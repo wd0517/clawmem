@@ -62,7 +62,7 @@ By default, `clawmem` follows the local `gitea-memory-context` conventions:
 
 ## Memory Tools
 
-- `save_memory`: create a new active memory tied to the current session.
+- `save_memory`: create a new active memory tied to the current session, with optional `topic:*` labels.
 - `search_memory`: search only active memories.
 - `retrieve_memory`: fetch a memory by `memoryId`.
 - `delete_memory`: soft-delete by changing the memory label from active to stale.

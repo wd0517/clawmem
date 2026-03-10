@@ -71,5 +71,6 @@ export type ParsedMemoryIssue = {
   sessionId: string;
   date: string;
   detail: string;
+  topics?: string[];
   status: "active" | "stale";
 };

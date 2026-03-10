@@ -118,6 +118,7 @@ Each memory issue should include:
 - `type:memory`
 - `session:<session_id>`
 - `date:YYYY-MM-DD`
+- optional `topic:<topic>`
 - `memory-status:active` or `memory-status:stale`
 
 Memory search must return only issues labeled:
@@ -152,6 +153,7 @@ Default behavior:
 - create a `type:memory` issue
 - apply `session:<session_id>`
 - apply `date:YYYY-MM-DD`
+- optionally apply one or more `topic:*` labels
 - apply `memory-status:active`
 
 In addition to the explicit tool, the plugin may auto-capture memory on conversation finalization by running an AI extraction step over the finalized transcript.
