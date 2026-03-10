@@ -169,7 +169,7 @@ class ClawMemService {
       name: "save_memory",
       label: "Save Memory",
       description:
-        "Store a reusable memory as a GitHub-backed memory issue tied to the current conversation session.",
+        "Save important information in long-term memory via ClawMem. Use for preferences, facts, decisions, and anything worth remembering.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -177,7 +177,7 @@ class ClawMemService {
         properties: {
           detail: {
             type: "string",
-            description: "The memory detail to store.",
+            description: "Information to remember.",
           },
           sessionId: {
             type: "string",
@@ -190,10 +190,10 @@ class ClawMemService {
         const detail = readRequiredString(params, "detail");
         const sessionId = readOptionalString(params, "sessionId") ?? ctx.sessionId;
         if (!detail) {
-          return this.errorResult("save_memory requires a non-empty detail.");
+          return this.errorResult("save_memory requires information to remember.");
         }
         if (!sessionId) {
-          return this.errorResult("save_memory requires a sessionId or an active session.");
+          return this.errorResult("save_memory requires a sessionId to tag the memory.");
         }
         if (!isPluginConfigured(this.config)) {
           return this.errorResult("clawmem is not configured.");
@@ -220,7 +220,7 @@ class ClawMemService {
       name: "search_memory",
       label: "Search Memory",
       description:
-        "Search active memories and return only memories that are currently marked active.",
+        "Search for memories by natural-language query. Returns only active memories. Use for finding specific memories or confirming information.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -228,11 +228,11 @@ class ClawMemService {
         properties: {
           query: {
             type: "string",
-            description: "The natural-language query used to search active memories.",
+            description: "The natural-language query to search for memories.",
           },
           limit: {
             type: "number",
-            description: `Max results to return. Defaults to ${this.config.memoryRecallLimit}.`,
+            description: `Maximum number of results to return. Defaults to ${this.config.memoryRecallLimit}.`,
           },
         },
       },
@@ -274,7 +274,7 @@ class ClawMemService {
     return {
       name: "retrieve_memory",
       label: "Retrieve Memory",
-      description: "Retrieve a specific memory by memoryId.",
+      description: "Fetch a specific memory by its `memoryId` from ClawMem.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -282,7 +282,7 @@ class ClawMemService {
         properties: {
           memoryId: {
             type: "string",
-            description: "The memoryId returned by save_memory or search_memory.",
+            description: "The `memoryId` returned by `save_memory` or `search_memory`.",
           },
         },
       },
@@ -290,7 +290,7 @@ class ClawMemService {
         const params = asRecord(args);
         const memoryId = readRequiredString(params, "memoryId");
         if (!memoryId) {
-          return this.errorResult("retrieve_memory requires memoryId.");
+          return this.errorResult("retrieve_memory requires a `memoryId` to fetch.");
         }
         if (!isPluginConfigured(this.config)) {
           return this.errorResult("clawmem is not configured.");
@@ -317,7 +317,7 @@ class ClawMemService {
       name: "delete_memory",
       label: "Delete Memory",
       description:
-        "Mark an active memory as stale. This is a soft delete and does not remove the issue.",
+        "Delete memory from ClawMem, this will mark the memory as stale and hide it from search results.",
       parameters: {
         type: "object",
         additionalProperties: false,
