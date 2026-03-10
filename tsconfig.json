@@ -1,0 +1,14 @@
+{
+  "extends": "../openclaw/tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "openclaw/plugin-sdk": ["../openclaw/src/plugin-sdk/index.ts"],
+      "openclaw/plugin-sdk/*": ["../openclaw/src/plugin-sdk/*.ts"],
+      "openclaw/plugin-sdk/account-id": ["../openclaw/src/plugin-sdk/account-id.ts"]
+    },
+    "typeRoots": ["../openclaw/node_modules/@types"],
+    "types": ["node"]
+  },
+  "include": ["./index.ts", "./src/**/*.ts"]
+}

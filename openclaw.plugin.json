@@ -1,0 +1,161 @@
+{
+  "id": "clawmem",
+  "name": "ClawMem",
+  "version": "0.1.0",
+  "description": "Mirror OpenClaw sessions into GitHub-compatible issues and comments.",
+  "kind": "memory",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "minLength": 1,
+        "default": "http://github.localhost:4003/api/v3"
+      },
+      "repo": {
+        "type": "string",
+        "pattern": "^[^/]+/[^/]+$",
+        "default": "testadmin/morpheus-memory"
+      },
+      "token": {
+        "type": "string",
+        "minLength": 1,
+        "default": "mytoken"
+      },
+      "authScheme": {
+        "type": "string",
+        "enum": ["token", "bearer"]
+      },
+      "issueTitlePrefix": {
+        "type": "string"
+      },
+      "memoryTitlePrefix": {
+        "type": "string"
+      },
+      "defaultLabels": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": ["source:openclaw"]
+      },
+      "agentLabelPrefix": {
+        "type": "string"
+      },
+      "activeStatusLabel": {
+        "type": "string"
+      },
+      "closedStatusLabel": {
+        "type": "string"
+      },
+      "memoryActiveStatusLabel": {
+        "type": "string"
+      },
+      "memoryStaleStatusLabel": {
+        "type": "string"
+      },
+      "autoCreateLabels": {
+        "type": "boolean"
+      },
+      "closeIssueOnReset": {
+        "type": "boolean"
+      },
+      "turnCommentDelayMs": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 60000
+      },
+      "summaryWaitTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 600000
+      },
+      "memoryRecallLimit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20
+      },
+      "labelColor": {
+        "type": "string",
+        "pattern": "^#?[0-9a-fA-F]{6}$"
+      },
+      "maxExcerptChars": {
+        "type": "integer",
+        "minimum": 120,
+        "maximum": 4000
+      }
+    }
+  },
+  "uiHints": {
+    "baseUrl": {
+      "label": "API Base URL",
+      "placeholder": "http://github.localhost:4003/api/v3",
+      "help": "GitHub-compatible API base URL. Root URLs are normalized to /api/v3 automatically."
+    },
+    "repo": {
+      "label": "Repository",
+      "placeholder": "testadmin/morpheus-memory",
+      "help": "Target repository that will store session issues."
+    },
+    "token": {
+      "label": "API Token",
+      "sensitive": true,
+      "help": "Token used for issue, comment, and label API calls. Defaults to the local gitea-memory-context token."
+    },
+    "authScheme": {
+      "label": "Auth Scheme",
+      "help": "Use 'token' for GitHub-style auth or 'bearer' for bearer tokens. Defaults to 'token' like gitea-memory-context."
+    },
+    "defaultLabels": {
+      "label": "Default Labels",
+      "help": "Labels added to every new session issue. Good place for topic:* tags."
+    },
+    "memoryTitlePrefix": {
+      "label": "Memory Title Prefix",
+      "help": "Prefix used when creating memory issue titles."
+    },
+    "agentLabelPrefix": {
+      "label": "Agent Label Prefix",
+      "help": "Dynamic agent label prefix, for example agent:coder."
+    },
+    "activeStatusLabel": {
+      "label": "Active Status Label"
+    },
+    "closedStatusLabel": {
+      "label": "Closed Status Label"
+    },
+    "memoryActiveStatusLabel": {
+      "label": "Memory Active Status Label"
+    },
+    "memoryStaleStatusLabel": {
+      "label": "Memory Stale Status Label"
+    },
+    "autoCreateLabels": {
+      "label": "Auto Create Labels"
+    },
+    "closeIssueOnReset": {
+      "label": "Close On Reset"
+    },
+    "turnCommentDelayMs": {
+      "label": "Turn Sync Delay (ms)",
+      "help": "Small delay so transcript writes settle before a turn comment is mirrored."
+    },
+    "summaryWaitTimeoutMs": {
+      "label": "Summary Wait Timeout (ms)",
+      "help": "How long clawmem waits for the OpenClaw subagent summarizer before writing a failed summary."
+    },
+    "memoryRecallLimit": {
+      "label": "Memory Recall Limit",
+      "help": "Maximum number of active memories injected into context before an agent starts."
+    },
+    "labelColor": {
+      "label": "Fallback Label Color",
+      "placeholder": "0e8a16"
+    },
+    "maxExcerptChars": {
+      "label": "Max Excerpt Chars",
+      "help": "Soft cap used when rendering summaries and comment sections."
+    }
+  }
+}
