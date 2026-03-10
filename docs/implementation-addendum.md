@@ -101,26 +101,14 @@ Rules:
 
 ### 3.1 Body Format
 
-The first implementation keeps the memory issue body minimal and stores memory detail only.
+The first implementation keeps the memory issue body minimal and stores only the memory detail text itself.
 
-The entire memory issue body should also be YAML.
-
-Recommended fields:
-
-- `type`
-- `memory_id`
-- `session_id`
-- `date`
-- `detail`
+Metadata such as type, session, date, and status are carried by labels and issue metadata, not repeated in the body.
 
 Example:
 
-```yaml
-type: memory
-memory_id: mem_abc123
-session_id: abc123
-date: 2026-03-10
-detail: User prefers storing conversation issue bodies as full YAML instead of markdown plus front matter.
+```text
+User prefers storing conversation issue bodies as full YAML instead of markdown plus front matter.
 ```
 
 ### 3.2 Labels
@@ -166,6 +154,8 @@ Default behavior:
 - apply `date:YYYY-MM-DD`
 - apply `memory-status:active`
 
+In addition to the explicit tool, the plugin may auto-capture memory on conversation finalization by running an AI extraction step over the finalized transcript.
+
 ### 4.2 `search_memory`
 
 `search_memory` returns only active memory.
@@ -178,6 +168,8 @@ Default filter:
 ### 4.3 `retrieve_memory`
 
 `retrieve_memory` retrieves a specific memory by `memory_id`.
+
+For memory issues created by the current implementation, `memory_id` is the issue number rendered as a string.
 
 Unlike search, exact retrieval is allowed to return either:
 
@@ -201,6 +193,11 @@ to:
 This makes deletion a logical state transition rather than a hard delete.
 
 The decision to add or delete memory is left to AI policy.
+
+In the current implementation, finalized conversations are passed through an AI extraction step that may:
+
+- create new memory issues
+- mark existing active memory issues as stale
 
 ---
 

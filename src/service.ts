@@ -40,6 +40,11 @@ type MemoryToolContext = {
   agentId?: string;
 };
 
+type MemoryDecision = {
+  save: string[];
+  stale: string[];
+};
+
 class ClawMemService {
   private readonly config: ClawMemPluginConfig;
 
@@ -552,6 +557,7 @@ class ClawMemService {
     const summary = await this.safeGenerateConversationSummary(session, snapshot);
     await this.ensureConversationLabels(session, snapshot, true);
     await this.syncConversationIssueBody(session, snapshot, summary, true);
+    await this.safeSyncConversationMemories(session, snapshot);
 
     if (commentsComplete) {
       session.finalizedAt = new Date().toISOString();
@@ -682,6 +688,23 @@ class ClawMemService {
     }
   }
 
+  private async safeSyncConversationMemories(
+    session: SessionMirrorState,
+    snapshot: TranscriptSnapshot,
+  ): Promise<void> {
+    try {
+      const decision = await this.generateMemoryDecision(session, snapshot);
+      const saved = await this.applyMemoryDecision(session, decision);
+      if (saved.savedCount > 0 || saved.staledCount > 0) {
+        this.api.logger.info?.(
+          `clawmem: synced memories for ${session.sessionId} (saved=${saved.savedCount}, stale=${saved.staledCount})`,
+        );
+      }
+    } catch (error) {
+      this.logBackgroundError("memory capture", error);
+    }
+  }
+
   private async generateConversationSummary(
     session: SessionMirrorState,
     snapshot: TranscriptSnapshot,
@@ -744,17 +767,130 @@ class ClawMemService {
     }
   }
 
+  private async generateMemoryDecision(
+    session: SessionMirrorState,
+    snapshot: TranscriptSnapshot,
+  ): Promise<MemoryDecision> {
+    if (snapshot.messages.length === 0) {
+      return { save: [], stale: [] };
+    }
+
+    const recentActiveMemories = (await this.listMemoryIssues("active"))
+      .sort((left, right) => right.issueNumber - left.issueNumber)
+      .slice(0, 20);
+
+    const existingMemoryBlock =
+      recentActiveMemories.length === 0
+        ? "None."
+        : recentActiveMemories
+            .map((memory) => `[${memory.memoryId}] ${memory.detail}`)
+            .join("\n");
+
+    const subagent = this.api.runtime.subagent;
+    const sessionKey = this.buildMemoryDecisionSessionKey(session);
+    const idempotencyKey = this.hash(`${session.sessionId}:${snapshot.messages.length}:memory-decision`);
+    const message = [
+      "Extract durable memories from the conversation below.",
+      'Return JSON only in the form {"save":["..."],"stale":["memory-id"]}.',
+      "Use save for stable, reusable facts, preferences, decisions, constraints, and ongoing context worth remembering later.",
+      "Use stale for existing memory IDs only when the conversation clearly supersedes or invalidates them.",
+      "Do not save temporary requests, startup boilerplate, tool chatter, summaries about internal helper sessions, or one-off operational details.",
+      "Prefer empty arrays when nothing durable should be remembered.",
+      "",
+      "<existing-active-memories>",
+      existingMemoryBlock,
+      "</existing-active-memories>",
+      "",
+      "<conversation>",
+      this.formatTranscriptForSummary(snapshot.messages),
+      "</conversation>",
+    ].join("\n");
+
+    try {
+      const run = await subagent.run({
+        sessionKey,
+        message,
+        deliver: false,
+        lane: "clawmem-memory",
+        idempotencyKey,
+        extraSystemPrompt:
+          "You extract durable memory updates from OpenClaw conversations. Output JSON only with string arrays save and stale.",
+      });
+
+      const waitResult = await subagent.waitForRun({
+        runId: run.runId,
+        timeoutMs: this.config.summaryWaitTimeoutMs,
+      });
+      if (waitResult.status === "timeout") {
+        throw new Error("memory decision subagent timed out");
+      }
+      if (waitResult.status === "error") {
+        throw new Error(waitResult.error || "memory decision subagent failed");
+      }
+
+      const result = await subagent.getSessionMessages({ sessionKey, limit: 50 });
+      const messages = normalizeMessages(result.messages);
+      const finalText = [...messages]
+        .reverse()
+        .find((entry) => entry.role === "assistant" && entry.text.trim().length > 0)?.text;
+      if (!finalText) {
+        throw new Error("memory decision subagent returned no assistant text");
+      }
+      return extractMemoryDecision(finalText);
+    } finally {
+      try {
+        await subagent.deleteSession({ sessionKey, deleteTranscript: true });
+      } catch (error) {
+        this.logBackgroundError("memory decision subagent cleanup", error);
+      }
+    }
+  }
+
+  private async applyMemoryDecision(
+    session: SessionMirrorState,
+    decision: MemoryDecision,
+  ): Promise<{ savedCount: number; staledCount: number }> {
+    const allActiveMemories = await this.listMemoryIssues("active");
+    const activeById = new Map(allActiveMemories.map((memory) => [memory.memoryId, memory]));
+    const existingDetails = new Set(
+      allActiveMemories.map((memory) => normalizeMemoryDetail(memory.detail)),
+    );
+
+    let savedCount = 0;
+    let staledCount = 0;
+
+    const saveItems = [...new Set(decision.save.map(normalizeMemoryDetail).filter(Boolean))];
+    for (const detail of saveItems) {
+      if (existingDetails.has(detail)) {
+        continue;
+      }
+      await this.createMemoryIssue(session.sessionId, detail);
+      existingDetails.add(detail);
+      savedCount += 1;
+    }
+
+    const staleIds = [...new Set(decision.stale.map((value) => value.trim()).filter(Boolean))];
+    for (const memoryId of staleIds) {
+      const memory = activeById.get(memoryId);
+      if (!memory) {
+        continue;
+      }
+      await this.ensureLabels([this.config.memoryStaleStatusLabel]);
+      await this.syncManagedLabels(
+        memory.issueNumber,
+        this.buildMemoryLabels(memory.sessionId, memory.date, "stale"),
+      );
+      staledCount += 1;
+    }
+
+    return { savedCount, staledCount };
+  }
+
   private async createMemoryIssue(sessionId: string, detail: string): Promise<ParsedMemoryIssue> {
     const date = this.toLocalDateString();
-    const memoryId = crypto.randomUUID();
     const labels = this.buildMemoryLabels(sessionId, date, "active");
     const title = `${this.config.memoryTitlePrefix}${this.truncateInline(detail, 72)}`;
-    const body = this.renderMemoryBody({
-      memoryId,
-      sessionId,
-      date,
-      detail,
-    });
+    const body = this.renderMemoryBody(detail);
     await this.ensureLabels(labels);
     const issue = await this.client.createIssue({
       title,
@@ -764,7 +900,7 @@ class ClawMemService {
     return {
       issueNumber: issue.number,
       title: issue.title ?? title,
-      memoryId,
+      memoryId: String(issue.number),
       sessionId,
       date,
       detail,
@@ -836,12 +972,13 @@ class ClawMemService {
     if (!labels.includes("type:memory")) {
       return null;
     }
-    const body = typeof issue.body === "string" ? parseFlatYaml(issue.body) : {};
-    const memoryId = body.memory_id?.trim();
-    const sessionId = body.session_id?.trim();
-    const date = body.date?.trim();
-    const detail = body.detail ?? "";
-    if (!memoryId || !sessionId || !date || !detail.trim()) {
+    const sessionId = this.extractLabelValue(labels, "session:");
+    const date = this.extractLabelValue(labels, "date:");
+    const rawBody = typeof issue.body === "string" ? issue.body.trim() : "";
+    const body = rawBody ? parseFlatYaml(rawBody) : {};
+    const detail = body.detail?.trim() || rawBody;
+    const memoryId = body.memory_id?.trim() || String(issue.number);
+    if (!sessionId || !date || !detail.trim()) {
       return null;
     }
     return {
@@ -933,19 +1070,8 @@ class ClawMemService {
     ]);
   }
 
-  private renderMemoryBody(params: {
-    memoryId: string;
-    sessionId: string;
-    date: string;
-    detail: string;
-  }): string {
-    return stringifyFlatYaml([
-      ["type", "memory"],
-      ["memory_id", params.memoryId],
-      ["session_id", params.sessionId],
-      ["date", params.date],
-      ["detail", params.detail],
-    ]);
+  private renderMemoryBody(detail: string): string {
+    return detail.trim();
   }
 
   private renderConversationComment(message: NormalizedMessage): string {
@@ -985,6 +1111,12 @@ class ClawMemService {
     const agentId = sanitizeSessionKeyPart(session.agentId || "main");
     const sessionId = sanitizeSessionKeyPart(session.sessionId);
     return `agent:${agentId}:subagent:clawmem-summary-${sessionId}`;
+  }
+
+  private buildMemoryDecisionSessionKey(session: SessionMirrorState): string {
+    const agentId = sanitizeSessionKeyPart(session.agentId || "main");
+    const sessionId = sanitizeSessionKeyPart(session.sessionId);
+    return `agent:${agentId}:subagent:clawmem-memory-${sessionId}`;
   }
 
   private getOrCreateSession(sessionId: string): SessionMirrorState {
@@ -1098,6 +1230,15 @@ class ClawMemService {
       .filter((label) => label.length > 0);
   }
 
+  private extractLabelValue(labels: string[], prefix: string): string | undefined {
+    const match = labels.find((label) => label.startsWith(prefix));
+    if (!match) {
+      return undefined;
+    }
+    const value = match.slice(prefix.length).trim();
+    return value || undefined;
+  }
+
   private isManagedLabel(label: string): boolean {
     if (this.config.defaultLabels.includes(label)) {
       return true;
@@ -1130,6 +1271,13 @@ class ClawMemService {
       firstUserMessage.includes("Summarize the following conversation.") &&
       firstUserMessage.includes('Return valid JSON only in the form {"summary":"..."}') &&
       firstUserMessage.includes("<conversation>")
+    ) {
+      return false;
+    }
+    if (
+      firstUserMessage.includes("Extract durable memories from the conversation below.") &&
+      firstUserMessage.includes('Return JSON only in the form {"save":["..."],"stale":["memory-id"]}.') &&
+      firstUserMessage.includes("<existing-active-memories>")
     ) {
       return false;
     }
@@ -1292,6 +1440,42 @@ function extractSummaryText(raw: string): string {
   }
 
   return trimmed;
+}
+
+function extractMemoryDecision(raw: string): MemoryDecision {
+  const parsed = tryParseMemoryDecisionJson(raw.trim());
+  if (parsed) {
+    return parsed;
+  }
+
+  const fenced = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(raw.trim());
+  if (fenced?.[1]) {
+    const nested = tryParseMemoryDecisionJson(fenced[1].trim());
+    if (nested) {
+      return nested;
+    }
+  }
+
+  throw new Error("memory decision subagent returned invalid JSON");
+}
+
+function tryParseMemoryDecisionJson(raw: string): MemoryDecision | null {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const save = Array.isArray(parsed.save)
+      ? parsed.save.filter((value): value is string => typeof value === "string")
+      : [];
+    const stale = Array.isArray(parsed.stale)
+      ? parsed.stale.filter((value): value is string => typeof value === "string")
+      : [];
+    return { save, stale };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeMemoryDetail(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
 }
 
 function tryParseSummaryJson(raw: string): string | null {

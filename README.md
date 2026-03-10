@@ -8,6 +8,7 @@ Current behavior:
 - Stores the conversation issue body as YAML metadata plus final summary.
 - Appends one issue comment per mirrored `user` or `assistant` message.
 - Uses an OpenClaw subagent to generate the final conversation summary on finalize.
+- Uses an OpenClaw subagent to extract durable memories on finalize and store them as memory issues.
 - Exposes memory tools: `save_memory`, `search_memory`, `retrieve_memory`, `delete_memory`.
 - Stores each memory as a separate `type:memory` issue with `memory-status:active` or `memory-status:stale`.
 - Injects relevant active memories into context before agent start.
@@ -72,4 +73,5 @@ By default, `clawmem` follows the local `gitea-memory-context` conventions:
 - Conversation summary failures do not block issue finalization; the YAML `summary` field is written as `failed: ...`.
 - Conversation issue bodies store `date` as `YYYY-MM-DD`, and `start_at` / `end_at` as local `YYYY-MM-DDTHH:mm:ss`.
 - Memory search and auto-injection only return `memory-status:active` issues.
-- Memory bodies are YAML and include a stable `memory_id`.
+- Durable memories are auto-captured on session finalize; manual memory tools remain available for explicit save/search/delete.
+- Memory issue bodies store only the memory detail text itself; metadata comes from labels and the issue number.
