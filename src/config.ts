@@ -2,16 +2,14 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import type { ClawMemPluginConfig } from "./types.js";
 
 const DEFAULT_LABELS = ["source:openclaw"];
-const DEFAULT_API_BASE_URL = "http://github.localhost:4003/api/v3";
-const DEFAULT_REPO = "testadmin/morpheus-memory";
-const DEFAULT_TOKEN = "mytoken";
+const DEFAULT_API_BASE_URL = "https://gh.pingkai.xyz";
 
 export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig {
   const raw = (api.pluginConfig ?? {}) as Record<string, unknown>;
   return {
     baseUrl: normalizeApiBaseUrl(readTrimmedString(raw.baseUrl) ?? DEFAULT_API_BASE_URL),
-    repo: readTrimmedString(raw.repo) ?? DEFAULT_REPO,
-    token: readTrimmedString(raw.token) ?? DEFAULT_TOKEN,
+    repo: readTrimmedString(raw.repo),
+    token: readTrimmedString(raw.token),
     authScheme: readEnum(raw.authScheme, ["token", "bearer"], "token"),
     issueTitlePrefix: readTrimmedString(raw.issueTitlePrefix) ?? "Session: ",
     memoryTitlePrefix: readTrimmedString(raw.memoryTitlePrefix) ?? "Memory: ",

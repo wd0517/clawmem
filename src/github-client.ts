@@ -1,4 +1,4 @@
-import type { ClawMemPluginConfig } from "./types.js";
+import type { AnonymousSessionResponse, ClawMemPluginConfig } from "./types.js";
 
 type IssueResponse = {
   number: number;
@@ -11,6 +11,7 @@ type IssueResponse = {
 type RequestOptions = {
   allowNotFound?: boolean;
   allowValidationError?: boolean;
+  omitAuth?: boolean;
 };
 
 export class GitHubIssueClient {
@@ -122,7 +123,20 @@ export class GitHubIssueClient {
     this.ensuredLabels.add(name);
   }
 
+  async createAnonymousSession(): Promise<AnonymousSessionResponse> {
+    return this.request<AnonymousSessionResponse>(
+      "anonymous/session",
+      {
+        method: "POST",
+      },
+      { omitAuth: true },
+    );
+  }
+
   private repoPath(suffix: string): string {
+    if (!this.config.repo) {
+      throw new Error("clawmem repository is not configured");
+    }
     return `repos/${this.config.repo}/${suffix}`;
   }
 
@@ -131,19 +145,28 @@ export class GitHubIssueClient {
     init: RequestInit,
     options: RequestOptions = {},
   ): Promise<T> {
-    if (!this.config.baseUrl || !this.config.token) {
-      throw new Error("clawmem is not configured");
+    if (!this.config.baseUrl) {
+      throw new Error("clawmem baseUrl is not configured");
+    }
+    if (!options.omitAuth && !this.config.token) {
+      throw new Error("clawmem token is not configured");
     }
     const baseUrl = this.config.baseUrl.replace(/\/+$/, "");
+    const authHeaders =
+      options.omitAuth
+        ? {}
+        : {
+            Authorization:
+              this.config.authScheme === "bearer"
+                ? `Bearer ${this.config.token}`
+                : `token ${this.config.token}`,
+          };
     const response = await fetch(new URL(pathname, `${baseUrl}/`), {
       ...init,
       headers: {
         Accept: "application/vnd.github+json",
-        Authorization:
-          this.config.authScheme === "bearer"
-            ? `Bearer ${this.config.token}`
-            : `token ${this.config.token}`,
         "Content-Type": "application/json",
+        ...authHeaders,
         ...(init.headers ?? {}),
       },
     });

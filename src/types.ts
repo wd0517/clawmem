@@ -20,6 +20,13 @@ export type ClawMemPluginConfig = {
   maxExcerptChars: number;
 };
 
+export type AnonymousSessionResponse = {
+  token: string;
+  owner_login: string;
+  repo_name: string;
+  repo_full_name: string;
+};
+
 export type SessionMirrorState = {
   sessionId: string;
   sessionKey?: string;

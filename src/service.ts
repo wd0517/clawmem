@@ -69,6 +69,8 @@ class ClawMemService {
 
   private loadPromise: Promise<void> | null = null;
 
+  private configEnsurePromise: Promise<boolean> | null = null;
+
   constructor(private readonly api: OpenClawPluginApi) {
     this.config = resolvePluginConfig(api);
     this.client = new GitHubIssueClient(this.config, api.logger);
@@ -115,13 +117,7 @@ class ClawMemService {
       start: async (ctx) => {
         this.statePath = resolveStatePath(ctx.stateDir);
         await this.ensureLoaded();
-
-        if (!isPluginConfigured(this.config)) {
-          this.api.logger.warn(
-            "clawmem: missing baseUrl/repo/token in plugin config; plugin loaded in no-op mode",
-          );
-          return;
-        }
+        const configured = await this.ensureConfigured();
 
         this.transcriptUnsubscribe = this.api.runtime.events.onSessionTranscriptUpdate((update) => {
           void this.track(this.handleTranscriptUpdate(update.sessionFile)).catch((error) => {
@@ -129,9 +125,15 @@ class ClawMemService {
           });
         });
 
-        this.api.logger.info?.(
-          `clawmem: mirroring sessions to ${this.config.repo} via ${this.config.baseUrl}`,
-        );
+        if (configured) {
+          this.api.logger.info?.(
+            `clawmem: mirroring sessions to ${this.config.repo} via ${this.config.baseUrl}`,
+          );
+        } else {
+          this.api.logger.warn(
+            `clawmem: missing repo/token and automatic provisioning failed via ${this.config.baseUrl}; sync will retry on the next use`,
+          );
+        }
       },
       stop: async () => {
         this.transcriptUnsubscribe?.();
@@ -204,8 +206,8 @@ class ClawMemService {
         if (!sessionId) {
           return this.errorResult("save_memory requires a sessionId to tag the memory.");
         }
-        if (!isPluginConfigured(this.config)) {
-          return this.errorResult("clawmem is not configured.");
+        if (!(await this.ensureConfigured())) {
+          return this.errorResult("clawmem could not initialize Git credentials.");
         }
 
         try {
@@ -256,8 +258,8 @@ class ClawMemService {
           1,
           20,
         );
-        if (!isPluginConfigured(this.config)) {
-          return this.errorResult("clawmem is not configured.");
+        if (!(await this.ensureConfigured())) {
+          return this.errorResult("clawmem could not initialize Git credentials.");
         }
 
         try {
@@ -301,8 +303,8 @@ class ClawMemService {
         if (!memoryId) {
           return this.errorResult("retrieve_memory requires a `memoryId` to fetch.");
         }
-        if (!isPluginConfigured(this.config)) {
-          return this.errorResult("clawmem is not configured.");
+        if (!(await this.ensureConfigured())) {
+          return this.errorResult("clawmem could not initialize Git credentials.");
         }
 
         try {
@@ -344,8 +346,8 @@ class ClawMemService {
         if (!memoryId) {
           return this.errorResult("delete_memory requires memoryId.");
         }
-        if (!isPluginConfigured(this.config)) {
-          return this.errorResult("clawmem is not configured.");
+        if (!(await this.ensureConfigured())) {
+          return this.errorResult("clawmem could not initialize Git credentials.");
         }
 
         try {
@@ -370,7 +372,10 @@ class ClawMemService {
   }
 
   private async handleBeforeAgentStart(prompt: unknown): Promise<{ prependContext: string } | void> {
-    if (!isPluginConfigured(this.config) || typeof prompt !== "string" || prompt.trim().length < 5) {
+    if (typeof prompt !== "string" || prompt.trim().length < 5) {
+      return;
+    }
+    if (!(await this.ensureConfigured())) {
       return;
     }
 
@@ -404,6 +409,83 @@ class ClawMemService {
       this.state = await loadState(this.statePath);
     })();
     return this.loadPromise;
+  }
+
+  private async ensureConfigured(): Promise<boolean> {
+    if (isPluginConfigured(this.config)) {
+      return true;
+    }
+    if (this.configEnsurePromise) {
+      return this.configEnsurePromise;
+    }
+    const ensurePromise = this.bootstrapPluginConfig();
+    this.configEnsurePromise = ensurePromise;
+    try {
+      return await ensurePromise;
+    } finally {
+      if (this.configEnsurePromise === ensurePromise) {
+        this.configEnsurePromise = null;
+      }
+    }
+  }
+
+  private async bootstrapPluginConfig(): Promise<boolean> {
+    if (!this.config.baseUrl) {
+      this.api.logger.warn("clawmem: cannot provision Git credentials without a baseUrl");
+      return false;
+    }
+
+    try {
+      const anonymousSession = await this.client.createAnonymousSession();
+      await this.persistPluginConfig({
+        baseUrl: this.config.baseUrl,
+        authScheme: "token",
+        token: anonymousSession.token,
+        repo: anonymousSession.repo_full_name,
+      });
+      this.config.authScheme = "token";
+      this.config.token = anonymousSession.token;
+      this.config.repo = anonymousSession.repo_full_name;
+      this.api.logger.info?.(
+        `clawmem: provisioned Git credentials for ${anonymousSession.repo_full_name} via ${this.config.baseUrl}`,
+      );
+      return true;
+    } catch (error) {
+      this.api.logger.warn(
+        `clawmem: failed to provision Git credentials via ${this.config.baseUrl}: ${String(error)}`,
+      );
+      return false;
+    }
+  }
+
+  private async persistPluginConfig(values: Partial<ClawMemPluginConfig>): Promise<void> {
+    const rootConfig = this.api.runtime.config.loadConfig();
+    const existingPlugins = rootConfig.plugins;
+    const entries =
+      existingPlugins?.entries &&
+      typeof existingPlugins.entries === "object" &&
+      !Array.isArray(existingPlugins.entries)
+        ? (existingPlugins.entries as Record<string, unknown>)
+        : {};
+    const existingEntry = asRecord(entries[this.api.id]);
+    const existingPluginConfig = asRecord(existingEntry.config);
+
+    await this.api.runtime.config.writeConfigFile({
+      ...rootConfig,
+      plugins: {
+        ...(existingPlugins ?? {}),
+        entries: {
+          ...entries,
+          [this.api.id]: {
+            ...existingEntry,
+            config: {
+              ...existingPluginConfig,
+              ...values,
+            },
+          },
+        },
+      },
+    });
   }
 
   private track<T>(promise: Promise<T>): Promise<T> {
@@ -462,10 +544,6 @@ class ClawMemService {
   }
 
   private async handleTranscriptUpdate(sessionFile: string): Promise<void> {
-    if (!isPluginConfigured(this.config)) {
-      return;
-    }
-
     let snapshot: TranscriptSnapshot;
     try {
       snapshot = await readTranscriptSnapshot(sessionFile);
@@ -477,6 +555,9 @@ class ClawMemService {
       return;
     }
     if (!this.shouldMirrorConversation(snapshot.sessionId, snapshot.messages)) {
+      return;
+    }
+    if (!(await this.ensureConfigured())) {
       return;
     }
 
@@ -492,7 +573,10 @@ class ClawMemService {
   }
 
   private async syncTurn(payload: AgentEndPayload): Promise<void> {
-    if (!payload.sessionId || !isPluginConfigured(this.config)) {
+    if (!payload.sessionId) {
+      return;
+    }
+    if (!(await this.ensureConfigured())) {
       return;
     }
 
@@ -527,7 +611,10 @@ class ClawMemService {
   }
 
   private async finalizeSession(payload: FinalizePayload): Promise<void> {
-    if (!payload.sessionId || !isPluginConfigured(this.config)) {
+    if (!payload.sessionId) {
+      return;
+    }
+    if (!(await this.ensureConfigured())) {
       return;
     }
 

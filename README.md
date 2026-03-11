@@ -22,12 +22,15 @@ openclaw plugins enable clawmem
 
 ## Example Config
 
-By default, `clawmem` follows the local `gitea-memory-context` conventions:
+By default, `clawmem` targets `https://gh.pingkai.xyz`.
 
-- `baseUrl`: `http://github.localhost:4003/api/v3`
-- `repo`: `testadmin/morpheus-memory`
-- `token`: `mytoken`
+- `baseUrl`: `https://gh.pingkai.xyz/api/v3`
 - `authScheme`: `token`
+
+If `repo` or `token` is missing, `clawmem` will create an account session on first start and
+write the resolved `token` and `repo` back into `plugins.entries.clawmem.config` in the main
+OpenClaw config file. You can override either field later with your own manually managed
+credentials.
 
 ```json5
 {
@@ -36,9 +39,7 @@ By default, `clawmem` follows the local `gitea-memory-context` conventions:
       clawmem: {
         enabled: true,
         config: {
-          baseUrl: "http://github.localhost:4003/api/v3",
-          repo: "testadmin/morpheus-memory",
-          token: "mytoken",
+          baseUrl: "https://gh.pingkai.xyz/api/v3",
           authScheme: "token",
           issueTitlePrefix: "Session: ",
           memoryTitlePrefix: "Memory: ",
@@ -53,6 +54,26 @@ By default, `clawmem` follows the local `gitea-memory-context` conventions:
           turnCommentDelayMs: 1000,
           summaryWaitTimeoutMs: 120000,
           memoryRecallLimit: 5
+        }
+      }
+    }
+  }
+}
+```
+
+Example after automatic provisioning:
+
+```json5
+{
+  plugins: {
+    entries: {
+      clawmem: {
+        enabled: true,
+        config: {
+          baseUrl: "https://gh.pingkai.xyz/api/v3",
+          repo: "owner/repo",
+          token: "<token>",
+          authScheme: "token"
         }
       }
     }
