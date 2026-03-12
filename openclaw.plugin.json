@@ -11,7 +11,7 @@
       "baseUrl": {
         "type": "string",
         "minLength": 1,
-        "default": "https://gh.pingkai.xyz"
+        "default": "https://git.staging.clawmem.ai"
       },
       "repo": {
         "type": "string",
@@ -88,7 +88,7 @@
   "uiHints": {
     "baseUrl": {
       "label": "API Base URL",
-      "placeholder": "https://gh.pingkai.xyz",
+      "placeholder": "https://git.staging.clawmem.ai",
       "help": "GitHub-compatible API base URL. Root URLs are normalized to /api/v3 automatically."
     },
     "repo": {

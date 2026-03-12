@@ -2,7 +2,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import type { ClawMemPluginConfig } from "./types.js";
 
 const DEFAULT_LABELS = ["source:openclaw"];
-const DEFAULT_API_BASE_URL = "https://gh.pingkai.xyz";
+const DEFAULT_API_BASE_URL = "https://git.staging.clawmem.ai";
 
 export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig {
   const raw = (api.pluginConfig ?? {}) as Record<string, unknown>;

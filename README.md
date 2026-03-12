@@ -22,9 +22,9 @@ openclaw plugins enable clawmem
 
 ## Example Config
 
-By default, `clawmem` targets `https://gh.pingkai.xyz`.
+By default, `clawmem` targets `https://git.staging.clawmem.ai`.
 
-- `baseUrl`: `https://gh.pingkai.xyz/api/v3`
+- `baseUrl`: `https://git.staging.clawmem.ai/api/v3`
 - `authScheme`: `token`
 
 If `repo` or `token` is missing, `clawmem` will create an account session on first start and
@@ -39,7 +39,7 @@ credentials.
       clawmem: {
         enabled: true,
         config: {
-          baseUrl: "https://gh.pingkai.xyz/api/v3",
+          baseUrl: "https://git.staging.clawmem.ai/api/v3",
           authScheme: "token",
           issueTitlePrefix: "Session: ",
           memoryTitlePrefix: "Memory: ",
@@ -70,7 +70,7 @@ Example after automatic provisioning:
       clawmem: {
         enabled: true,
         config: {
-          baseUrl: "https://gh.pingkai.xyz/api/v3",
+          baseUrl: "https://git.staging.clawmem.ai/api/v3",
           repo: "owner/repo",
           token: "<token>",
           authScheme: "token"
