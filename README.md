@@ -16,8 +16,8 @@ Current behavior:
 ## Install
 
 ```bash
-openclaw plugins install -l /home/wangdi/project/ai/clawmem
-openclaw plugins enable clawmem
+openclaw plugins install @wd0517/clawmem
+openclaw gateway restart  # restart gateway to load the plugin
 ```
 
 ## Example Config
