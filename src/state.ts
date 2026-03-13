@@ -4,6 +4,8 @@ import type { PluginState } from "./types.js";
 
 const EMPTY_STATE: PluginState = {
   version: 1,
+  baseUrl: undefined,
+  repo: undefined,
   sessions: {},
 };
 
@@ -43,6 +45,8 @@ function sanitizeState(value: unknown): PluginState {
       : {};
   const out: PluginState = {
     version: 1,
+    baseUrl: readString(raw.baseUrl),
+    repo: readString(raw.repo),
     sessions: {},
   };
   for (const [sessionId, sessionValue] of Object.entries(sessions)) {

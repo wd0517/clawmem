@@ -18,6 +18,16 @@ import type {
 } from "./types.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 
+type HttpError = Error & { status?: number };
+
+function getHttpStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+  const status = (error as HttpError).status;
+  return typeof status === "number" ? status : undefined;
+}
+
 type AgentEndPayload = {
   sessionId?: string;
   sessionKey?: string;
@@ -407,12 +417,17 @@ class ClawMemService {
         this.statePath = resolveStatePath(baseStateDir);
       }
       this.state = await loadState(this.statePath);
+      // Best-effort: if repo is already configured at boot time, bind state to it.
+      await this.ensureStateBoundToRepo();
     })();
     return this.loadPromise;
   }
 
   private async ensureConfigured(): Promise<boolean> {
     if (isPluginConfigured(this.config)) {
+      // Repo may change across restarts; keep state consistent.
+      await this.ensureLoaded();
+      await this.ensureStateBoundToRepo();
       return true;
     }
     if (this.configEnsurePromise) {
@@ -446,6 +461,8 @@ class ClawMemService {
       this.config.authScheme = "token";
       this.config.token = anonymousSession.token;
       this.config.repo = anonymousSession.repo_full_name;
+      await this.ensureLoaded();
+      await this.ensureStateBoundToRepo();
       this.api.logger.info?.(
         `clawmem: provisioned Git credentials for ${anonymousSession.repo_full_name} via ${this.config.baseUrl}`,
       );
@@ -490,9 +507,14 @@ class ClawMemService {
 
   private track<T>(promise: Promise<T>): Promise<T> {
     this.pendingTasks.add(promise);
-    void promise.finally(() => {
-      this.pendingTasks.delete(promise);
-    });
+    // Avoid unhandled rejections from the Promise returned by finally().
+    void promise
+      .finally(() => {
+        this.pendingTasks.delete(promise);
+      })
+      .catch(() => {
+        // Errors are handled by the caller; this catch only prevents an unhandled rejection.
+      });
     return promise;
   }
 
@@ -596,7 +618,11 @@ class ClawMemService {
     }
 
     await this.ensureConversationIssue(session, snapshot);
-    await this.ensureConversationLabels(session, snapshot, false);
+    try {
+      await this.ensureConversationLabels(session, snapshot, false);
+    } catch (error) {
+      this.logBackgroundError("conversation labels", error);
+    }
 
     const nextMessages = snapshot.messages.slice(session.lastMirroredCount);
     if (nextMessages.length > 0) {
@@ -638,6 +664,7 @@ class ClawMemService {
     }
 
     await this.ensureConversationIssue(session, snapshot);
+    await this.ensureConversationIssueExists(session, snapshot);
 
     const nextMessages = snapshot.messages.slice(session.lastMirroredCount);
     let commentsComplete = true;
@@ -651,7 +678,11 @@ class ClawMemService {
     }
 
     const summary = await this.safeGenerateConversationSummary(session, snapshot);
-    await this.ensureConversationLabels(session, snapshot, true);
+    try {
+      await this.ensureConversationLabels(session, snapshot, true);
+    } catch (error) {
+      this.logBackgroundError("conversation labels", error);
+    }
     await this.syncConversationIssueBody(session, snapshot, summary, true);
     await this.safeSyncConversationMemories(session, snapshot);
 
@@ -713,6 +744,27 @@ class ClawMemService {
     session.updatedAt = session.createdAt;
   }
 
+  private async ensureConversationIssueExists(
+    session: SessionMirrorState,
+    snapshot: TranscriptSnapshot,
+  ): Promise<void> {
+    if (!session.issueNumber) {
+      return;
+    }
+    const issueNumber = session.issueNumber;
+    const issue = await this.client.getIssueOrUndefined(issueNumber);
+    if (issue) {
+      return;
+    }
+    this.api.logger.warn?.(
+      `clawmem: conversation issue #${issueNumber} missing in ${this.config.repo}; recreating`,
+    );
+    session.issueNumber = undefined;
+    session.issueTitle = undefined;
+    session.lastSummaryHash = undefined;
+    await this.ensureConversationIssue(session, snapshot);
+  }
+
   private async syncConversationIssueBody(
     session: SessionMirrorState,
     snapshot: TranscriptSnapshot,
@@ -749,7 +801,33 @@ class ClawMemService {
     }
     const labels = this.buildConversationLabels(session, snapshot, closed);
     await this.ensureLabels(labels);
-    await this.syncManagedLabels(session.issueNumber, labels);
+    try {
+      await this.syncManagedLabels(session.issueNumber, labels);
+    } catch (error) {
+      // Repo changes (or deleted issues) can leave stale issueNumber values in state. Recover by recreating.
+      if (getHttpStatus(error) === 404 || String(error).includes("HTTP 404:")) {
+        const missingIssueNumber = session.issueNumber;
+        this.api.logger.warn?.(
+          `clawmem: conversation issue #${missingIssueNumber} missing in ${this.config.repo}; recreating`,
+        );
+        session.issueNumber = undefined;
+        session.issueTitle = undefined;
+        session.lastSummaryHash = undefined;
+        try {
+          await this.ensureConversationIssue(session, snapshot);
+        } catch (recreateError) {
+          session.issueNumber = missingIssueNumber;
+          throw recreateError;
+        }
+        try {
+          await this.syncManagedLabels(session.issueNumber!, labels);
+        } catch (followupError) {
+          this.logBackgroundError("conversation labels", followupError);
+        }
+        return;
+      }
+      throw error;
+    }
   }
 
   private async appendConversationComments(
@@ -1494,6 +1572,63 @@ class ClawMemService {
       );
       return null;
     }
+  }
+
+  private async ensureStateBoundToRepo(): Promise<void> {
+    if (!this.state || !this.statePath) {
+      return;
+    }
+    const desiredRepo = this.config.repo?.trim();
+    const desiredBaseUrl = this.config.baseUrl?.trim();
+    if (!desiredRepo) {
+      return;
+    }
+    const currentRepo = this.state.repo?.trim();
+    const currentBaseUrl = this.state.baseUrl?.trim();
+    if (!currentRepo) {
+      // If state was created before repo-binding existed, sessions may reference a different backend.
+      // Reset mappings to avoid querying non-existent issues.
+      this.api.logger.warn?.(
+        `clawmem: binding state to ${desiredBaseUrl ?? "<unknown>"} ${desiredRepo}; resetting session mappings`,
+      );
+      this.state.baseUrl = desiredBaseUrl;
+      this.state.repo = desiredRepo;
+      this.state.sessions = {};
+      this.client.clearEnsuredLabels?.();
+      await saveState(this.statePath, this.state);
+      return;
+    }
+
+    if (currentRepo === desiredRepo) {
+      if (desiredBaseUrl && !currentBaseUrl) {
+        this.state.baseUrl = desiredBaseUrl;
+        await saveState(this.statePath, this.state);
+      }
+      if (desiredBaseUrl && currentBaseUrl && currentBaseUrl !== desiredBaseUrl) {
+        const fromLabel = `${currentBaseUrl} ${currentRepo}`.trim();
+        const toLabel = `${desiredBaseUrl} ${desiredRepo}`.trim();
+        this.api.logger.warn?.(
+          `clawmem: backend changed from ${fromLabel} to ${toLabel}; resetting session mappings`,
+        );
+        this.state.baseUrl = desiredBaseUrl;
+        this.state.sessions = {};
+        this.client.clearEnsuredLabels?.();
+        await saveState(this.statePath, this.state);
+      }
+      return;
+    }
+
+    // Repo changed: reset session->issue mappings to avoid querying non-existent issues.
+    const fromLabel = `${currentBaseUrl ?? "<unknown>"} ${currentRepo}`.trim();
+    const toLabel = `${desiredBaseUrl ?? "<unknown>"} ${desiredRepo}`.trim();
+    this.api.logger.warn?.(
+      `clawmem: backend changed from ${fromLabel} to ${toLabel}; resetting session mappings`,
+    );
+    this.state.baseUrl = desiredBaseUrl;
+    this.state.repo = desiredRepo;
+    this.state.sessions = {};
+    this.client.clearEnsuredLabels?.();
+    await saveState(this.statePath, this.state);
   }
 
   private logBackgroundError(scope: string, error: unknown): void {

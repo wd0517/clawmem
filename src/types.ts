@@ -46,6 +46,9 @@ export type SessionMirrorState = {
 
 export type PluginState = {
   version: 1;
+  baseUrl?: string;
+  // Bound to a specific backend repo; if repo changes, session->issue mappings must be reset.
+  repo?: string;
   sessions: Record<string, SessionMirrorState>;
 };
 
