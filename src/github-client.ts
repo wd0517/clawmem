@@ -14,6 +14,21 @@ type RequestOptions = {
   omitAuth?: boolean;
 };
 
+type HttpError = Error & {
+  status?: number;
+  method?: string;
+  url?: string;
+  detail?: string;
+};
+
+function getHttpStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+  const status = (error as HttpError).status;
+  return typeof status === "number" ? status : undefined;
+}
+
 export class GitHubIssueClient {
   private readonly ensuredLabels = new Set<string>();
 
@@ -63,6 +78,14 @@ export class GitHubIssueClient {
     });
   }
 
+  async getIssueOrUndefined(issueNumber: number): Promise<IssueResponse | undefined> {
+    return this.request<IssueResponse | undefined>(
+      this.repoPath(`issues/${issueNumber}`),
+      { method: "GET" },
+      { allowNotFound: true },
+    );
+  }
+
   async createComment(issueNumber: number, body: string): Promise<void> {
     await this.request(this.repoPath(`issues/${issueNumber}/comments`), {
       method: "POST",
@@ -74,10 +97,20 @@ export class GitHubIssueClient {
     if (labels.length === 0) {
       return;
     }
-    await this.request(this.repoPath(`issues/${issueNumber}/labels`), {
-      method: "POST",
-      body: JSON.stringify({ labels }),
-    });
+    try {
+      await this.request(this.repoPath(`issues/${issueNumber}/labels`), {
+        method: "POST",
+        body: JSON.stringify({ labels }),
+      });
+    } catch (error) {
+      // Some GitHub-compatible backends may not implement labels endpoints.
+      // Labels are non-critical; do not fail the whole sync on 404.
+      if (getHttpStatus(error) === 404 || String(error).includes("HTTP 404:")) {
+        this.log.warn?.(`clawmem: addLabels not supported (404), skipping`);
+        return;
+      }
+      throw error;
+    }
   }
 
   async listIssues(params: {
@@ -99,28 +132,51 @@ export class GitHubIssueClient {
   }
 
   async removeLabel(issueNumber: number, label: string): Promise<void> {
-    await this.request(this.repoPath(`issues/${issueNumber}/labels/${encodeURIComponent(label)}`), {
-      method: "DELETE",
-    }, { allowNotFound: true });
+    try {
+      await this.request(
+        this.repoPath(`issues/${issueNumber}/labels/${encodeURIComponent(label)}`),
+        { method: "DELETE" },
+        { allowNotFound: true },
+      );
+    } catch (error) {
+      // Some GitHub-compatible backends may not implement labels endpoints.
+      // Labels are non-critical; do not fail the whole sync on 404.
+      if (getHttpStatus(error) === 404 || String(error).includes("HTTP 404:")) {
+        this.log.warn?.(`clawmem: removeLabel not supported (404), skipping`);
+        return;
+      }
+      throw error;
+    }
   }
 
   async ensureLabel(name: string, color: string, description: string): Promise<void> {
     if (!name.trim() || this.ensuredLabels.has(name)) {
       return;
     }
-    await this.request(
-      this.repoPath("labels"),
-      {
-        method: "POST",
-        body: JSON.stringify({
-          name,
-          color,
-          description,
-        }),
-      },
-      { allowValidationError: true },
-    );
-    this.ensuredLabels.add(name);
+    try {
+      await this.request(
+        this.repoPath("labels"),
+        {
+          method: "POST",
+          body: JSON.stringify({
+            name,
+            color,
+            description,
+          }),
+        },
+        { allowValidationError: true },
+      );
+      this.ensuredLabels.add(name);
+    } catch (error) {
+      // Some GitHub-compatible backends may not implement labels endpoints.
+      // Labels are non-critical; do not fail the whole sync on 404.
+      if (getHttpStatus(error) === 404 || String(error).includes("HTTP 404:")) {
+        this.log.warn?.(`clawmem: ensureLabel not supported (404), skipping`);
+        this.ensuredLabels.add(name);
+        return;
+      }
+      throw error;
+    }
   }
 
   async createAnonymousSession(): Promise<AnonymousSessionResponse> {
@@ -131,6 +187,10 @@ export class GitHubIssueClient {
       },
       { omitAuth: true },
     );
+  }
+
+  clearEnsuredLabels(): void {
+    this.ensuredLabels.clear();
   }
 
   private repoPath(suffix: string): string {
@@ -179,7 +239,16 @@ export class GitHubIssueClient {
     }
     if (!response.ok) {
       const detail = await response.text();
-      throw new Error(`HTTP ${response.status}: ${detail || response.statusText}`);
+      const method = init.method || "GET";
+      const url = new URL(pathname, `${baseUrl}/`).toString();
+      const error = new Error(
+        `HTTP ${response.status}: ${detail || response.statusText} (${method} ${url})`,
+      ) as HttpError;
+      error.status = response.status;
+      error.method = method;
+      error.url = url;
+      error.detail = detail;
+      throw error;
     }
     if (response.status === 204) {
       return undefined as T;
