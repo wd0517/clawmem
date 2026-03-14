@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk/core";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
 import { isPluginConfigured, resolvePluginConfig } from "./config.js";
 import { GitHubIssueClient } from "./github-client.js";
@@ -32,12 +32,6 @@ type FinalizePayload = {
   agentId?: string;
   reason?: string;
   messages?: unknown[];
-};
-
-type MemoryToolContext = {
-  sessionId?: string;
-  sessionKey?: string;
-  agentId?: string;
 };
 
 type MemoryDecision = {
@@ -77,8 +71,6 @@ class ClawMemService {
   }
 
   register(): void {
-    this.registerMemoryTools();
-
     this.api.on("before_agent_start", async (event) => {
       return this.handleBeforeAgentStart(event.prompt);
     });
@@ -145,230 +137,6 @@ class ClawMemService {
         await Promise.allSettled([...this.pendingTasks]);
       },
     });
-  }
-
-  private registerMemoryTools(): void {
-    this.api.registerTool(
-      (ctx) => this.buildSaveMemoryTool(ctx),
-      { name: "save_memory" },
-    );
-    this.api.registerTool(
-      (ctx) => this.buildSearchMemoryTool(ctx),
-      { name: "search_memory" },
-    );
-    this.api.registerTool(
-      (ctx) => this.buildRetrieveMemoryTool(ctx),
-      { name: "retrieve_memory" },
-    );
-    this.api.registerTool(
-      (ctx) => this.buildDeleteMemoryTool(ctx),
-      { name: "delete_memory" },
-    );
-  }
-
-  private buildSaveMemoryTool(ctx: MemoryToolContext): AnyAgentTool {
-    return {
-      name: "save_memory",
-      label: "Save Memory",
-      description:
-        "Save important information in long-term memory via ClawMem. Use for preferences, facts, decisions, and anything worth remembering.",
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        required: ["detail"],
-        properties: {
-          detail: {
-            type: "string",
-            description: "Information to remember.",
-          },
-          topics: {
-            type: "array",
-            description: "Optional topic labels to categorize the memory. Use for grouping memories by category.",
-            items: {
-              type: "string",
-              description: "A topic label to categorize the memory.",
-            },
-          },
-          sessionId: {
-            type: "string",
-            description: "Optional session override. Defaults to the current session.",
-          },
-        },
-      },
-      execute: async (_toolCallId, args) => {
-        const params = asRecord(args);
-        const detail = readRequiredString(params, "detail");
-        const topics = readOptionalStringArray(params, "topics");
-        const sessionId = readOptionalString(params, "sessionId") ?? ctx.sessionId;
-        if (!detail) {
-          return this.errorResult("save_memory requires information to remember.");
-        }
-        if (!sessionId) {
-          return this.errorResult("save_memory requires a sessionId to tag the memory.");
-        }
-        if (!(await this.ensureConfigured())) {
-          return this.errorResult("clawmem could not initialize Git credentials.");
-        }
-
-        try {
-          const memory = await this.createMemoryIssue(sessionId, detail, topics);
-          return this.textResult(
-            `Saved memory ${memory.memoryId}.`,
-            {
-              action: "saved",
-              memory,
-            },
-          );
-        } catch (error) {
-          return this.errorResult(`save_memory failed: ${String(error)}`);
-        }
-      },
-    };
-  }
-
-  private buildSearchMemoryTool(_ctx: MemoryToolContext): AnyAgentTool {
-    return {
-      name: "search_memory",
-      label: "Search Memory",
-      description:
-        "Search for memories by natural-language query. Returns only active memories. Use for finding specific memories or confirming information.",
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        required: ["query"],
-        properties: {
-          query: {
-            type: "string",
-            description: "The natural-language query to search for memories.",
-          },
-          limit: {
-            type: "number",
-            description: `Maximum number of results to return. Defaults to ${this.config.memoryRecallLimit}.`,
-          },
-        },
-      },
-      execute: async (_toolCallId, args) => {
-        const params = asRecord(args);
-        const query = readRequiredString(params, "query");
-        if (!query) {
-          return this.errorResult("search_memory requires a non-empty query.");
-        }
-        const limit = clampNumber(
-          readOptionalNumber(params, "limit") ?? this.config.memoryRecallLimit,
-          1,
-          20,
-        );
-        if (!(await this.ensureConfigured())) {
-          return this.errorResult("clawmem could not initialize Git credentials.");
-        }
-
-        try {
-          const memories = await this.searchActiveMemories(query, limit);
-          if (memories.length === 0) {
-            return this.textResult("No active memories found.", { count: 0, memories: [] });
-          }
-          const text = memories
-            .map((memory, index) => `${index + 1}. [${memory.memoryId}] ${memory.detail}`)
-            .join("\n");
-          return this.textResult(`Found ${memories.length} active memories:\n\n${text}`, {
-            count: memories.length,
-            memories,
-          });
-        } catch (error) {
-          return this.errorResult(`search_memory failed: ${String(error)}`);
-        }
-      },
-    };
-  }
-
-  private buildRetrieveMemoryTool(_ctx: MemoryToolContext): AnyAgentTool {
-    return {
-      name: "retrieve_memory",
-      label: "Retrieve Memory",
-      description: "Fetch a specific memory by its `memoryId` from ClawMem.",
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        required: ["memoryId"],
-        properties: {
-          memoryId: {
-            type: "string",
-            description: "The `memoryId` returned by `save_memory` or `search_memory`.",
-          },
-        },
-      },
-      execute: async (_toolCallId, args) => {
-        const params = asRecord(args);
-        const memoryId = readRequiredString(params, "memoryId");
-        if (!memoryId) {
-          return this.errorResult("retrieve_memory requires a `memoryId` to fetch.");
-        }
-        if (!(await this.ensureConfigured())) {
-          return this.errorResult("clawmem could not initialize Git credentials.");
-        }
-
-        try {
-          const memory = await this.findMemoryById(memoryId);
-          if (!memory) {
-            return this.errorResult(`Memory ${memoryId} not found.`);
-          }
-          return this.textResult(
-            `Memory ${memory.memoryId} (${memory.status}):\n${memory.detail}`,
-            { memory },
-          );
-        } catch (error) {
-          return this.errorResult(`retrieve_memory failed: ${String(error)}`);
-        }
-      },
-    };
-  }
-
-  private buildDeleteMemoryTool(_ctx: MemoryToolContext): AnyAgentTool {
-    return {
-      name: "delete_memory",
-      label: "Delete Memory",
-      description:
-        "Delete memory from ClawMem, this will mark the memory as stale and hide it from search results.",
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        required: ["memoryId"],
-        properties: {
-          memoryId: {
-            type: "string",
-            description: "The memoryId to mark as stale.",
-          },
-        },
-      },
-      execute: async (_toolCallId, args) => {
-        const params = asRecord(args);
-        const memoryId = readRequiredString(params, "memoryId");
-        if (!memoryId) {
-          return this.errorResult("delete_memory requires memoryId.");
-        }
-        if (!(await this.ensureConfigured())) {
-          return this.errorResult("clawmem could not initialize Git credentials.");
-        }
-
-        try {
-          const memory = await this.findMemoryById(memoryId);
-          if (!memory) {
-            return this.errorResult(`Memory ${memoryId} not found.`);
-          }
-          await this.ensureLabels([this.config.memoryStaleStatusLabel]);
-          await this.syncManagedLabels(
-            memory.issueNumber,
-            this.buildMemoryLabels(memory.sessionId, memory.date, "stale"),
-          );
-          return this.textResult(`Memory ${memory.memoryId} marked stale.`, {
-            action: "stale",
-            memoryId: memory.memoryId,
-          });
-        } catch (error) {
-          return this.errorResult(`delete_memory failed: ${String(error)}`);
-        }
-      },
-    };
   }
 
   private async handleBeforeAgentStart(prompt: unknown): Promise<{ prependContext: string } | void> {
@@ -1030,11 +798,6 @@ class ClawMemService {
     return scored;
   }
 
-  private async findMemoryById(memoryId: string): Promise<ParsedMemoryIssue | null> {
-    const memories = await this.listMemoryIssues("all");
-    return memories.find((memory) => memory.memoryId === memoryId) ?? null;
-  }
-
   private async listMemoryIssues(status: "active" | "stale" | "all"): Promise<ParsedMemoryIssue[]> {
     const labels = ["type:memory"];
     if (status === "active") {
@@ -1503,41 +1266,6 @@ class ClawMemService {
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-}
-
-function readOptionalString(params: Record<string, unknown>, key: string): string | undefined {
-  const value = params[key];
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  return trimmed || undefined;
-}
-
-function readRequiredString(params: Record<string, unknown>, key: string): string {
-  return readOptionalString(params, key) ?? "";
-}
-
-function readOptionalNumber(params: Record<string, unknown>, key: string): number | undefined {
-  const value = params[key];
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) {
-      return parsed;
-    }
-  }
-  return undefined;
-}
-
-function readOptionalStringArray(params: Record<string, unknown>, key: string): string[] {
-  const value = params[key];
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.filter((entry): entry is string => typeof entry === "string");
 }
 
 function clampNumber(value: number, min: number, max: number): number {

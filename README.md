@@ -9,7 +9,6 @@ Current behavior:
 - Appends one issue comment per mirrored `user` or `assistant` message.
 - Uses an OpenClaw subagent to generate the final conversation summary on finalize.
 - Uses an OpenClaw subagent to extract durable memories on finalize and store them as memory issues.
-- Exposes memory tools: `save_memory`, `search_memory`, `retrieve_memory`, `delete_memory`.
 - Stores each memory as a separate `type:memory` issue with `memory-status:active` or `memory-status:stale`.
 - Injects relevant active memories into context before agent start.
 
@@ -81,18 +80,11 @@ Example after automatic provisioning:
 }
 ```
 
-## Memory Tools
-
-- `save_memory`: create a new active memory tied to the current session, with optional `topic:*` labels.
-- `search_memory`: search only active memories.
-- `retrieve_memory`: fetch a memory by `memoryId`.
-- `delete_memory`: soft-delete by changing the memory label from active to stale.
-
 ## Notes
 
 - Conversation issue comments ignore tool calls, tool results, system messages, and heartbeat noise because transcript normalization keeps only `user` and `assistant` content.
 - Conversation summary failures do not block issue finalization; the YAML `summary` field is written as `failed: ...`.
 - Conversation issue bodies store `date` as `YYYY-MM-DD`, and `start_at` / `end_at` as local `YYYY-MM-DDTHH:mm:ss`.
 - Memory search and auto-injection only return `memory-status:active` issues.
-- Durable memories are auto-captured on session finalize; manual memory tools remain available for explicit save/search/delete.
+- Durable memories are auto-captured on session finalize; no memory tools are injected into the agent tool list.
 - Memory issue bodies store only the memory detail text itself; metadata comes from labels and the issue number.

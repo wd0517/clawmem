@@ -142,11 +142,15 @@ Semantics:
 
 ---
 
-## 4. Tool Semantics
+## 4. Memory Lifecycle
 
-### 4.1 `save_memory`
+The current implementation does not inject any memory tools into the agent tool list.
 
-`save_memory` creates a new memory issue.
+Memory creation, recall, and staling remain internal plugin behaviors.
+
+### 4.1 Creation
+
+New durable memories are created during the finalize pipeline.
 
 Default behavior:
 
@@ -156,35 +160,20 @@ Default behavior:
 - optionally apply one or more `topic:*` labels
 - apply `memory-status:active`
 
-In addition to the explicit tool, the plugin may auto-capture memory on conversation finalization by running an AI extraction step over the finalized transcript.
+### 4.2 Recall
 
-### 4.2 `search_memory`
-
-`search_memory` returns only active memory.
+Relevant active memories may still be injected into prompt context before agent start.
 
 Default filter:
 
 - `type:memory`
 - `memory-status:active`
 
-### 4.3 `retrieve_memory`
+### 4.3 Staling
 
-`retrieve_memory` retrieves a specific memory by `memory_id`.
+Memories are not hard-deleted.
 
-For memory issues created by the current implementation, `memory_id` is the issue number rendered as a string.
-
-Unlike search, exact retrieval is allowed to return either:
-
-- `memory-status:active`
-- `memory-status:stale`
-
-### 4.4 `delete_memory`
-
-The plugin must expose a `delete_memory` tool.
-
-`delete_memory` does not physically delete an issue.
-
-Instead it changes memory state from:
+When the finalize-time memory decision determines an existing memory is outdated, the plugin changes its state from:
 
 - `memory-status:active`
 
@@ -192,9 +181,7 @@ to:
 
 - `memory-status:stale`
 
-This makes deletion a logical state transition rather than a hard delete.
-
-The decision to add or delete memory is left to AI policy.
+This keeps memory removal as a logical state transition rather than a hard delete.
 
 In the current implementation, finalized conversations are passed through an AI extraction step that may:
 
