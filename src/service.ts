@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
+import { KeyedAsyncQueue } from "./keyed-async-queue.js";
 import { isPluginConfigured, resolvePluginConfig } from "./config.js";
 import { GitHubIssueClient } from "./github-client.js";
 import { loadState, resolveStatePath, saveState } from "./state.js";
