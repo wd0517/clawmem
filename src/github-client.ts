@@ -1,198 +1,64 @@
+// GitHub Issues API client for clawmem. No label caching — idempotent create-if-absent.
+import { resolveLabelColor, labelDescription, extractLabelNames, isManagedLabel } from "./config.js";
 import type { AnonymousSessionResponse, ClawMemPluginConfig } from "./types.js";
 
-type IssueResponse = {
-  number: number;
-  title?: string;
-  body?: string;
-  state?: string;
-  labels?: Array<{ name?: string } | string>;
-};
-
-type RequestOptions = {
-  allowNotFound?: boolean;
-  allowValidationError?: boolean;
-  omitAuth?: boolean;
-};
+type IssueResponse = { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> };
+type ReqOpts = { allowNotFound?: boolean; allowValidationError?: boolean; omitAuth?: boolean };
 
 export class GitHubIssueClient {
-  private readonly ensuredLabels = new Set<string>();
+  constructor(private readonly config: ClawMemPluginConfig, private readonly log: { warn?: (msg: string) => void }) {}
 
-  constructor(
-    private readonly config: ClawMemPluginConfig,
-    private readonly log: {
-      info?: (message: string) => void;
-      warn?: (message: string) => void;
-      error?: (message: string) => void;
-      debug?: (message: string) => void;
-    },
-  ) {}
-
-  async createIssue(params: {
-    title: string;
-    body: string;
-    labels: string[];
-  }): Promise<IssueResponse> {
-    return this.request<IssueResponse>(this.repoPath("issues"), {
-      method: "POST",
-      body: JSON.stringify({
-        title: params.title,
-        body: params.body,
-        labels: params.labels,
-      }),
-    });
+  async createIssue(params: { title: string; body: string; labels: string[] }): Promise<IssueResponse> {
+    return this.req<IssueResponse>(this.repoPath("issues"), { method: "POST", body: JSON.stringify(params) });
   }
-
-  async updateIssue(
-    issueNumber: number,
-    params: {
-      title?: string;
-      body?: string;
-      state?: "open" | "closed";
-      labels?: string[];
-    },
-  ): Promise<IssueResponse> {
-    return this.request<IssueResponse>(this.repoPath(`issues/${issueNumber}`), {
-      method: "PATCH",
-      body: JSON.stringify(params),
-    });
+  async updateIssue(n: number, params: { title?: string; body?: string; state?: "open" | "closed"; labels?: string[] }): Promise<IssueResponse> {
+    return this.req<IssueResponse>(this.repoPath(`issues/${n}`), { method: "PATCH", body: JSON.stringify(params) });
   }
-
-  async getIssue(issueNumber: number): Promise<IssueResponse> {
-    return this.request<IssueResponse>(this.repoPath(`issues/${issueNumber}`), {
-      method: "GET",
-    });
+  async getIssue(n: number): Promise<IssueResponse> {
+    return this.req<IssueResponse>(this.repoPath(`issues/${n}`), { method: "GET" });
   }
-
   async createComment(issueNumber: number, body: string): Promise<void> {
-    await this.request(this.repoPath(`issues/${issueNumber}/comments`), {
-      method: "POST",
-      body: JSON.stringify({ body }),
-    });
+    await this.req(this.repoPath(`issues/${issueNumber}/comments`), { method: "POST", body: JSON.stringify({ body }) });
   }
-
-  async addLabels(issueNumber: number, labels: string[]): Promise<void> {
-    if (labels.length === 0) {
-      return;
+  async listIssues(params: { labels?: string[]; state?: "open" | "closed" | "all"; page?: number; perPage?: number }): Promise<IssueResponse[]> {
+    const q = new URLSearchParams();
+    q.set("state", params.state ?? "open"); q.set("page", String(params.page ?? 1)); q.set("per_page", String(params.perPage ?? 100));
+    if (params.labels?.length) q.set("labels", params.labels.join(","));
+    return this.req<IssueResponse[]>(`${this.repoPath("issues")}?${q}`, { method: "GET" });
+  }
+  async ensureLabels(labels: string[]): Promise<void> {
+    for (const label of labels) {
+      if (!label.trim()) continue;
+      await this.req(this.repoPath("labels"), { method: "POST",
+        body: JSON.stringify({ name: label, color: resolveLabelColor(label), description: labelDescription(label) }) }, { allowValidationError: true });
     }
-    await this.request(this.repoPath(`issues/${issueNumber}/labels`), {
-      method: "POST",
-      body: JSON.stringify({ labels }),
-    });
   }
-
-  async listIssues(params: {
-    labels?: string[];
-    state?: "open" | "closed" | "all";
-    page?: number;
-    perPage?: number;
-  }): Promise<IssueResponse[]> {
-    const query = new URLSearchParams();
-    query.set("state", params.state ?? "open");
-    query.set("page", String(params.page ?? 1));
-    query.set("per_page", String(params.perPage ?? 100));
-    if (params.labels && params.labels.length > 0) {
-      query.set("labels", params.labels.join(","));
-    }
-    return this.request<IssueResponse[]>(`${this.repoPath("issues")}?${query.toString()}`, {
-      method: "GET",
-    });
+  async syncManagedLabels(issueNumber: number, desired: string[]): Promise<void> {
+    const issue = await this.getIssue(issueNumber);
+    const unmanaged = extractLabelNames(issue.labels).filter((l) => !isManagedLabel(l));
+    await this.updateIssue(issueNumber, { labels: [...new Set([...unmanaged, ...desired])] });
   }
-
-  async removeLabel(issueNumber: number, label: string): Promise<void> {
-    await this.request(this.repoPath(`issues/${issueNumber}/labels/${encodeURIComponent(label)}`), {
-      method: "DELETE",
-    }, { allowNotFound: true });
-  }
-
-  async ensureLabel(name: string, color: string, description: string): Promise<void> {
-    if (!name.trim() || this.ensuredLabels.has(name)) {
-      return;
-    }
-    await this.request(
-      this.repoPath("labels"),
-      {
-        method: "POST",
-        body: JSON.stringify({
-          name,
-          color,
-          description,
-        }),
-      },
-      { allowValidationError: true },
-    );
-    this.ensuredLabels.add(name);
-  }
-
   async createAnonymousSession(): Promise<AnonymousSessionResponse> {
-    return this.request<AnonymousSessionResponse>(
-      "anonymous/session",
-      {
-        method: "POST",
-      },
-      { omitAuth: true },
-    );
+    return this.req<AnonymousSessionResponse>("anonymous/session", { method: "POST" }, { omitAuth: true });
   }
 
   private repoPath(suffix: string): string {
-    if (!this.config.repo) {
-      throw new Error("clawmem repository is not configured");
-    }
+    if (!this.config.repo) throw new Error("clawmem repository is not configured");
     return `repos/${this.config.repo}/${suffix}`;
   }
-
-  private async request<T = void>(
-    pathname: string,
-    init: RequestInit,
-    options: RequestOptions = {},
-  ): Promise<T> {
-    if (!this.config.baseUrl) {
-      throw new Error("clawmem baseUrl is not configured");
-    }
-    if (!options.omitAuth && !this.config.token) {
-      throw new Error("clawmem token is not configured");
-    }
-    const baseUrl = this.config.baseUrl.replace(/\/+$/, "");
-    const authHeaders =
-      options.omitAuth
-        ? {}
-        : {
-            Authorization:
-              this.config.authScheme === "bearer"
-                ? `Bearer ${this.config.token}`
-                : `token ${this.config.token}`,
-          };
-    const response = await fetch(new URL(pathname, `${baseUrl}/`), {
-      ...init,
-      headers: {
-        Accept: "application/vnd.github+json",
-        "Content-Type": "application/json",
-        ...authHeaders,
-        ...(init.headers ?? {}),
-      },
-    });
-
-    if (response.status === 404 && options.allowNotFound) {
-      return undefined as T;
-    }
-    if (response.status === 422 && options.allowValidationError) {
-      return undefined as T;
-    }
-    if (!response.ok) {
-      const detail = await response.text();
-      throw new Error(`HTTP ${response.status}: ${detail || response.statusText}`);
-    }
-    if (response.status === 204) {
-      return undefined as T;
-    }
-    const text = await response.text();
-    if (!text.trim()) {
-      return undefined as T;
-    }
-    try {
-      return JSON.parse(text) as T;
-    } catch (error) {
-      this.log.warn?.(`clawmem: failed to parse API response: ${String(error)}`);
-      return undefined as T;
-    }
+  private async req<T = void>(pathname: string, init: RequestInit, opts: ReqOpts = {}): Promise<T> {
+    if (!this.config.baseUrl) throw new Error("clawmem baseUrl is not configured");
+    if (!opts.omitAuth && !this.config.token) throw new Error("clawmem token is not configured");
+    const base = this.config.baseUrl.replace(/\/+$/, "");
+    const headers: Record<string, string> = { Accept: "application/vnd.github+json", "Content-Type": "application/json" };
+    if (!opts.omitAuth) headers.Authorization = this.config.authScheme === "bearer" ? `Bearer ${this.config.token}` : `token ${this.config.token}`;
+    const res = await fetch(new URL(pathname, `${base}/`), { ...init, headers: { ...headers, ...(init.headers ?? {}) } });
+    if (res.status === 404 && opts.allowNotFound) return undefined as T;
+    if (res.status === 422 && opts.allowValidationError) return undefined as T;
+    if (!res.ok) { const d = await res.text(); throw new Error(`HTTP ${res.status}: ${d || res.statusText}`); }
+    if (res.status === 204) return undefined as T;
+    const text = await res.text();
+    if (!text.trim()) return undefined as T;
+    try { return JSON.parse(text) as T; } catch (e) { this.log.warn?.(`clawmem: failed to parse API response: ${String(e)}`); return undefined as T; }
   }
 }
