@@ -32,7 +32,7 @@ Finally: your `IDENTITY.md` is not something you fill out on day one. It fills i
 ## Install
 
 ```bash
-openclaw plugins install @wd0517/clawmem
+openclaw plugins install @clawmem-ai/clawmem
 openclaw gateway restart
 ```
 

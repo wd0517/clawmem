@@ -1,5 +1,5 @@
 {
-  "name": "@wd0517/clawmem",
+  "name": "@clawmem-ai/clawmem",
   "version": "0.1.3",
   "description": "Mirror OpenClaw sessions into GitHub-compatible issues and comments.",
   "type": "module",
