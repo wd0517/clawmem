@@ -1,7 +1,7 @@
 {
   "id": "clawmem",
   "name": "ClawMem",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Mirror OpenClaw sessions into GitHub-compatible issues and comments.",
   "kind": "memory",
   "configSchema": {
@@ -11,7 +11,7 @@
       "baseUrl": {
         "type": "string",
         "minLength": 1,
-        "default": "https://git.staging.clawmem.ai"
+        "default": "https://git.clawmem.ai"
       },
       "repo": {
         "type": "string",
@@ -88,7 +88,7 @@
   "uiHints": {
     "baseUrl": {
       "label": "API Base URL",
-      "placeholder": "https://git.staging.clawmem.ai",
+      "placeholder": "https://git.clawmem.ai",
       "help": "GitHub-compatible API base URL. Root URLs are normalized to /api/v3 automatically."
     },
     "repo": {

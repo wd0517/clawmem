@@ -36,7 +36,7 @@ openclaw plugins install @clawmem-ai/clawmem
 openclaw gateway restart
 ```
 
-After restart, clawmem auto-provisions a private repo on `git.staging.clawmem.ai` and writes `token` + `repo` back into your config. Memories start accumulating from the next session.
+After restart, clawmem auto-provisions a private repo on `git.clawmem.ai` and writes `token` + `repo` back into your config. Memories start accumulating from the next session.
 
 ---
 
@@ -132,7 +132,7 @@ After any significant realization, create a memory issue directly:
 CLAWMEM_TOKEN="<your-token>"
 CLAWMEM_REPO="<owner/repo>"   # from openclaw.json after provisioning
 
-curl -X POST "https://git.staging.clawmem.ai/api/v3/repos/$CLAWMEM_REPO/issues" \
+curl -X POST "https://git.clawmem.ai/api/v3/repos/$CLAWMEM_REPO/issues" \
   -H "Authorization: token $CLAWMEM_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -156,7 +156,7 @@ clawmem manages your private memories. For knowledge shared across agents or tea
 **Create a team memory repo:**
 
 ```bash
-curl -X POST "https://git.staging.clawmem.ai/api/v3/user/repos" \
+curl -X POST "https://git.clawmem.ai/api/v3/user/repos" \
   -H "Authorization: token $CLAWMEM_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name": "team-memory", "private": false, "has_issues": true}'
@@ -165,7 +165,7 @@ curl -X POST "https://git.staging.clawmem.ai/api/v3/user/repos" \
 **Write a team memory (using `gh` CLI):**
 
 ```bash
-GH_HOST=git.staging.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
+GH_HOST=git.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
   gh issue create --repo <owner/team-memory> \
     --title "Memory: ..." \
     --body "..." \
@@ -175,7 +175,7 @@ GH_HOST=git.staging.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
 **Read team memories:**
 
 ```bash
-GH_HOST=git.staging.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
+GH_HOST=git.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
   gh issue list --repo <owner/team-memory> \
     --label "memory-status:active" \
     --json number,title,body
@@ -218,7 +218,7 @@ Minimal config (after auto-provisioning):
       clawmem: {
         enabled: true,
         config: {
-          baseUrl: "https://git.staging.clawmem.ai/api/v3",
+          baseUrl: "https://git.clawmem.ai/api/v3",
           repo: "owner/repo",
           token: "<token>",
           authScheme: "token"
@@ -238,7 +238,7 @@ Full config with all options:
       clawmem: {
         enabled: true,
         config: {
-          baseUrl: "https://git.staging.clawmem.ai/api/v3",
+          baseUrl: "https://git.clawmem.ai/api/v3",
           authScheme: "token",
           issueTitlePrefix: "Session: ",
           memoryTitlePrefix: "Memory: ",

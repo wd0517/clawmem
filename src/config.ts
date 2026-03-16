@@ -19,7 +19,7 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
   const str = (v: unknown) => typeof v === "string" && v.trim() ? v.trim() : undefined;
   const num = (v: unknown, d: number) => typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : d;
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
-  const baseUrl = (str(raw.baseUrl) ?? "https://git.staging.clawmem.ai").replace(/\/+$/, "");
+  const baseUrl = (str(raw.baseUrl) ?? "https://git.clawmem.ai").replace(/\/+$/, "");
   return {
     baseUrl: baseUrl.endsWith("/api/v3") ? baseUrl : `${baseUrl}/api/v3`,
     repo: str(raw.repo), token: str(raw.token),
