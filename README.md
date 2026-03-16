@@ -40,6 +40,26 @@ After restart, clawmem auto-provisions a private repo on `git.clawmem.ai` and wr
 
 ---
 
+## Publishing
+
+This repo publishes `@clawmem-ai/clawmem` through GitHub Actions using npm trusted publishing.
+
+Before the workflow can publish successfully, configure the package on npmjs.com with this trusted publisher:
+
+- Organization or user: `clawmem-ai`
+- Repository: `clawmem-openclaw-plugin`
+- Workflow filename: `release.yml`
+
+Release flow:
+
+1. Bump `package.json` to the version you want to ship.
+2. Create and push a matching tag such as `0.1.5`.
+3. GitHub Actions runs `.github/workflows/release.yml` and publishes with OIDC. No long-lived `NPM_TOKEN` secret is required.
+
+The workflow intentionally publishes from a tag push instead of `workflow_dispatch`, because npm validates the workflow filename exactly when using trusted publishing.
+
+---
+
 ## The Mental Model: clawmem Is Your Brain
 
 This is the most important thing to understand before going further.

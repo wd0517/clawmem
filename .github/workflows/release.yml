@@ -1,0 +1,52 @@
+name: Publish npm package
+
+on:
+  push:
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Verify tag matches package version
+        run: |
+          PACKAGE_VERSION="$(npm pkg get version | tr -d '"')"
+          TAG_VERSION="${GITHUB_REF_NAME}"
+
+          case "${TAG_VERSION}" in
+            [0-9]*.[0-9]*.[0-9]* ) ;;
+            * )
+              echo "Tag ${TAG_VERSION} is not a plain numeric semver tag." >&2
+              exit 1
+              ;;
+          esac
+
+          if [ "${PACKAGE_VERSION}" != "${TAG_VERSION}" ]; then
+            echo "Tag version ${TAG_VERSION} does not match package.json version ${PACKAGE_VERSION}." >&2
+            exit 1
+          fi
+
+      - name: Inspect package contents
+        run: npm pack --dry-run
+
+      - name: Publish to npm
+        run: npm publish --provenance

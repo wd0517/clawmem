@@ -1,9 +1,13 @@
 {
   "name": "@clawmem-ai/clawmem",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Mirror OpenClaw sessions into GitHub-compatible issues and comments.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clawmem-ai/clawmem-openclaw-plugin.git"
+  },
   "files": [
     "index.ts",
     "openclaw.plugin.json",
