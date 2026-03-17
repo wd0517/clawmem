@@ -78,7 +78,13 @@ class ClawMemService {
     let snap: TranscriptSnapshot;
     try { snap = await readTranscriptSnapshot(sessionFile); } catch (e) { this.warn("transcript read", e); return; }
     if (!snap.sessionId) return;
-    const agentId = inferAgentIdFromTranscriptPath(sessionFile);
+    const agentId = this.resolveTranscriptAgentId(snap.sessionId, sessionFile);
+    if (!agentId) {
+      this.api.logger.info?.(
+        `clawmem: skipping transcript sync for ${snap.sessionId} because agent ownership could not be inferred from ${sessionFile}`,
+      );
+      return;
+    }
     const { conv } = this.getServices(agentId);
     if (!conv.shouldMirror(snap.sessionId, snap.messages)) return;
     if (!(await this.ensureConfigured(agentId))) return;
@@ -182,6 +188,17 @@ class ClawMemService {
     };
     this.state.sessions[scopeKey] = s;
     return s;
+  }
+  private resolveTranscriptAgentId(sessionId: string, sessionFile: string): string | null {
+    const fromPath = inferAgentIdFromTranscriptPath(sessionFile);
+    if (fromPath) return fromPath;
+    const knownAgents = new Set(
+      Object.values(this.state.sessions)
+        .filter((session) => session.sessionId === sessionId)
+        .map((session) => normalizeAgentId(session.agentId)),
+    );
+    if (knownAgents.size === 1) return [...knownAgents][0] ?? null;
+    return null;
   }
   private async persistState(): Promise<void> {
     if (!this.statePath) this.statePath = resolveStatePath(this.api.runtime.state.resolveStateDir());
