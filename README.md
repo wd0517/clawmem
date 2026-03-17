@@ -53,7 +53,7 @@ Before the workflow can publish successfully, configure the package on npmjs.com
 Release flow:
 
 1. Bump `package.json` to the version you want to ship.
-2. Create and push a matching tag such as `0.1.5`.
+2. Create and push a matching tag such as `0.1.6`.
 3. GitHub Actions runs `.github/workflows/release.yml` and publishes with OIDC. No long-lived `NPM_TOKEN` secret is required.
 
 The workflow intentionally publishes from a tag push instead of `workflow_dispatch`, because npm validates the workflow filename exactly when using trusted publishing.
