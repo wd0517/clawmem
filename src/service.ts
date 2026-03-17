@@ -146,7 +146,14 @@ class ClawMemService {
     return this.queue.enqueue(sessionId, async () => { await this.ensureLoaded(); return task(); });
   }
   private track<T>(promise: Promise<T>): Promise<T> {
-    this.pending.add(promise); void promise.finally(() => this.pending.delete(promise)); return promise;
+    this.pending.add(promise);
+    // Avoid creating a second rejecting promise via finally(); OpenClaw treats
+    // unhandled rejections as fatal and exits the gateway process.
+    void promise.then(
+      () => this.pending.delete(promise),
+      () => this.pending.delete(promise),
+    );
+    return promise;
   }
   private getOrCreate(sessionId: string): SessionMirrorState {
     if (this.state.sessions[sessionId]) return this.state.sessions[sessionId];
