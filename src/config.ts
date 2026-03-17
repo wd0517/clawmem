@@ -1,6 +1,7 @@
 // Hardcoded label/prefix constants and plugin config resolution.
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import type { ClawMemPluginConfig } from "./types.js";
+import type { ClawMemAgentConfig, ClawMemPluginConfig, ClawMemResolvedRoute } from "./types.js";
+import { normalizeAgentId } from "./utils.js";
 
 export const SESSION_TITLE_PREFIX = "Session: ";
 export const MEMORY_TITLE_PREFIX = "Memory: ";
@@ -20,18 +21,46 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
   const num = (v: unknown, d: number) => typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : d;
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
   const baseUrl = (str(raw.baseUrl) ?? "https://git.clawmem.ai").replace(/\/+$/, "");
+  const rawAgents = raw.agents && typeof raw.agents === "object" && !Array.isArray(raw.agents)
+    ? (raw.agents as Record<string, unknown>)
+    : {};
+  const agents: Record<string, ClawMemAgentConfig> = {};
+  for (const [rawAgentId, rawAgentConfig] of Object.entries(rawAgents)) {
+    if (!rawAgentConfig || typeof rawAgentConfig !== "object" || Array.isArray(rawAgentConfig)) continue;
+    const agentId = normalizeAgentId(rawAgentId);
+    const agent = rawAgentConfig as Record<string, unknown>;
+    agents[agentId] = {
+      baseUrl: str(agent.baseUrl)?.replace(/\/+$/, ""),
+      repo: str(agent.repo),
+      token: str(agent.token),
+      authScheme: agent.authScheme === "bearer" ? "bearer" : agent.authScheme === "token" ? "token" : undefined,
+    };
+  }
   return {
     baseUrl: baseUrl.endsWith("/api/v3") ? baseUrl : `${baseUrl}/api/v3`,
-    repo: str(raw.repo), token: str(raw.token),
     authScheme: raw.authScheme === "bearer" ? "bearer" : "token",
+    agents,
     memoryRecallLimit: clamp(num(raw.memoryRecallLimit, 5), 1, 20),
     turnCommentDelayMs: num(raw.turnCommentDelayMs, 1000),
     summaryWaitTimeoutMs: clamp(num(raw.summaryWaitTimeoutMs, 120000), 1000, 600000),
   };
 }
 
-export function isPluginConfigured(config: ClawMemPluginConfig): boolean {
-  return Boolean(config.baseUrl && config.repo && config.token);
+export function resolveAgentRoute(config: ClawMemPluginConfig, agentId?: string): ClawMemResolvedRoute {
+  const id = normalizeAgentId(agentId);
+  const agent = config.agents[id] ?? {};
+  const baseUrl = (agent.baseUrl ?? config.baseUrl).replace(/\/+$/, "");
+  return {
+    agentId: id,
+    baseUrl: baseUrl.endsWith("/api/v3") ? baseUrl : `${baseUrl}/api/v3`,
+    repo: agent.repo?.trim() || undefined,
+    token: agent.token?.trim() || undefined,
+    authScheme: agent.authScheme === "bearer" ? "bearer" : config.authScheme,
+  };
+}
+
+export function isAgentConfigured(route: ClawMemResolvedRoute): boolean {
+  return Boolean(route.baseUrl && route.repo && route.token);
 }
 
 export function resolveLabelColor(label: string): string {

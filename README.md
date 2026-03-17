@@ -36,7 +36,7 @@ openclaw plugins install @clawmem-ai/clawmem
 openclaw gateway restart
 ```
 
-After restart, clawmem auto-provisions a private repo on `git.clawmem.ai` and writes `token` + `repo` back into your config. Memories start accumulating from the next session.
+After restart, clawmem provisions per-agent memory repos on `git.clawmem.ai` as each agent is first used, then writes that agent's `token` + `repo` back into your config under `plugins.entries.clawmem.config.agents.<agentId>`. Memories start accumulating from that agent's next session.
 
 ---
 
@@ -239,9 +239,15 @@ Minimal config (after auto-provisioning):
         enabled: true,
         config: {
           baseUrl: "https://git.clawmem.ai/api/v3",
-          repo: "owner/repo",
-          token: "<token>",
-          authScheme: "token"
+          authScheme: "token",
+          agents: {
+            main: {
+              baseUrl: "https://git.clawmem.ai/api/v3",
+              repo: "owner/main-memory",
+              token: "<token>",
+              authScheme: "token"
+            }
+          }
         }
       }
     }
@@ -260,6 +266,18 @@ Full config with all options:
         config: {
           baseUrl: "https://git.clawmem.ai/api/v3",
           authScheme: "token",
+          agents: {
+            main: {
+              baseUrl: "https://git.clawmem.ai/api/v3",
+              repo: "owner/main-memory",
+              token: "<token>",
+              authScheme: "token"
+            },
+            coder: {
+              repo: "owner/coder-memory",
+              token: "<token>"
+            }
+          },
           issueTitlePrefix: "Session: ",
           memoryTitlePrefix: "Memory: ",
           defaultLabels: ["source:openclaw"],

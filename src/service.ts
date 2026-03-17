@@ -1,6 +1,6 @@
 // Thin orchestrator: wires conversation mirroring, memory store, and plugin lifecycle.
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { isPluginConfigured, resolvePluginConfig } from "./config.js";
+import { isAgentConfigured, resolveAgentRoute, resolvePluginConfig } from "./config.js";
 import { ConversationMirror } from "./conversation.js";
 import { GitHubIssueClient } from "./github-client.js";
 import { KeyedAsyncQueue } from "./keyed-async-queue.js";
@@ -8,34 +8,29 @@ import { MemoryStore } from "./memory.js";
 import { loadState, resolveStatePath, saveState } from "./state.js";
 import { readTranscriptSnapshot } from "./transcript.js";
 import type { ClawMemPluginConfig, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import { inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
 
 type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; messages: unknown[] };
 type FinalizePayload = { sessionId?: string; sessionKey?: string; sessionFile?: string; agentId?: string; reason?: string; messages?: unknown[] };
 
 class ClawMemService {
   private readonly config: ClawMemPluginConfig;
-  private readonly client: GitHubIssueClient;
-  private readonly conv: ConversationMirror;
-  private readonly mem: MemoryStore;
   private readonly queue = new KeyedAsyncQueue();
   private readonly stateQueue = new KeyedAsyncQueue();
   private readonly pending = new Set<Promise<unknown>>();
   private readonly syncTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private statePath = "";
-  private state: PluginState = { version: 1, sessions: {} };
+  private state: PluginState = { version: 2, sessions: {} };
   private unsubTranscript?: () => void;
   private loadPromise: Promise<void> | null = null;
-  private configPromise: Promise<boolean> | null = null;
+  private readonly configPromises = new Map<string, Promise<boolean>>();
 
   constructor(private readonly api: OpenClawPluginApi) {
     this.config = resolvePluginConfig(api);
-    this.client = new GitHubIssueClient(this.config, api.logger);
-    this.conv = new ConversationMirror(this.client, api, this.config);
-    this.mem = new MemoryStore(this.client, api, this.config);
   }
 
   register(): void {
-    this.api.on("before_agent_start", async (ev) => this.handleRecall(ev.prompt));
+    this.api.on("before_agent_start", async (ev, ctx) => this.handleRecall(ev.prompt, ctx.agentId));
     this.api.on("agent_end", (ev, ctx) => this.scheduleTurn({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, agentId: ctx.agentId, messages: ev.messages }));
     this.api.on("before_reset", (ev, ctx) => this.enqueueFinalize({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, sessionFile: ev.sessionFile, agentId: ctx.agentId, reason: ev.reason, messages: ev.messages }));
     this.api.on("session_end", (ev, ctx) => this.enqueueFinalize({ sessionId: ev.sessionId ?? ctx.sessionId, sessionKey: ev.sessionKey ?? ctx.sessionKey, agentId: ctx.agentId, reason: "session_end" }));
@@ -45,12 +40,17 @@ class ClawMemService {
       start: async (ctx) => {
         this.statePath = resolveStatePath(ctx.stateDir);
         await this.ensureLoaded();
-        const ok = await this.ensureConfigured();
         this.unsubTranscript = this.api.runtime.events.onSessionTranscriptUpdate((u) => {
           void this.track(this.handleTranscript(u.sessionFile)).catch((e) => this.warn("transcript update", e));
         });
-        if (ok) this.api.logger.info?.(`clawmem: mirroring sessions to ${this.config.repo} via ${this.config.baseUrl}`);
-        else this.api.logger.warn(`clawmem: missing repo/token and automatic provisioning failed via ${this.config.baseUrl}; sync will retry on the next use`);
+        const configuredCount = Object.keys(this.config.agents).filter((agentId) => {
+          return isAgentConfigured(resolveAgentRoute(this.config, agentId));
+        }).length;
+        this.api.logger.info?.(
+          configuredCount > 0
+            ? `clawmem: ready with ${configuredCount} configured agent route(s); missing routes will provision on first use via ${this.config.baseUrl}`
+            : `clawmem: ready; agent routes will provision on first use via ${this.config.baseUrl}`,
+        );
       },
       stop: async () => {
         this.unsubTranscript?.();
@@ -61,11 +61,13 @@ class ClawMemService {
     });
   }
 
-  private async handleRecall(prompt: unknown): Promise<{ prependContext: string } | void> {
+  private async handleRecall(prompt: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
     if (typeof prompt !== "string" || prompt.trim().length < 5) return;
-    if (!(await this.ensureConfigured())) return;
+    const routeAgentId = normalizeAgentId(agentId);
+    if (!(await this.ensureConfigured(routeAgentId))) return;
     try {
-      const memories = await this.mem.search(prompt, this.config.memoryRecallLimit);
+      const { mem } = this.getServices(routeAgentId);
+      const memories = await mem.search(prompt, this.config.memoryRecallLimit);
       if (memories.length === 0) return;
       const text = memories.map((m) => `- ${m.detail}`).join("\n");
       return { prependContext: `<relevant-memories>\nThe following active memories may be relevant to this conversation:\n${text}\n</relevant-memories>` };
@@ -75,67 +77,78 @@ class ClawMemService {
   private async handleTranscript(sessionFile: string): Promise<void> {
     let snap: TranscriptSnapshot;
     try { snap = await readTranscriptSnapshot(sessionFile); } catch (e) { this.warn("transcript read", e); return; }
-    if (!snap.sessionId || !this.conv.shouldMirror(snap.sessionId, snap.messages)) return;
-    if (!(await this.ensureConfigured())) return;
-    await this.enqueueSession(snap.sessionId, async () => {
-      const s = this.getOrCreate(snap.sessionId!);
+    if (!snap.sessionId) return;
+    const agentId = inferAgentIdFromTranscriptPath(sessionFile);
+    const { conv } = this.getServices(agentId);
+    if (!conv.shouldMirror(snap.sessionId, snap.messages)) return;
+    if (!(await this.ensureConfigured(agentId))) return;
+    await this.enqueueSession(sessionScopeKey(snap.sessionId, agentId), async () => {
+      const s = this.getOrCreate(snap.sessionId!, agentId);
       s.sessionFile = sessionFile;
       s.updatedAt = new Date().toISOString();
-      await this.conv.ensureIssue(s, snap);
+      await conv.ensureIssue(s, snap);
       await this.persistState();
     });
   }
 
   private scheduleTurn(p: TurnPayload): void {
     if (!p.sessionId) return;
-    const prev = this.syncTimers.get(p.sessionId);
+    const scopeKey = sessionScopeKey(p.sessionId, p.agentId);
+    const prev = this.syncTimers.get(scopeKey);
     if (prev) clearTimeout(prev);
     const timer = setTimeout(() => {
-      this.syncTimers.delete(p.sessionId!);
-      void this.track(this.enqueueSession(p.sessionId!, () => this.syncTurn(p))).catch((e) => this.warn("turn sync", e));
+      this.syncTimers.delete(scopeKey);
+      void this.track(this.enqueueSession(scopeKey, () => this.syncTurn(p))).catch((e) => this.warn("turn sync", e));
     }, this.config.turnCommentDelayMs);
     timer.unref?.();
-    this.syncTimers.set(p.sessionId, timer);
+    this.syncTimers.set(scopeKey, timer);
   }
 
   private async syncTurn(p: TurnPayload): Promise<void> {
-    if (!p.sessionId || !(await this.ensureConfigured())) return;
-    const s = this.getOrCreate(p.sessionId);
-    s.sessionKey = p.sessionKey ?? s.sessionKey; s.agentId = p.agentId ?? s.agentId; s.updatedAt = new Date().toISOString();
-    const snap = await this.conv.loadSnapshot(s, p.messages);
-    if (!this.conv.shouldMirror(s.sessionId, snap.messages) || snap.messages.length === 0) { await this.persistState(); return; }
-    await this.conv.ensureIssue(s, snap);
-    await this.conv.syncLabels(s, snap, false);
+    if (!p.sessionId) return;
+    const agentId = normalizeAgentId(p.agentId);
+    if (!(await this.ensureConfigured(agentId))) return;
+    const { conv } = this.getServices(agentId);
+    const s = this.getOrCreate(p.sessionId, agentId);
+    s.sessionKey = p.sessionKey ?? s.sessionKey; s.agentId = agentId; s.updatedAt = new Date().toISOString();
+    const snap = await conv.loadSnapshot(s, p.messages);
+    if (!conv.shouldMirror(s.sessionId, snap.messages) || snap.messages.length === 0) { await this.persistState(); return; }
+    await conv.ensureIssue(s, snap);
+    await conv.syncLabels(s, snap, false);
     const next = snap.messages.slice(s.lastMirroredCount);
-    if (next.length > 0) { const n = await this.conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; }
+    if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; }
     await this.persistState();
   }
 
   private enqueueFinalize(p: FinalizePayload): void {
     if (!p.sessionId) return;
-    const prev = this.syncTimers.get(p.sessionId);
-    if (prev) { clearTimeout(prev); this.syncTimers.delete(p.sessionId); }
-    void this.track(this.enqueueSession(p.sessionId, () => this.finalize(p))).catch((e) => this.warn("finalize", e));
+    const scopeKey = sessionScopeKey(p.sessionId, p.agentId);
+    const prev = this.syncTimers.get(scopeKey);
+    if (prev) { clearTimeout(prev); this.syncTimers.delete(scopeKey); }
+    void this.track(this.enqueueSession(scopeKey, () => this.finalize(p))).catch((e) => this.warn("finalize", e));
   }
 
   private async finalize(p: FinalizePayload): Promise<void> {
-    if (!p.sessionId || !(await this.ensureConfigured())) return;
-    const s = this.getOrCreate(p.sessionId);
+    if (!p.sessionId) return;
+    const agentId = normalizeAgentId(p.agentId);
+    if (!(await this.ensureConfigured(agentId))) return;
+    const { conv, mem } = this.getServices(agentId);
+    const s = this.getOrCreate(p.sessionId, agentId);
     if (s.finalizedAt) return;
     s.sessionKey = p.sessionKey ?? s.sessionKey; s.sessionFile = p.sessionFile ?? s.sessionFile;
-    s.agentId = p.agentId ?? s.agentId; s.updatedAt = new Date().toISOString();
-    const snap = await this.conv.loadSnapshot(s, p.messages ?? []);
-    if (!this.conv.shouldMirror(s.sessionId, snap.messages)) { await this.persistState(); return; }
+    s.agentId = agentId; s.updatedAt = new Date().toISOString();
+    const snap = await conv.loadSnapshot(s, p.messages ?? []);
+    if (!conv.shouldMirror(s.sessionId, snap.messages)) { await this.persistState(); return; }
     if (snap.messages.length === 0 && !s.issueNumber) { await this.persistState(); return; }
-    await this.conv.ensureIssue(s, snap);
+    await conv.ensureIssue(s, snap);
     const next = snap.messages.slice(s.lastMirroredCount);
     let allOk = true;
-    if (next.length > 0) { const n = await this.conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; allOk = n === next.length; }
+    if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; allOk = n === next.length; }
     let summary = "pending";
-    try { summary = await this.conv.generateSummary(s, snap); } catch (e) { summary = `failed: ${String(e)}`; }
-    await this.conv.syncLabels(s, snap, true);
-    await this.conv.syncBody(s, snap, summary, true);
-    await this.mem.syncFromConversation(s, snap);
+    try { summary = await conv.generateSummary(s, snap); } catch (e) { summary = `failed: ${String(e)}`; }
+    await conv.syncLabels(s, snap, true);
+    await conv.syncBody(s, snap, summary, true);
+    await mem.syncFromConversation(s, snap);
     if (allOk) s.finalizedAt = new Date().toISOString();
     await this.persistState();
   }
@@ -155,11 +168,19 @@ class ClawMemService {
     );
     return promise;
   }
-  private getOrCreate(sessionId: string): SessionMirrorState {
-    if (this.state.sessions[sessionId]) return this.state.sessions[sessionId];
+  private getOrCreate(sessionId: string, agentId?: string): SessionMirrorState {
+    const scopeKey = sessionScopeKey(sessionId, agentId);
+    if (this.state.sessions[scopeKey]) return this.state.sessions[scopeKey];
     const now = new Date().toISOString();
-    const s: SessionMirrorState = { sessionId, lastMirroredCount: 0, turnCount: 0, createdAt: now, updatedAt: now };
-    this.state.sessions[sessionId] = s;
+    const s: SessionMirrorState = {
+      sessionId,
+      agentId: normalizeAgentId(agentId),
+      lastMirroredCount: 0,
+      turnCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.state.sessions[scopeKey] = s;
     return s;
   }
   private async persistState(): Promise<void> {
@@ -174,29 +195,60 @@ class ClawMemService {
     })();
     return this.loadPromise;
   }
-  private async ensureConfigured(): Promise<boolean> {
-    if (isPluginConfigured(this.config)) return true;
-    if (this.configPromise) return this.configPromise;
-    const p = this.bootstrap();
-    this.configPromise = p;
-    try { return await p; } finally { if (this.configPromise === p) this.configPromise = null; }
+  private async ensureConfigured(agentId?: string): Promise<boolean> {
+    const id = normalizeAgentId(agentId);
+    if (isAgentConfigured(resolveAgentRoute(this.config, id))) return true;
+    const pending = this.configPromises.get(id);
+    if (pending) return pending;
+    const p = this.bootstrap(id);
+    this.configPromises.set(id, p);
+    try { return await p; } finally { if (this.configPromises.get(id) === p) this.configPromises.delete(id); }
   }
-  private async bootstrap(): Promise<boolean> {
-    if (!this.config.baseUrl) { this.api.logger.warn("clawmem: cannot provision Git credentials without a baseUrl"); return false; }
+  private async bootstrap(agentId: string): Promise<boolean> {
+    const route = resolveAgentRoute(this.config, agentId);
+    if (!route.baseUrl) { this.api.logger.warn(`clawmem: cannot provision Git credentials for ${agentId} without a baseUrl`); return false; }
     try {
-      const sess = await this.client.createAnonymousSession();
-      await this.persistPluginConfig({ baseUrl: this.config.baseUrl, authScheme: "token", token: sess.token, repo: sess.repo_full_name });
-      this.config.authScheme = "token"; this.config.token = sess.token; this.config.repo = sess.repo_full_name;
-      this.api.logger.info?.(`clawmem: provisioned Git credentials for ${sess.repo_full_name} via ${this.config.baseUrl}`);
+      const client = new GitHubIssueClient(route, this.api.logger);
+      const sess = await client.createAnonymousSession();
+      await this.persistAgentConfig(agentId, { baseUrl: route.baseUrl, authScheme: "token", token: sess.token, repo: sess.repo_full_name });
+      this.config.agents[agentId] = { ...(this.config.agents[agentId] ?? {}), baseUrl: route.baseUrl, authScheme: "token", token: sess.token, repo: sess.repo_full_name };
+      this.api.logger.info?.(`clawmem: provisioned Git credentials for agent ${agentId} -> ${sess.repo_full_name} via ${route.baseUrl}`);
       return true;
-    } catch (error) { this.api.logger.warn(`clawmem: failed to provision Git credentials via ${this.config.baseUrl}: ${String(error)}`); return false; }
+    } catch (error) { this.api.logger.warn(`clawmem: failed to provision Git credentials for agent ${agentId} via ${route.baseUrl}: ${String(error)}`); return false; }
   }
-  private async persistPluginConfig(values: Partial<ClawMemPluginConfig>): Promise<void> {
+  private async persistAgentConfig(agentId: string, values: { baseUrl: string; authScheme: "token" | "bearer"; token: string; repo: string }): Promise<void> {
     const root = this.api.runtime.config.loadConfig();
     const plugins = root.plugins;
     const entries = plugins?.entries && typeof plugins.entries === "object" && !Array.isArray(plugins.entries) ? (plugins.entries as Record<string, unknown>) : {};
     const ex = asRecord(entries[this.api.id]), exCfg = asRecord(ex.config);
-    await this.api.runtime.config.writeConfigFile({ ...root, plugins: { ...(plugins ?? {}), entries: { ...entries, [this.api.id]: { ...ex, config: { ...exCfg, ...values } } } } });
+    const agents = exCfg.agents && typeof exCfg.agents === "object" && !Array.isArray(exCfg.agents) ? (exCfg.agents as Record<string, unknown>) : {};
+    const existingAgent = asRecord(agents[agentId]);
+    await this.api.runtime.config.writeConfigFile({
+      ...root,
+      plugins: {
+        ...(plugins ?? {}),
+        entries: {
+          ...entries,
+          [this.api.id]: {
+            ...ex,
+            config: {
+              ...exCfg,
+              agents: {
+                ...agents,
+                [agentId]: { ...existingAgent, ...values },
+              },
+            },
+          },
+        },
+      },
+    });
+  }
+  private getServices(agentId?: string): { conv: ConversationMirror; mem: MemoryStore } {
+    const client = new GitHubIssueClient(resolveAgentRoute(this.config, agentId), this.api.logger);
+    return {
+      conv: new ConversationMirror(client, this.api, this.config),
+      mem: new MemoryStore(client, this.api, this.config),
+    };
   }
   private warn(scope: string, error: unknown): void { this.api.logger.warn(`clawmem: ${scope} failed: ${String(error)}`); }
 }

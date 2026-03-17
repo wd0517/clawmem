@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { PluginState } from "./types.js";
+import { normalizeAgentId, sessionScopeKey } from "./utils.js";
 
 const EMPTY_STATE: PluginState = {
-  version: 1,
+  version: 2,
   sessions: {},
 };
 
@@ -42,19 +43,24 @@ function sanitizeState(value: unknown): PluginState {
       ? (raw.sessions as Record<string, unknown>)
       : {};
   const out: PluginState = {
-    version: 1,
+    version: 2,
     sessions: {},
   };
-  for (const [sessionId, sessionValue] of Object.entries(sessions)) {
-    if (!sessionValue || typeof sessionValue !== "object" || !sessionId.trim()) {
+  for (const [storedKey, sessionValue] of Object.entries(sessions)) {
+    if (!sessionValue || typeof sessionValue !== "object" || !storedKey.trim()) {
       continue;
     }
     const rawSession = sessionValue as Record<string, unknown>;
-    out.sessions[sessionId] = {
+    const sessionId = readString(rawSession.sessionId) ?? storedKey.trim();
+    if (!sessionId) {
+      continue;
+    }
+    const agentId = normalizeAgentId(readString(rawSession.agentId));
+    out.sessions[sessionScopeKey(sessionId, agentId)] = {
       sessionId,
       sessionKey: readString(rawSession.sessionKey),
       sessionFile: readString(rawSession.sessionFile),
-      agentId: readString(rawSession.agentId),
+      agentId,
       issueNumber: readNumber(rawSession.issueNumber),
       issueTitle: readString(rawSession.issueTitle),
       lastMirroredCount: readNumber(rawSession.lastMirroredCount) ?? 0,
