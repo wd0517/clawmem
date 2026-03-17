@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { AGENT_LABEL_PREFIX, DEFAULT_LABELS, LABEL_ACTIVE, LABEL_CLOSED, SESSION_TITLE_PREFIX } from "./config.js";
+import { AGENT_LABEL_PREFIX, DEFAULT_LABELS, LABEL_ACTIVE, LABEL_CLOSED, SESSION_TITLE_PREFIX, extractLabelNames } from "./config.js";
 import type { GitHubIssueClient } from "./github-client.js";
 import { normalizeMessages, readTranscriptSnapshot } from "./transcript.js";
 import type { ClawMemPluginConfig, NormalizedMessage, SessionMirrorState, TranscriptSnapshot } from "./types.js";
@@ -36,7 +36,17 @@ export class ConversationMirror {
   }
 
   async ensureIssue(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<void> {
-    if (session.issueNumber) return;
+    if (session.issueNumber) {
+      const existing = await this.lookupBoundIssue(session);
+      if (existing && this.isBoundIssue(session, existing)) {
+        session.issueTitle = existing.title?.trim() || session.issueTitle;
+        return;
+      }
+      this.api.logger.warn(
+        `clawmem: issue binding for ${session.sessionId} is stale or mismatched (${session.issueNumber}); recreating`,
+      );
+      this.resetIssueBinding(session);
+    }
     const title = `${SESSION_TITLE_PREFIX}${session.sessionId}`;
     const labels = this.buildLabels(session, snapshot, false);
     const body = this.renderBody(session, snapshot, "pending", false);
@@ -143,9 +153,37 @@ export class ConversationMirror {
     } catch { /* directory unreadable */ }
     return null;
   }
+
+  private async lookupBoundIssue(session: SessionMirrorState): Promise<{ number: number; title?: string; labels?: Array<{ name?: string } | string> } | null> {
+    if (!session.issueNumber) return null;
+    try {
+      return await this.client.getIssue(session.issueNumber);
+    } catch (error) {
+      if (isNotFoundError(error)) return null;
+      throw error;
+    }
+  }
+
+  private isBoundIssue(session: SessionMirrorState, issue: { title?: string; labels?: Array<{ name?: string } | string> }): boolean {
+    const labels = extractLabelNames(issue.labels);
+    return labels.includes("type:conversation") && labels.includes(`session:${session.sessionId}`);
+  }
+
+  private resetIssueBinding(session: SessionMirrorState): void {
+    session.issueNumber = undefined;
+    session.issueTitle = undefined;
+    session.lastSummaryHash = undefined;
+    session.lastMirroredCount = 0;
+    session.turnCount = 0;
+    session.finalizedAt = undefined;
+  }
 }
 
 async function fexists(p: string): Promise<boolean> { try { return (await fs.promises.stat(p)).isFile(); } catch { return false; } }
+function isNotFoundError(error: unknown): boolean {
+  const text = String(error);
+  return text.includes("HTTP 404");
+}
 function parseSummary(raw: string): string {
   const tryParse = (s: string): string | null => {
     try { const p = JSON.parse(s) as { summary?: unknown }; return typeof p?.summary === "string" && p.summary.trim() ? p.summary.trim() : null; }
