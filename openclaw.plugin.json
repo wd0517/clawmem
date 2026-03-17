@@ -25,6 +25,32 @@
         "type": "string",
         "enum": ["token", "bearer"]
       },
+      "agents": {
+        "type": "object",
+        "default": {},
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "baseUrl": {
+              "type": "string",
+              "minLength": 1
+            },
+            "repo": {
+              "type": "string",
+              "pattern": "^[^/]+/[^/]+$"
+            },
+            "token": {
+              "type": "string",
+              "minLength": 1
+            },
+            "authScheme": {
+              "type": "string",
+              "enum": ["token", "bearer"]
+            }
+          }
+        }
+      },
       "issueTitlePrefix": {
         "type": "string"
       },
@@ -94,16 +120,20 @@
     "repo": {
       "label": "Repository",
       "placeholder": "owner/repo",
-      "help": "Target repository that stores session issues. If left blank, clawmem will provision one automatically on first start."
+      "help": "Legacy single-route setting. New installs should use per-agent routes under agents.<agentId>."
     },
     "token": {
       "label": "API Token",
       "sensitive": true,
-      "help": "Token used for issue, comment, and label API calls. If left blank, clawmem will provision one automatically on first start."
+      "help": "Legacy single-route setting. New installs should use per-agent routes under agents.<agentId>."
     },
     "authScheme": {
       "label": "Auth Scheme",
-      "help": "Use 'token' for GitHub-style auth or 'bearer' for bearer tokens. Automatically provisioned credentials use 'token'."
+      "help": "Default auth scheme for per-agent routes. Automatically provisioned credentials use 'token'."
+    },
+    "agents": {
+      "label": "Agent Routes",
+      "help": "Per-agent ClawMem credentials keyed by agent id. Missing repo/token are provisioned automatically on first use."
     },
     "defaultLabels": {
       "label": "Default Labels",

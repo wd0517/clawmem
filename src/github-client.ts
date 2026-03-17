@@ -1,12 +1,12 @@
 // GitHub Issues API client for clawmem. No label caching — idempotent create-if-absent.
 import { resolveLabelColor, labelDescription, extractLabelNames, isManagedLabel } from "./config.js";
-import type { AnonymousSessionResponse, ClawMemPluginConfig } from "./types.js";
+import type { AnonymousSessionResponse, ClawMemResolvedRoute } from "./types.js";
 
 type IssueResponse = { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> };
 type ReqOpts = { allowNotFound?: boolean; allowValidationError?: boolean; omitAuth?: boolean };
 
 export class GitHubIssueClient {
-  constructor(private readonly config: ClawMemPluginConfig, private readonly log: { warn?: (msg: string) => void }) {}
+  constructor(private readonly config: ClawMemResolvedRoute, private readonly log: { warn?: (msg: string) => void }) {}
 
   async createIssue(params: { title: string; body: string; labels: string[] }): Promise<IssueResponse> {
     return this.req<IssueResponse>(this.repoPath("issues"), { method: "POST", body: JSON.stringify(params) });
