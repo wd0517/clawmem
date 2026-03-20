@@ -304,6 +304,7 @@ Full config with all options:
 
 - Conversation comments exclude tool calls, tool results, system messages, and heartbeat noise.
 - Summary failures do not block finalization; the `summary` field is written as `failed: ...`.
-- Memory search and auto-injection only return `memory-status:active` issues.
-- Durable memories are auto-captured on session finalize — no memory tools are injected into the agent tool list.
+- `memory_search` and auto-injection only return open issues labeled `type:memory` + `memory-status:active`.
+- `memory_store` and `memory_search` are agent-scoped: each agent reads/writes only its own provisioned repo with its own token.
+- Durable memories are still auto-captured on session finalize; the new tools add explicit manual store/search on top.
 - Memory issue bodies store only the detail text; metadata comes from labels and issue number.

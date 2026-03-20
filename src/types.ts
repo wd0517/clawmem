@@ -37,5 +37,6 @@ export type TranscriptSnapshot = { sessionId?: string; messages: NormalizedMessa
 export type ParsedMemoryIssue = {
   issueNumber: number; title: string; memoryId: string; memoryHash?: string;
   sessionId: string; date: string; detail: string;
+  labels: string[];
   topics?: string[]; status: "active" | "stale";
 };

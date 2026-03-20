@@ -3,30 +3,73 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { LABEL_MEMORY_ACTIVE, LABEL_MEMORY_STALE, MEMORY_TITLE_PREFIX, extractLabelNames, labelVal } from "./config.js";
 import type { GitHubIssueClient } from "./github-client.js";
 import { normalizeMessages } from "./transcript.js";
-import type { ClawMemPluginConfig, NormalizedMessage, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import type { ClawMemPluginConfig, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { fmtTranscript, localDate, sha256, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 
 type MemoryDecision = { save: string[]; stale: string[] };
+type MemoryStatus = "active" | "stale";
+type IssueState = "open" | "closed" | "all";
+
+type ManualMemoryStoreParams = {
+  content: string;
+  labels?: string[];
+  sessionId: string;
+};
+
+type ManualMemoryStoreResult = {
+  created: boolean;
+  duplicate: boolean;
+  memory: ParsedMemoryIssue;
+};
 
 export class MemoryStore {
   constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
 
-  async search(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
-    const memories = await this.list("active");
-    const q = query.trim().toLowerCase();
-    const tokens = q.split(/[^a-z0-9]+/i).filter((t) => t.length > 1);
+  async search(query: string, limit: number, opts: { issueState?: IssueState } = {}): Promise<ParsedMemoryIssue[]> {
+    const q = norm(query).toLowerCase();
+    if (!q) return [];
+    const tokens = [...new Set(q.split(/[^a-z0-9]+/i).filter((t) => t.length > 1))];
+    const issueState = opts.issueState ?? "open";
+    const memories = await this.list("active", { issueState });
     return memories
       .map((m) => {
-        const hay = `${m.title}\n${m.detail}`.toLowerCase();
-        let score = hay.includes(q) ? 10 : 0;
-        for (const t of tokens) if (hay.includes(t)) score += 1;
-        return { m, score };
+        const titleHay = m.title.toLowerCase();
+        const detailHay = m.detail.toLowerCase();
+        const labelHay = m.labels.join("\n").toLowerCase();
+        let score = 0;
+        if (titleHay.includes(q)) score += 12;
+        if (detailHay.includes(q)) score += 10;
+        if (labelHay.includes(q)) score += 6;
+        for (const token of tokens) {
+          if (titleHay.includes(token)) score += 2;
+          if (detailHay.includes(token)) score += 1;
+          if (labelHay.includes(token)) score += 1;
+        }
+        return { memory: m, score };
       })
-      .filter((e) => e.score > 0)
-      .sort((a, b) => b.score - a.score || b.m.issueNumber - a.m.issueNumber)
-      .slice(0, limit)
-      .map((e) => e.m);
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score || b.memory.issueNumber - a.memory.issueNumber)
+      .slice(0, Math.max(1, Math.floor(limit)))
+      .map((entry) => entry.memory);
+  }
+
+  async storeManual(params: ManualMemoryStoreParams): Promise<ManualMemoryStoreResult> {
+    const detail = norm(params.content);
+    if (!detail) throw new Error("content required");
+    const sessionId = params.sessionId.trim();
+    if (!sessionId) throw new Error("sessionId required");
+    const existing = await this.findExistingActiveByHash(sha256(detail));
+    if (existing) return { created: false, duplicate: true, memory: existing };
+    const created = await this.createMemoryIssue({
+      detail,
+      sessionId,
+      date: localDate(),
+      status: "active",
+      extraLabels: normalizeMemoryLabels(params.labels),
+      memoryHash: sha256(detail),
+    });
+    return { created: true, duplicate: false, memory: created };
   }
 
   async syncFromConversation(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<void> {
@@ -40,14 +83,19 @@ export class MemoryStore {
     }
   }
 
-  private async list(status: "active" | "stale" | "all"): Promise<ParsedMemoryIssue[]> {
+  private async list(status: MemoryStatus | "all", opts: { issueState?: IssueState } = {}): Promise<ParsedMemoryIssue[]> {
     const labels = ["type:memory"];
     if (status === "active") labels.push(LABEL_MEMORY_ACTIVE);
     else if (status === "stale") labels.push(LABEL_MEMORY_STALE);
     const out: ParsedMemoryIssue[] = [];
+    const issueState = opts.issueState ?? "open";
     for (let page = 1; page <= 20; page++) {
-      const batch = await this.client.listIssues({ labels, state: "all", page, perPage: 100 });
-      for (const issue of batch) { const p = this.parseIssue(issue); if (p) out.push(p); }
+      const batch = await this.client.listIssues({ labels, state: issueState, page, perPage: 100 });
+      for (const issue of batch) {
+        const parsed = this.parseIssue(issue);
+        if (!parsed) continue;
+        if (status === "all" || parsed.status === status) out.push(parsed);
+      }
       if (batch.length < 100) break;
     }
     return out;
@@ -56,46 +104,60 @@ export class MemoryStore {
   private parseIssue(issue: { number: number; title?: string; body?: string; labels?: Array<{ name?: string } | string> }): ParsedMemoryIssue | null {
     const labels = extractLabelNames(issue.labels);
     if (!labels.includes("type:memory")) return null;
-    const sessionId = labelVal(labels, "session:"), date = labelVal(labels, "date:");
+    const sessionId = labelVal(labels, "session:");
+    const date = labelVal(labels, "date:");
     const topics = labels.filter((l) => l.startsWith("topic:")).map((l) => l.slice(6).trim()).filter(Boolean);
     const rawBody = (issue.body ?? "").trim();
     const body = rawBody ? parseFlatYaml(rawBody) : {};
     const detail = body.detail?.trim() || rawBody;
     if (!sessionId || !date || !detail) return null;
     return {
-      issueNumber: issue.number, title: issue.title?.trim() || "",
+      issueNumber: issue.number,
+      title: issue.title?.trim() || "",
       memoryId: body.memory_id?.trim() || String(issue.number),
       memoryHash: body.memory_hash?.trim() || undefined,
-      sessionId, date, detail,
+      sessionId,
+      date,
+      detail,
+      labels,
       ...(topics.length > 0 ? { topics } : {}),
       status: labels.includes(LABEL_MEMORY_STALE) ? "stale" : "active",
     };
   }
 
   private async applyDecision(sessionId: string, decision: MemoryDecision): Promise<{ savedCount: number; staledCount: number }> {
-    const allActive = await this.list("active");
-    const activeById = new Map(allActive.map((m) => [m.memoryId, m]));
-    const existingHashes = new Set(allActive.map((m) => m.memoryHash || sha256(norm(m.detail))));
+    const allActive = await this.list("active", { issueState: "open" });
+    const activeById = new Map(allActive.map((memory) => [memory.memoryId, memory]));
+    const existingHashes = new Set(allActive.map((memory) => memory.memoryHash || sha256(norm(memory.detail))));
     let savedCount = 0;
     for (const raw of decision.save) {
       const detail = norm(raw);
       if (!detail) continue;
       const hash = sha256(detail);
       if (existingHashes.has(hash)) continue;
-      const date = localDate(), labels = memLabels(sessionId, date, "active");
-      const title = `${MEMORY_TITLE_PREFIX}${trunc(detail, 72)}`;
-      const body = stringifyFlatYaml([["memory_hash", hash], ["detail", detail]]);
-      await this.client.ensureLabels(labels);
-      await this.client.createIssue({ title, body, labels });
+      await this.createMemoryIssue({
+        detail,
+        sessionId,
+        date: localDate(),
+        status: "active",
+        extraLabels: [],
+        memoryHash: hash,
+      });
       existingHashes.add(hash);
       savedCount++;
     }
     let staledCount = 0;
     for (const id of [...new Set(decision.stale.map((s) => s.trim()).filter(Boolean))]) {
-      const mem = activeById.get(id);
-      if (!mem) continue;
-      await this.client.ensureLabels([LABEL_MEMORY_STALE]);
-      await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.sessionId, mem.date, "stale"));
+      const memory = activeById.get(id);
+      if (!memory) continue;
+      const labels = buildMemoryLabels({
+        sessionId: memory.sessionId,
+        date: memory.date,
+        status: "stale",
+        extraLabels: preserveCustomMemoryLabels(memory.labels),
+      });
+      await this.client.ensureLabels(labels);
+      await this.client.syncManagedLabels(memory.issueNumber, labels);
       staledCount++;
     }
     return { savedCount, staledCount };
@@ -103,7 +165,7 @@ export class MemoryStore {
 
   private async generateDecision(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<MemoryDecision> {
     if (snapshot.messages.length === 0) return { save: [], stale: [] };
-    const recent = (await this.list("active")).sort((a, b) => b.issueNumber - a.issueNumber).slice(0, 20);
+    const recent = (await this.list("active", { issueState: "open" })).sort((a, b) => b.issueNumber - a.issueNumber).slice(0, 20);
     const existingBlock = recent.length === 0 ? "None." : recent.map((m) => `[${m.memoryId}] ${m.detail}`).join("\n");
     const subagent = this.api.runtime.subagent;
     const sessionKey = subKey(session, "memory");
@@ -132,11 +194,91 @@ export class MemoryStore {
       return parseDecision(text);
     } finally { subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {}); }
   }
+
+  private async findExistingActiveByHash(hash: string): Promise<ParsedMemoryIssue | null> {
+    const active = await this.list("active", { issueState: "open" });
+    return active.find((memory) => (memory.memoryHash || sha256(norm(memory.detail))) === hash) ?? null;
+  }
+
+  private async createMemoryIssue(params: {
+    detail: string;
+    sessionId: string;
+    date: string;
+    status: MemoryStatus;
+    extraLabels: string[];
+    memoryHash: string;
+  }): Promise<ParsedMemoryIssue> {
+    const labels = buildMemoryLabels({
+      sessionId: params.sessionId,
+      date: params.date,
+      status: params.status,
+      extraLabels: params.extraLabels,
+    });
+    const title = `${MEMORY_TITLE_PREFIX}${trunc(params.detail, 72)}`;
+    const body = stringifyFlatYaml([["memory_hash", params.memoryHash], ["detail", params.detail]]);
+    await this.client.ensureLabels(labels);
+    const issue = await this.client.createIssue({ title, body, labels });
+    const topics = labels.filter((label) => label.startsWith("topic:")).map((label) => label.slice(6).trim()).filter(Boolean);
+    return {
+      issueNumber: issue.number,
+      title: issue.title?.trim() || title,
+      memoryId: String(issue.number),
+      memoryHash: params.memoryHash,
+      sessionId: params.sessionId,
+      date: params.date,
+      detail: params.detail,
+      labels,
+      ...(topics.length > 0 ? { topics } : {}),
+      status: params.status,
+    };
+  }
 }
 
-function memLabels(sessionId: string, date: string, status: "active" | "stale"): string[] {
-  return ["type:memory", `session:${sessionId}`, `date:${date}`, status === "active" ? LABEL_MEMORY_ACTIVE : LABEL_MEMORY_STALE];
+function buildMemoryLabels(params: {
+  sessionId: string;
+  date: string;
+  status: MemoryStatus;
+  extraLabels?: string[];
+}): string[] {
+  return [
+    ...new Set([
+      ...normalizeMemoryLabels(params.extraLabels),
+      "type:memory",
+      `date:${params.date}`,
+      `session:${params.sessionId}`,
+      params.status === "active" ? LABEL_MEMORY_ACTIVE : LABEL_MEMORY_STALE,
+    ]),
+  ];
 }
+
+function normalizeMemoryLabels(labels: string[] | undefined): string[] {
+  if (!Array.isArray(labels)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const label of labels) {
+    if (typeof label !== "string") continue;
+    const trimmed = label.trim();
+    if (!trimmed || trimmed.includes("\n") || trimmed.includes(",")) continue;
+    if (isReservedMemoryLabel(trimmed)) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function preserveCustomMemoryLabels(labels: string[]): string[] {
+  return normalizeMemoryLabels(labels.filter((label) => !isSystemMemoryLabel(label)));
+}
+
+function isReservedMemoryLabel(label: string): boolean {
+  return label.startsWith("type:") || label.startsWith("date:") || label.startsWith("session:") || label.startsWith("memory-status:");
+}
+
+function isSystemMemoryLabel(label: string): boolean {
+  return label === "type:memory" || label.startsWith("date:") || label.startsWith("session:") || label === LABEL_MEMORY_ACTIVE || label === LABEL_MEMORY_STALE;
+}
+
 function norm(v: string): string { return v.replace(/\s+/g, " ").trim(); }
 function trunc(v: string, max: number): string { const s = norm(v); return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`; }
 function parseDecision(raw: string): MemoryDecision {

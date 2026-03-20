@@ -1,7 +1,7 @@
 {
   "id": "clawmem",
   "name": "ClawMem",
-  "version": "0.1.7",
+  "version": "0.1.11",
   "description": "Mirror OpenClaw sessions into GitHub-compatible issues and comments.",
   "kind": "memory",
   "configSchema": {

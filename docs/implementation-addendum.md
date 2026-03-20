@@ -144,30 +144,38 @@ Semantics:
 
 ## 4. Memory Lifecycle
 
-The current implementation does not inject any memory tools into the agent tool list.
+The current implementation injects two agent-scoped memory tools into the agent tool list:
 
-Memory creation, recall, and staling remain internal plugin behaviors.
+- `memory_store`
+- `memory_search`
+
+Both tools are scoped to the current agent only. They use the current agent's provisioned repo and token, and do not support cross-agent overrides.
 
 ### 4.1 Creation
 
 New durable memories are created during the finalize pipeline.
+
+The `memory_store` tool also allows explicit manual memory creation during a live session. It requires the current `sessionId` and creates the memory in the current agent's repo.
 
 Default behavior:
 
 - create a `type:memory` issue
 - apply `session:<session_id>`
 - apply `date:YYYY-MM-DD`
-- optionally apply one or more `topic:*` labels
+- optionally apply one or more caller-provided labels
 - apply `memory-status:active`
 
 ### 4.2 Recall
 
 Relevant active memories may still be injected into prompt context before agent start.
 
+The `memory_search` tool allows explicit lookup of active memories in the current agent's repo.
+
 Default filter:
 
 - `type:memory`
 - `memory-status:active`
+- issue state `open`
 
 ### 4.3 Staling
 

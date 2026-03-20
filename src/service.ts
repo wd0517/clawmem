@@ -1,5 +1,5 @@
-// Thin orchestrator: wires conversation mirroring, memory store, and plugin lifecycle.
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
+// Thin orchestrator: wires conversation mirroring, memory store, agent-scoped tools, and plugin lifecycle.
+import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { isAgentConfigured, resolveAgentRoute, resolvePluginConfig } from "./config.js";
 import { ConversationMirror } from "./conversation.js";
 import { GitHubIssueClient } from "./github-client.js";
@@ -7,16 +7,18 @@ import { KeyedAsyncQueue } from "./keyed-async-queue.js";
 import { MemoryStore } from "./memory.js";
 import { loadState, resolveStatePath, saveState } from "./state.js";
 import { readTranscriptSnapshot } from "./transcript.js";
-import type { ClawMemPluginConfig, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
-import { inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
+import type { ClawMemPluginConfig, ParsedMemoryIssue, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import { inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey, sha256 } from "./utils.js";
 
 type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; messages: unknown[] };
 type FinalizePayload = { sessionId?: string; sessionKey?: string; sessionFile?: string; agentId?: string; reason?: string; messages?: unknown[] };
+type MemoryToolName = "memory_store" | "memory_search";
 
 class ClawMemService {
   private readonly config: ClawMemPluginConfig;
   private readonly queue = new KeyedAsyncQueue();
   private readonly stateQueue = new KeyedAsyncQueue();
+  private readonly toolQueue = new KeyedAsyncQueue();
   private readonly pending = new Set<Promise<unknown>>();
   private readonly syncTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private statePath = "";
@@ -34,13 +36,14 @@ class ClawMemService {
     this.api.on("agent_end", (ev, ctx) => this.scheduleTurn({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, agentId: ctx.agentId, messages: ev.messages }));
     this.api.on("before_reset", (ev, ctx) => this.enqueueFinalize({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, sessionFile: ev.sessionFile, agentId: ctx.agentId, reason: ev.reason, messages: ev.messages }));
     this.api.on("session_end", (ev, ctx) => this.enqueueFinalize({ sessionId: ev.sessionId ?? ctx.sessionId, sessionKey: ev.sessionKey ?? ctx.sessionKey, agentId: ctx.agentId, reason: "session_end" }));
+    this.api.registerTool((ctx) => this.createTools(ctx), { names: ["memory_store", "memory_search"] });
 
     this.api.registerService({
       id: "clawmem",
-      start: async (ctx) => {
+      start: async (ctx: { stateDir: string }) => {
         this.statePath = resolveStatePath(ctx.stateDir);
         await this.ensureLoaded();
-        this.unsubTranscript = this.api.runtime.events.onSessionTranscriptUpdate((u) => {
+        this.unsubTranscript = this.api.runtime.events.onSessionTranscriptUpdate((u: { sessionFile: string }) => {
           void this.track(this.handleTranscript(u.sessionFile)).catch((e) => this.warn("transcript update", e));
         });
         const configuredCount = Object.keys(this.config.agents).filter((agentId) => {
@@ -59,6 +62,136 @@ class ClawMemService {
         await Promise.allSettled([...this.pending]);
       },
     });
+  }
+
+  private createTools(ctx: { agentId?: string; sessionId?: string }): AnyAgentTool[] {
+    return [
+      this.createMemoryStoreTool(ctx),
+      this.createMemorySearchTool(ctx),
+    ];
+  }
+
+  private createMemoryStoreTool(ctx: { agentId?: string; sessionId?: string }): AnyAgentTool {
+    return {
+      name: "memory_store",
+      label: "Memory Store",
+      description:
+        "Save important information in long-term memory via ClawMem. Use for preferences, facts, decisions, and anything worth remembering.",
+      parameters: {
+        type: "object",
+        properties: {
+          content: {
+            type: "string",
+            description: "Memory content to store.",
+          },
+          labels: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional extra labels. Multiple labels are supported. Reserved system labels are ignored.",
+          },
+          sessionId: {
+            type: "string",
+            description: "Current session id. Must match the active runtime session.",
+          },
+        },
+        required: ["content", "sessionId"],
+      },
+      execute: async (_toolCallId, rawParams) => {
+        const params = asToolParams(rawParams);
+        const content = readRequiredToolString(params, ["content"], "content");
+        const requestedSessionId = readRequiredToolString(params, ["sessionId", "session_id", "sessionid"], "sessionId");
+        const labels = readToolStringArray(params, ["labels"], "labels") ?? [];
+        const runtimeSessionId = ctx.sessionId?.trim();
+        if (runtimeSessionId && requestedSessionId !== runtimeSessionId) {
+          throw new Error(`sessionId mismatch: got ${JSON.stringify(requestedSessionId)}, expected ${JSON.stringify(runtimeSessionId)}`);
+        }
+        const sessionId = runtimeSessionId || requestedSessionId;
+        const agentId = normalizeAgentId(ctx.agentId);
+        return await this.toolQueue.enqueue(memoryStoreQueueKey(agentId, content), async () => {
+          if (!(await this.ensureConfigured(agentId))) {
+            const route = resolveAgentRoute(this.config, agentId);
+            return buildToolErrorResult("memory_store", {
+              agentId,
+              repo: route.repo ?? null,
+              code: "route_unavailable",
+              message: `clawmem route unavailable for agent ${agentId}`,
+              data: { sessionId },
+            });
+          }
+          const route = resolveAgentRoute(this.config, agentId);
+          const { mem } = this.getServices(agentId);
+          const result = await mem.storeManual({ content, labels, sessionId });
+          return buildToolSuccessResult("memory_store", {
+            agentId,
+            repo: route.repo ?? null,
+            data: {
+              created: result.created,
+              duplicate: result.duplicate,
+              memory: serializeMemory(result.memory),
+            },
+          });
+        });
+      },
+    };
+  }
+
+  private createMemorySearchTool(ctx: { agentId?: string }): AnyAgentTool {
+    return {
+      name: "memory_search",
+      label: "Memory Search",
+      description:
+        "Search for memories by natural-language query. Returns only active memories. Use for finding specific memories or confirming information.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Search query for active memories.",
+          },
+          limit: {
+            type: "number",
+            minimum: 1,
+            maximum: 10,
+            description: "Maximum number of results to return. Defaults to 5.",
+          },
+        },
+        required: ["query"],
+      },
+      execute: async (_toolCallId, rawParams) => {
+        const params = asToolParams(rawParams);
+        const query = readRequiredToolString(params, ["query"], "query");
+        const limit = clampInteger(readToolNumber(params, ["limit"], "limit") ?? 5, 1, 10);
+        const agentId = normalizeAgentId(ctx.agentId);
+        if (!(await this.ensureConfigured(agentId))) {
+          const route = resolveAgentRoute(this.config, agentId);
+          return buildToolErrorResult("memory_search", {
+            agentId,
+            repo: route.repo ?? null,
+            code: "route_unavailable",
+            message: `clawmem route unavailable for agent ${agentId}`,
+            data: {
+              query,
+              limit,
+              count: 0,
+              memories: [],
+            },
+          });
+        }
+        const route = resolveAgentRoute(this.config, agentId);
+        const { mem } = this.getServices(agentId);
+        const results = await mem.search(query, limit, { issueState: "open" });
+        return buildToolSuccessResult("memory_search", {
+          agentId,
+          repo: route.repo ?? null,
+          data: {
+            query,
+            limit,
+            count: results.length,
+            memories: results.map(serializeMemory),
+          },
+        });
+      },
+    };
   }
 
   private async handleRecall(prompt: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
@@ -271,5 +404,120 @@ class ClawMemService {
 }
 
 function asRecord(v: unknown): Record<string, unknown> { return v && typeof v === "object" ? (v as Record<string, unknown>) : {}; }
+
+function asToolParams(v: unknown): Record<string, unknown> {
+  return asRecord(v);
+}
+
+function readToolRaw(params: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) {
+    if (Object.hasOwn(params, key)) return params[key];
+  }
+  return undefined;
+}
+
+function readRequiredToolString(params: Record<string, unknown>, keys: string[], label: string): string {
+  const raw = readToolRaw(params, keys);
+  if (typeof raw !== "string" || !raw.trim()) throw new Error(`${label} required`);
+  return raw.trim();
+}
+
+function readToolStringArray(params: Record<string, unknown>, keys: string[], label: string): string[] | undefined {
+  const raw = readToolRaw(params, keys);
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === "string") return raw.trim() ? [raw.trim()] : [];
+  if (!Array.isArray(raw)) throw new Error(`${label} must be a string or array of strings`);
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string") throw new Error(`${label} entries must be strings`);
+    const trimmed = entry.trim();
+    if (trimmed) out.push(trimmed);
+  }
+  return out;
+}
+
+function readToolNumber(params: Record<string, unknown>, keys: string[], label: string): number | undefined {
+  const raw = readToolRaw(params, keys);
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  if (typeof raw === "string" && raw.trim()) {
+    const parsed = Number(raw.trim());
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  throw new Error(`${label} must be a number`);
+}
+
+function clampInteger(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, Math.trunc(value)));
+}
+
+function memoryStoreQueueKey(agentId: string, content: string): string {
+  return `memory-store:${agentId}:${sha256(normalizeToolText(content))}`;
+}
+
+function normalizeToolText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function serializeMemory(memory: ParsedMemoryIssue) {
+  return {
+    issueNumber: memory.issueNumber,
+    memoryId: memory.memoryId,
+    title: memory.title,
+    detail: memory.detail,
+    labels: memory.labels,
+    sessionId: memory.sessionId,
+    date: memory.date,
+    status: memory.status,
+  };
+}
+
+function buildToolSuccessResult(
+  tool: MemoryToolName,
+  params: { agentId: string; repo: string | null; data: unknown },
+) {
+  return toolJsonResult({
+    ok: true,
+    tool,
+    agentId: params.agentId,
+    repo: params.repo,
+    data: params.data,
+  });
+}
+
+function buildToolErrorResult(
+  tool: MemoryToolName,
+  params: {
+    agentId: string;
+    repo: string | null;
+    code: string;
+    message: string;
+    data?: unknown;
+  },
+) {
+  return toolJsonResult({
+    ok: false,
+    tool,
+    agentId: params.agentId,
+    repo: params.repo,
+    error: {
+      code: params.code,
+      message: params.message,
+    },
+    ...(params.data !== undefined ? { data: params.data } : {}),
+  });
+}
+
+function toolJsonResult(payload: unknown) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(payload, null, 2),
+      },
+    ],
+    details: payload,
+  };
+}
 
 export function createClawMemPlugin(api: OpenClawPluginApi): void { new ClawMemService(api).register(); }
