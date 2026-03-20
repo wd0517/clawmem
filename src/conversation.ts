@@ -47,7 +47,8 @@ export class ConversationMirror {
       );
       this.resetIssueBinding(session);
     }
-    const title = `${SESSION_TITLE_PREFIX}${session.sessionId}`;
+    // Use first user message as title (truncated), falling back to session ID.
+    const title = deriveInitialTitle(snapshot.messages, session.sessionId);
     const labels = this.buildLabels(session, snapshot, false);
     const body = this.renderBody(session, snapshot, "pending", false);
     await this.client.ensureLabels(labels);
@@ -59,9 +60,10 @@ export class ConversationMirror {
     session.updatedAt = session.createdAt;
   }
 
-  async syncBody(session: SessionMirrorState, snapshot: TranscriptSnapshot, summary: string, closed: boolean): Promise<void> {
+  async syncBody(session: SessionMirrorState, snapshot: TranscriptSnapshot, summary: string, closed: boolean, titleOverride?: string): Promise<void> {
     if (!session.issueNumber) return;
-    const title = `${SESSION_TITLE_PREFIX}${session.sessionId}`;
+    // Prefer explicit override (LLM-generated title), then keep existing title, then fall back to session ID.
+    const title = titleOverride?.trim() || session.issueTitle || `${SESSION_TITLE_PREFIX}${session.sessionId}`;
     const body = this.renderBody(session, snapshot, summary, closed);
     const hash = sha256(`${title}\n${body}\n${closed ? "closed" : "open"}`);
     if (hash === session.lastSummaryHash) return;
@@ -86,22 +88,28 @@ export class ConversationMirror {
     return count;
   }
 
-  async generateSummary(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<string> {
+  async generateSummaryAndTitle(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<{ summary: string; title?: string }> {
     if (snapshot.messages.length === 0) throw new Error("no conversation messages to summarize");
     const subagent = this.api.runtime.subagent;
     const sessionKey = subKey(session, "summary");
     const message = [
-      "Summarize the following conversation.",
-      'Return valid JSON only in the form {"summary":"..."}',
+      "Summarize the following conversation and generate a short title.",
+      'Return valid JSON only in the form {"summary":"...","title":"..."}',
       "The summary should be concise, factual, and written in 2-4 sentences.",
       "Do not include markdown, bullet points, or analysis.",
+      "",
+      "Title rules:",
+      "- Under 50 characters, evocative like a good article headline.",
+      "- Should make someone curious to read the conversation.",
+      "- Must be in the same language as the majority of the conversation content.",
+      "- Good: creative, captures the spirit. Bad: dry meeting-minutes style.",
       "", "<conversation>", fmtTranscript(snapshot.messages), "</conversation>",
     ].join("\n");
     try {
       const run = await subagent.run({
         sessionKey, message, deliver: false, lane: "clawmem-summary",
-        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:summary`),
-        extraSystemPrompt: "You summarize OpenClaw conversations. Output JSON only with one string field named summary.",
+        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:summary-v2`),
+        extraSystemPrompt: "You summarize OpenClaw conversations and generate evocative titles. Output JSON only with string fields summary and title.",
       });
       const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.summaryWaitTimeoutMs });
       if (wait.status === "timeout") throw new Error("summary subagent timed out");
@@ -109,7 +117,7 @@ export class ConversationMirror {
       const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
       const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
       if (!text) throw new Error("summary subagent returned no assistant text");
-      return parseSummary(text);
+      return parseSummaryAndTitle(text);
     } finally { subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {}); }
   }
 
@@ -184,11 +192,36 @@ function isNotFoundError(error: unknown): boolean {
   const text = String(error);
   return text.includes("HTTP 404");
 }
-function parseSummary(raw: string): string {
-  const tryParse = (s: string): string | null => {
-    try { const p = JSON.parse(s) as { summary?: unknown }; return typeof p?.summary === "string" && p.summary.trim() ? p.summary.trim() : null; }
-    catch { const i = s.indexOf("{"), j = s.lastIndexOf("}");
-      if (i >= 0 && j > i) { try { const p = JSON.parse(s.slice(i, j + 1)) as { summary?: unknown }; return typeof p?.summary === "string" && p.summary.trim() ? p.summary.trim() : null; } catch { return null; } }
+/** Derive a conversation title from the first user message, truncated to 50 chars. */
+export function deriveInitialTitle(messages: NormalizedMessage[], sessionId: string): string {
+  const firstUserMsg = messages.find((m) => m.role === "user")?.text?.trim() ?? "";
+  // Strip markdown, collapse whitespace.
+  const clean = firstUserMsg.replace(/[#*`~>|]/g, "").replace(/\s+/g, " ").trim();
+  if (clean.length >= 5) {
+    return clean.length <= 50 ? clean : clean.slice(0, 49).trimEnd() + "…";
+  }
+  return `${SESSION_TITLE_PREFIX}${sessionId}`;
+}
+
+function parseSummaryAndTitle(raw: string): { summary: string; title?: string } {
+  const tryParse = (s: string): { summary: string; title?: string } | null => {
+    try {
+      const p = JSON.parse(s) as { summary?: unknown; title?: unknown };
+      const summary = typeof p?.summary === "string" && p.summary.trim() ? p.summary.trim() : null;
+      if (!summary) return null;
+      const title = typeof p?.title === "string" && p.title.trim() ? p.title.trim() : undefined;
+      return { summary, title };
+    } catch {
+      const i = s.indexOf("{"), j = s.lastIndexOf("}");
+      if (i >= 0 && j > i) {
+        try {
+          const p = JSON.parse(s.slice(i, j + 1)) as { summary?: unknown; title?: unknown };
+          const summary = typeof p?.summary === "string" && p.summary.trim() ? p.summary.trim() : null;
+          if (!summary) return null;
+          const title = typeof p?.title === "string" && p.title.trim() ? p.title.trim() : undefined;
+          return { summary, title };
+        } catch { return null; }
+      }
       return null;
     }
   };
@@ -196,5 +229,5 @@ function parseSummary(raw: string): string {
   const direct = tryParse(t); if (direct) return direct;
   const f = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(t);
   if (f?.[1]) { const nested = tryParse(f[1].trim()); if (nested) return nested; }
-  return t;
+  return { summary: t };
 }

@@ -151,12 +151,20 @@ class ClawMemService {
     let allOk = true;
     if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; allOk = n === next.length; }
     let summary = "pending";
-    try { summary = await conv.generateSummary(s, snap); } catch (e) { summary = `failed: ${String(e)}`; }
+    let generatedTitle: string | undefined;
+    try {
+      const result = await conv.generateSummaryAndTitle(s, snap);
+      summary = result.summary;
+      generatedTitle = result.title;
+    } catch (e) { summary = `failed: ${String(e)}`; }
     await conv.syncLabels(s, snap, true);
-    await conv.syncBody(s, snap, summary, true);
+    await conv.syncBody(s, snap, summary, true, generatedTitle);
     await mem.syncFromConversation(s, snap);
     if (allOk) s.finalizedAt = new Date().toISOString();
     await this.persistState();
+
+    // Auto-name the repo if it still has no description (first few conversations).
+    this.maybeAutoNameRepo(agentId, summary, generatedTitle);
   }
 
   // --- Infrastructure ---
@@ -226,7 +234,8 @@ class ClawMemService {
     if (!route.baseUrl) { this.api.logger.warn(`clawmem: cannot provision Git credentials for ${agentId} without a baseUrl`); return false; }
     try {
       const client = new GitHubIssueClient(route, this.api.logger);
-      const sess = await client.createAnonymousSession();
+      const locale = Intl?.DateTimeFormat?.()?.resolvedOptions?.()?.locale ?? "";
+      const sess = await client.createAnonymousSession(locale);
       await this.persistAgentConfig(agentId, { baseUrl: route.baseUrl, authScheme: "token", token: sess.token, repo: sess.repo_full_name });
       this.config.agents[agentId] = { ...(this.config.agents[agentId] ?? {}), baseUrl: route.baseUrl, authScheme: "token", token: sess.token, repo: sess.repo_full_name };
       this.api.logger.info?.(`clawmem: provisioned Git credentials for agent ${agentId} -> ${sess.repo_full_name} via ${route.baseUrl}`);
@@ -266,6 +275,28 @@ class ClawMemService {
       conv: new ConversationMirror(client, this.api, this.config),
       mem: new MemoryStore(client, this.api, this.config),
     };
+  }
+  /**
+   * After finalization, check if the repo still has an empty/default description.
+   * If so, use the conversation summary to suggest a meaningful name and update
+   * the repo description automatically. Best-effort, fire-and-forget.
+   */
+  private maybeAutoNameRepo(agentId: string, summary: string, title?: string): void {
+    if (!summary || summary.startsWith("failed:") || summary === "pending") return;
+    const snippet = title || summary.slice(0, 100);
+    void (async () => {
+      try {
+        const client = new GitHubIssueClient(resolveAgentRoute(this.config, agentId), this.api.logger);
+        const repo = await client.getRepoInfo();
+        // Only auto-name if description is still empty or a default placeholder.
+        if (repo.description && repo.description !== "My Memory Space" && repo.description !== "我的记忆空间" && repo.description !== "マイメモリースペース") return;
+        // Use the conversation title or summary as a lightweight description.
+        await client.updateRepoDescription(snippet);
+        this.api.logger.info?.(`clawmem: auto-named repo to "${snippet}"`);
+      } catch (e) {
+        this.api.logger.warn(`clawmem: auto-name repo failed: ${String(e)}`);
+      }
+    })();
   }
   private warn(scope: string, error: unknown): void { this.api.logger.warn(`clawmem: ${scope} failed: ${String(error)}`); }
 }

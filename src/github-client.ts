@@ -38,8 +38,15 @@ export class GitHubIssueClient {
     const unmanaged = extractLabelNames(issue.labels).filter((l) => !isManagedLabel(l));
     await this.updateIssue(issueNumber, { labels: [...new Set([...unmanaged, ...desired])] });
   }
-  async createAnonymousSession(): Promise<AnonymousSessionResponse> {
-    return this.req<AnonymousSessionResponse>("anonymous/session", { method: "POST" }, { omitAuth: true });
+  async getRepoInfo(): Promise<{ description?: string; name?: string }> {
+    return this.req<{ description?: string; name?: string }>(this.repoPath("").replace(/\/$/, ""), { method: "GET" });
+  }
+  async updateRepoDescription(description: string): Promise<void> {
+    await this.req(this.repoPath("").replace(/\/$/, ""), { method: "PATCH", body: JSON.stringify({ description }) });
+  }
+  async createAnonymousSession(locale?: string): Promise<AnonymousSessionResponse> {
+    const body = locale ? JSON.stringify({ locale }) : undefined;
+    return this.req<AnonymousSessionResponse>("anonymous/session", { method: "POST", ...(body ? { body } : {}) }, { omitAuth: true });
   }
 
   private repoPath(suffix: string): string {
