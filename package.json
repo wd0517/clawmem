@@ -1,6 +1,6 @@
 {
-  "name": "@clawmem-ai/clawmem",
-  "version": "0.1.7",
+  "name": "@wd0517/clawmem",
+  "version": "0.1.14",
   "description": "Mirror OpenClaw sessions into GitHub-compatible issues and comments.",
   "type": "module",
   "license": "MIT",
@@ -12,6 +12,7 @@
     "index.ts",
     "openclaw.plugin.json",
     "src",
+    "skills",
     "README.md",
     "tsconfig.json"
   ],
