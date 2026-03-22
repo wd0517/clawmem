@@ -3,6 +3,7 @@ import { resolveLabelColor, labelDescription, extractLabelNames, isManagedLabel 
 import type { AnonymousSessionResponse, ClawMemResolvedRoute } from "./types.js";
 
 type IssueResponse = { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> };
+type CommentResponse = { id?: number; body?: string; created_at?: string };
 type ReqOpts = { allowNotFound?: boolean; allowValidationError?: boolean; omitAuth?: boolean };
 
 export class GitHubIssueClient {
@@ -19,6 +20,12 @@ export class GitHubIssueClient {
   }
   async createComment(issueNumber: number, body: string): Promise<void> {
     await this.req(this.repoPath(`issues/${issueNumber}/comments`), { method: "POST", body: JSON.stringify({ body }) });
+  }
+  async listComments(issueNumber: number, params?: { page?: number; perPage?: number }): Promise<CommentResponse[]> {
+    const q = new URLSearchParams();
+    q.set("page", String(params?.page ?? 1));
+    q.set("per_page", String(params?.perPage ?? 100));
+    return this.req<CommentResponse[]>(`${this.repoPath(`issues/${issueNumber}/comments`)}?${q}`, { method: "GET" });
   }
   async listIssues(params: { labels?: string[]; state?: "open" | "closed" | "all"; page?: number; perPage?: number }): Promise<IssueResponse[]> {
     const q = new URLSearchParams();
