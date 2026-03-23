@@ -4,6 +4,7 @@ import type { AnonymousSessionResponse, ClawMemResolvedRoute } from "./types.js"
 
 type IssueResponse = { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> };
 type CommentResponse = { id?: number; body?: string; created_at?: string };
+type LabelResponse = { name?: string; color?: string; description?: string };
 type ReqOpts = { allowNotFound?: boolean; allowValidationError?: boolean; omitAuth?: boolean };
 
 export class GitHubIssueClient {
@@ -32,6 +33,12 @@ export class GitHubIssueClient {
     q.set("state", params.state ?? "open"); q.set("page", String(params.page ?? 1)); q.set("per_page", String(params.perPage ?? 100));
     if (params.labels?.length) q.set("labels", params.labels.join(","));
     return this.req<IssueResponse[]>(`${this.repoPath("issues")}?${q}`, { method: "GET" });
+  }
+  async listLabels(params?: { page?: number; perPage?: number }): Promise<LabelResponse[]> {
+    const q = new URLSearchParams();
+    q.set("page", String(params?.page ?? 1));
+    q.set("per_page", String(params?.perPage ?? 100));
+    return this.req<LabelResponse[]>(`${this.repoPath("labels")}?${q}`, { method: "GET" });
   }
   async ensureLabels(labels: string[]): Promise<void> {
     for (const label of labels) {

@@ -69,6 +69,41 @@ class ClawMemService {
 
   private registerTools(): void {
     this.api.registerTool({
+      name: "memory_labels",
+      description: "List existing ClawMem schema labels so the agent can reuse current kinds and topics before adding new ones.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
+          limitTopics: { type: "integer", minimum: 1, maximum: 200, description: "Maximum number of topic labels to display." },
+        },
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
+        const { mem } = this.getServices(agentId);
+        const schema = await mem.listSchema();
+        const rawLimit = typeof p.limitTopics === "number" && Number.isFinite(p.limitTopics) ? Math.floor(p.limitTopics) : 50;
+        const limitTopics = Math.min(200, Math.max(1, rawLimit));
+        const kinds = schema.kinds.length > 0 ? schema.kinds.map((kind) => `- kind:${kind}`).join("\n") : "- None";
+        const topics = schema.topics.length > 0 ? schema.topics.slice(0, limitTopics).map((topic) => `- topic:${topic}`).join("\n") : "- None";
+        const extra = schema.topics.length > limitTopics ? `\n- ...and ${schema.topics.length - limitTopics} more topics` : "";
+        return toolText([
+          "Current ClawMem schema labels:",
+          "",
+          "Kinds:",
+          kinds,
+          "",
+          "Topics:",
+          `${topics}${extra}`,
+        ].join("\n"));
+      },
+    });
+
+    this.api.registerTool({
       name: "memory_recall",
       description: "Search ClawMem active memories for relevant prior facts, decisions, conventions, and lessons.",
       required: true,
@@ -95,7 +130,10 @@ class ClawMemService {
         if (memories.length === 0) return toolText(`No active memories matched "${query}".`);
         const text = [
           `Found ${memories.length} active memor${memories.length === 1 ? "y" : "ies"} for "${query}":`,
-          ...memories.map((m) => `- [${m.memoryId}] ${m.title || "Memory"}: ${m.detail}`),
+          ...memories.map((m) => {
+            const schema = [m.kind ? `kind:${m.kind}` : "", ...(m.topics ?? []).map((topic) => `topic:${topic}`)].filter(Boolean).join(", ");
+            return `- [${m.memoryId}] ${m.title || "Memory"}${schema ? ` (${schema})` : ""}: ${m.detail}`;
+          }),
         ].join("\n");
         return toolText(text);
       },
@@ -110,6 +148,14 @@ class ClawMemService {
         additionalProperties: false,
         properties: {
           detail: { type: "string", minLength: 1, description: "The durable fact, lesson, decision, or preference to remember." },
+          kind: { type: "string", minLength: 1, description: "Optional schema kind, for example lesson, convention, skill, or task." },
+          topics: {
+            type: "array",
+            description: "Optional topic labels to improve future retrieval.",
+            items: { type: "string", minLength: 1 },
+            minItems: 1,
+            maxItems: 10,
+          },
           sessionId: { type: "string", minLength: 1, description: "Optional source session id label. Defaults to manual." },
           agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
         },
@@ -123,9 +169,12 @@ class ClawMemService {
         if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
         const { mem } = this.getServices(agentId);
         const sessionId = typeof p.sessionId === "string" && p.sessionId.trim() ? p.sessionId.trim() : "manual";
-        const result = await mem.store(detail, sessionId);
-        if (!result.created) return toolText(`Memory already exists as [${result.memory.memoryId}] ${result.memory.title || "Memory"}.`);
-        return toolText(`Stored memory [${result.memory.memoryId}] ${result.memory.title || "Memory"}: ${result.memory.detail}`);
+        const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
+        const topics = Array.isArray(p.topics) ? p.topics.filter((topic): topic is string => typeof topic === "string" && topic.trim().length > 0) : undefined;
+        const result = await mem.store({ detail, ...(kind ? { kind } : {}), ...(topics && topics.length > 0 ? { topics } : {}) }, sessionId);
+        const schema = [result.memory.kind ? `kind:${result.memory.kind}` : "", ...(result.memory.topics ?? []).map((topic) => `topic:${topic}`)].filter(Boolean).join(", ");
+        if (!result.created) return toolText(`Memory already exists as [${result.memory.memoryId}] ${result.memory.title || "Memory"}${schema ? ` (${schema})` : ""}.`);
+        return toolText(`Stored memory [${result.memory.memoryId}] ${result.memory.title || "Memory"}${schema ? ` (${schema})` : ""}: ${result.memory.detail}`);
       },
     });
 

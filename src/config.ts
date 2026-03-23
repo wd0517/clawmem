@@ -12,7 +12,7 @@ export const LABEL_CLOSED = "status:closed";
 export const LABEL_MEMORY_ACTIVE = "memory-status:active";
 export const LABEL_MEMORY_STALE = "memory-status:stale";
 
-const MANAGED_PREFIXES = ["type:", "session:", "date:", "topic:", "agent:", "source:"];
+const MANAGED_PREFIXES = ["type:", "kind:", "session:", "date:", "topic:", "agent:", "source:"];
 const MANAGED_EXACT = new Set([LABEL_ACTIVE, LABEL_CLOSED, LABEL_MEMORY_ACTIVE, LABEL_MEMORY_STALE]);
 
 export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig {
@@ -67,6 +67,7 @@ export function resolveLabelColor(label: string): string {
   if (label.startsWith("status:")) return "b60205";
   if (label.startsWith("memory-status:")) return label.endsWith(":stale") ? "d93f0b" : "0e8a16";
   if (label.startsWith("type:")) return label === "type:memory" ? "5319e7" : "1d76db";
+  if (label.startsWith("kind:")) return "5319e7";
   if (label.startsWith("date:")) return "c5def5";
   if (label.startsWith("topic:")) return "fbca04";
   if (label.startsWith("session:")) return "bfdadc";
@@ -76,7 +77,7 @@ export function resolveLabelColor(label: string): string {
 }
 
 export function labelDescription(label: string): string {
-  for (const [pfx, d] of [["type:", "Issue type"], ["memory-status:", "Memory lifecycle status"],
+  for (const [pfx, d] of [["type:", "Issue type"], ["kind:", "Memory kind"], ["memory-status:", "Memory lifecycle status"],
     ["status:", "Conversation lifecycle status"], ["session:", "Session association"],
     ["date:", "Date"], ["topic:", "Topic"], ["agent:", "Agent"], ["source:", "Source"]] as const)
     if (label.startsWith(pfx)) return `${d} label managed by clawmem.`;

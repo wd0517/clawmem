@@ -10,12 +10,14 @@ function memory(overrides: Partial<ParsedMemoryIssue> = {}): ParsedMemoryIssue {
     date: overrides.date ?? "2026-03-23",
     detail: overrides.detail ?? "Example durable detail",
     status: overrides.status ?? "active",
+    ...(overrides.kind ? { kind: overrides.kind } : {}),
     ...(overrides.memoryHash ? { memoryHash: overrides.memoryHash } : {}),
     ...(overrides.topics ? { topics: overrides.topics } : {}),
   };
 }
 
 type IssueRecord = { number: number; title?: string; body?: string; labels?: string[] };
+type LabelRecord = { name?: string };
 
 function issueFromMemory(m: ParsedMemoryIssue): IssueRecord {
   return {
@@ -27,6 +29,7 @@ function issueFromMemory(m: ParsedMemoryIssue): IssueRecord {
       `session:${m.sessionId}`,
       `date:${m.date}`,
       m.status === "stale" ? "memory-status:stale" : "memory-status:active",
+      ...(m.kind ? [`kind:${m.kind}`] : []),
       ...(m.topics ?? []).map((topic) => `topic:${topic}`),
     ],
   };
@@ -42,6 +45,7 @@ async function testSearchRanking(): Promise<void> {
       issueNumber: 1,
       title: "Memory: Redis rate limit tuning",
       detail: "Distributed Redis rate limiting must use Lua scripts to stay atomic.",
+      kind: "lesson",
       topics: ["redis", "rate-limiting"],
     })),
     issueFromMemory(memory({
@@ -79,9 +83,39 @@ function testCjkScoring(): void {
   assert(billingScore > 0, "expected Chinese query to produce a positive match score");
 }
 
+async function testStructuredStoreAndSchema(): Promise<void> {
+  const created: Array<{ title: string; body: string; labels: string[] }> = [];
+  const ensured: string[][] = [];
+  const labels: LabelRecord[] = [{ name: "kind:lesson" }, { name: "topic:redis" }];
+  const client = {
+    listIssues: async () => [] as IssueRecord[],
+    listLabels: async () => labels,
+    ensureLabels: async (next: string[]) => { ensured.push(next); },
+    createIssue: async (payload: { title: string; body: string; labels: string[] }) => {
+      created.push(payload);
+      return { number: 99, title: payload.title };
+    },
+  };
+  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const result = await store.store({ detail: "Redis Lua scripts are required for atomic rate limiting.", kind: "Lesson", topics: ["Redis Ops", "rate_limit"] }, "manual");
+  const schema = await store.listSchema();
+
+  assert(result.created === true, "expected a new structured memory to be created");
+  assert(result.memory.kind === "lesson", "expected kind to be normalized");
+  assert(JSON.stringify(result.memory.topics) === JSON.stringify(["rate-limit", "redis-ops"]), "expected topics to be normalized and sorted");
+  assert(created.length === 1, "expected a single issue creation");
+  assert(created[0]?.labels.includes("kind:lesson"), "expected created labels to include normalized kind");
+  assert(created[0]?.labels.includes("topic:redis-ops"), "expected created labels to include normalized topic");
+  assert(created[0]?.labels.includes("topic:rate-limit"), "expected created labels to include normalized topic");
+  assert(ensured[0]?.includes("kind:lesson"), "expected ensureLabels to include kind label");
+  assert(schema.kinds.includes("lesson"), "expected schema to expose existing kind labels");
+  assert(schema.topics.includes("redis"), "expected schema to expose existing topic labels");
+}
+
 async function main(): Promise<void> {
   await testSearchRanking();
   testCjkScoring();
+  await testStructuredStoreAndSchema();
   console.log("memory tests passed");
 }
 
