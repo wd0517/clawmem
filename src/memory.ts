@@ -105,6 +105,36 @@ export class MemoryStore {
     };
   }
 
+  async update(memoryId: string, patch: { detail?: string; kind?: string; topics?: string[] }): Promise<ParsedMemoryIssue | null> {
+    const current = await this.get(memoryId, "all");
+    if (!current) return null;
+    const nextDetail = typeof patch.detail === "string" && patch.detail.trim() ? norm(patch.detail) : current.detail;
+    const nextKind = patch.kind !== undefined ? normalizeLabelValue(patch.kind, "kind:") : current.kind;
+    const nextTopics = patch.topics !== undefined
+      ? uniqueNormalized(patch.topics.map((topic) => normalizeLabelValue(topic, "topic:")).filter(Boolean) as string[])
+      : uniqueNormalized(current.topics ?? []);
+    const nextHash = sha256(nextDetail);
+    const duplicate = (await this.listByStatus("active")).find((memory) => {
+      if (memory.issueNumber === current.issueNumber) return false;
+      return (memory.memoryHash || sha256(norm(memory.detail))) === nextHash;
+    });
+    if (duplicate) throw new Error(`another active memory already stores this detail as [${duplicate.memoryId}]`);
+    const nextTitle = `${MEMORY_TITLE_PREFIX}${trunc(nextDetail, 72)}`;
+    const nextBody = stringifyFlatYaml([["memory_hash", nextHash], ["detail", nextDetail]]);
+    const nextLabels = memLabels(current.sessionId, current.date, current.status, nextKind, nextTopics);
+    await this.client.ensureLabels(nextLabels);
+    await this.client.updateIssue(current.issueNumber, { title: nextTitle, body: nextBody });
+    await this.client.syncManagedLabels(current.issueNumber, nextLabels);
+    return {
+      ...current,
+      title: nextTitle,
+      memoryHash: nextHash,
+      detail: nextDetail,
+      ...(nextKind ? { kind: nextKind } : {}),
+      ...(nextTopics.length > 0 ? { topics: nextTopics } : {}),
+    };
+  }
+
   async forget(memoryId: string): Promise<ParsedMemoryIssue | null> {
     const id = memoryId.trim();
     if (!id) throw new Error("memoryId is empty");

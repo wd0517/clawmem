@@ -236,6 +236,50 @@ class ClawMemService {
     });
 
     this.api.registerTool({
+      name: "memory_update",
+      description: "Update an existing ClawMem memory in place when the same canonical fact or task has evolved.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          memoryId: { type: "string", minLength: 1, description: "The memory id or issue number to update." },
+          detail: { type: "string", minLength: 1, description: "Optional replacement detail text for the same memory record." },
+          kind: { type: "string", minLength: 1, description: "Optional replacement kind label." },
+          topics: {
+            type: "array",
+            description: "Optional replacement topic labels.",
+            items: { type: "string", minLength: 1 },
+            minItems: 1,
+            maxItems: 10,
+          },
+          agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
+        },
+        required: ["memoryId"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const memoryId = typeof p.memoryId === "string" ? p.memoryId.trim() : "";
+        if (!memoryId) return toolText("memoryId is empty.");
+        const detail = typeof p.detail === "string" && p.detail.trim() ? p.detail.trim() : undefined;
+        const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
+        const topics = Array.isArray(p.topics) ? p.topics.filter((topic): topic is string => typeof topic === "string" && topic.trim().length > 0) : undefined;
+        if (!detail && kind === undefined && topics === undefined) return toolText("Provide at least one of detail, kind, or topics.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
+        const { mem } = this.getServices(agentId);
+        let updated;
+        try {
+          updated = await mem.update(memoryId, { ...(detail ? { detail } : {}), ...(kind !== undefined ? { kind } : {}), ...(topics !== undefined ? { topics } : {}) });
+        } catch (error) {
+          return toolText(`Unable to update memory "${memoryId}": ${String(error)}`);
+        }
+        if (!updated) return toolText(`No memory matched id "${memoryId}".`);
+        return toolText(`Updated memory.\n${renderMemoryBlock(updated)}`);
+      },
+    });
+
+    this.api.registerTool({
       name: "memory_forget",
       description: "Mark an active ClawMem memory as stale when it is superseded or no longer true.",
       required: true,

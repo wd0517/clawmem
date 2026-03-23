@@ -6,7 +6,7 @@
 - Creates one `type:conversation` issue per session, mirrors the full transcript as comments.
 - During request-scoped hooks: best-effort extracts durable memories and stores each as a `type:memory` issue.
 - On session start: searches active memories by relevance and injects them into context.
-- Lets agents inspect memory indexes and schema, fetch exact memories, and write structured memories with `kind:*` and `topic:*` labels through plugin tools.
+- Lets agents inspect memory indexes and schema, fetch exact memories, update canonical facts in place, and write structured memories with `kind:*` and `topic:*` labels through plugin tools.
 
 ---
 
@@ -310,6 +310,7 @@ Full config with all options:
 - Summary failures do not block finalization; the `summary` field is written as `failed: ...`.
 - Memory search and auto-injection only return `memory-status:active` issues.
 - Durable memories are extracted best-effort during later request-scoped maintenance, not by background subagent work after a request has already ended.
-- The plugin exposes `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, and `memory_forget` for mid-session use.
+- The plugin exposes `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
 - `memory_store` accepts optional schema hints such as kind and topics; the plugin normalizes them into managed `kind:*` and `topic:*` labels.
+- `memory_update` updates one existing memory issue in place; use it for evolving canonical facts or active tasks instead of creating a duplicate node.
 - Memory issue bodies store only the detail text; metadata comes from labels and issue number.

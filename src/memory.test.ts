@@ -185,12 +185,65 @@ async function testLegacyMemoriesWithoutSessionOrDate(): Promise<void> {
   assert(recalled.some((memory) => memory.issueNumber === 4), "expected legacy memory to participate in recall");
 }
 
+async function testUpdateMemoryInPlace(): Promise<void> {
+  const issues: IssueRecord[] = [
+    issueFromMemory(memory({
+      issueNumber: 4,
+      title: "Memory: xiangz preferences",
+      detail: "xiangz likes F1 and watches Dota 2 as a viewer.",
+      kind: "core-fact",
+      topics: ["preferences"],
+    })),
+  ];
+  const ensured: string[][] = [];
+  const updatedIssues: Array<{ number: number; title?: string; body?: string }> = [];
+  const syncedLabels: Array<{ number: number; labels: string[] }> = [];
+  const client = {
+    listIssues: async (params?: { labels?: string[] }) => {
+      const labels = params?.labels ?? [];
+      return issues.filter((issue) => {
+        const issueLabels = issue.labels ?? [];
+        return labels.every((label) => issueLabels.includes(label));
+      });
+    },
+    ensureLabels: async (labels: string[]) => { ensured.push(labels); },
+    updateIssue: async (number: number, patch: { title?: string; body?: string }) => {
+      updatedIssues.push({ number, ...patch });
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      if (patch.title) issue.title = patch.title;
+      if (patch.body) issue.body = patch.body;
+      return issue;
+    },
+    syncManagedLabels: async (number: number, labels: string[]) => {
+      syncedLabels.push({ number, labels });
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      issue.labels = labels;
+    },
+  };
+  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const updated = await store.update("4", {
+    detail: "xiangz likes F1, watches Dota 2 as a viewer, and recently follows tennis.",
+    topics: ["preferences", "sports"],
+  });
+
+  assert(updated?.issueNumber === 4, "expected memory_update to modify the same issue");
+  assert(updated?.detail.includes("tennis"), "expected updated detail to be returned");
+  assert(JSON.stringify(updated?.topics) === JSON.stringify(["preferences", "sports"]), "expected topics to be replaced");
+  assert(updatedIssues.length === 1, "expected a single issue update");
+  assert(updatedIssues[0]?.title !== "Memory: xiangz preferences", "expected title to refresh from updated detail");
+  assert(ensured[0]?.includes("topic:sports"), "expected new topic label to be ensured");
+  assert(syncedLabels[0]?.labels.includes("kind:core-fact"), "expected existing kind label to be preserved");
+}
+
 async function main(): Promise<void> {
   await testSearchRanking();
   testCjkScoring();
   await testStructuredStoreAndSchema();
   await testGetAndListMemories();
   await testLegacyMemoriesWithoutSessionOrDate();
+  await testUpdateMemoryInPlace();
   console.log("memory tests passed");
 }
 
