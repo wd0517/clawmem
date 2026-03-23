@@ -149,12 +149,14 @@ export class MemoryStore {
     const rawBody = (issue.body ?? "").trim();
     const body = rawBody ? parseFlatYaml(rawBody) : {};
     const detail = body.detail?.trim() || rawBody;
-    if (!sessionId || !date || !detail) return null;
+    if (!detail) return null;
     return {
       issueNumber: issue.number, title: issue.title?.trim() || "",
       memoryId: body.memory_id?.trim() || String(issue.number),
       memoryHash: body.memory_hash?.trim() || undefined,
-      sessionId, date, detail,
+      sessionId: sessionId || "legacy",
+      date: date || "1970-01-01",
+      detail,
       ...(kind ? { kind } : {}),
       ...(topics.length > 0 ? { topics } : {}),
       status: labels.includes(LABEL_MEMORY_STALE) ? "stale" : "active",

@@ -157,11 +157,40 @@ async function testGetAndListMemories(): Promise<void> {
   assert(sports.length === 1 && sports[0]?.issueNumber === 11, "expected listMemories to filter by topic across statuses");
 }
 
+async function testLegacyMemoriesWithoutSessionOrDate(): Promise<void> {
+  const issues: IssueRecord[] = [
+    {
+      number: 4,
+      title: "Memory: xiangz preferences",
+      body: "xiangz likes F1 and watches Dota 2 as a viewer.",
+      labels: ["type:memory", "memory-status:active", "kind:core-fact", "topic:preferences"],
+    },
+  ];
+  const client = {
+    listIssues: async (params?: { labels?: string[] }) => {
+      const labels = params?.labels ?? [];
+      return issues.filter((issue) => {
+        const issueLabels = issue.labels ?? [];
+        return labels.every((label) => issueLabels.includes(label));
+      });
+    },
+  };
+  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const exact = await store.get("4");
+  const recalled = await store.search("F1 Dota 2", 5);
+
+  assert(exact?.issueNumber === 4, "expected legacy memory without session/date to be readable");
+  assert(exact?.sessionId === "legacy", "expected missing session label to fall back to legacy");
+  assert(exact?.date === "1970-01-01", "expected missing date label to fall back to a placeholder");
+  assert(recalled.some((memory) => memory.issueNumber === 4), "expected legacy memory to participate in recall");
+}
+
 async function main(): Promise<void> {
   await testSearchRanking();
   testCjkScoring();
   await testStructuredStoreAndSchema();
   await testGetAndListMemories();
+  await testLegacyMemoriesWithoutSessionOrDate();
   console.log("memory tests passed");
 }
 
