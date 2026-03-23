@@ -53,6 +53,10 @@ class ClawMemService {
             ? `clawmem: ready with ${configuredCount} configured agent route(s); missing routes will provision on first use via ${this.config.baseUrl}`
             : `clawmem: ready; agent routes will provision on first use via ${this.config.baseUrl}`,
         );
+        // One-time migration: retitle existing conversations with accurate LLM-generated titles.
+        if (!this.state.migrations?.retitleV1) {
+          void this.track(this.runRetitleMigration()).catch((e) => this.warn("retitle migration", e));
+        }
       },
       stop: async () => {
         this.unsubTranscript?.();
@@ -214,6 +218,7 @@ class ClawMemService {
     await conv.syncLabels(s, snap, false);
     const next = snap.messages.slice(s.lastMirroredCount);
     if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; }
+    await conv.syncTitle(s, snap);
     if (snap.messages.length >= 2 && snap.messages.length > (s.lastMemorySyncCount ?? 0)) {
       const ok = await mem.syncFromConversation(s, snap);
       if (ok) s.lastMemorySyncCount = snap.messages.length;
@@ -386,6 +391,31 @@ class ClawMemService {
       },
     });
   }
+  private async runRetitleMigration(): Promise<void> {
+    const configuredAgents = Object.keys(this.config.agents).filter((agentId) => {
+      return isAgentConfigured(resolveAgentRoute(this.config, agentId));
+    });
+    for (const agentId of configuredAgents) {
+      try {
+        const { conv } = this.getServices(agentId);
+        const result = await conv.retitleConversations();
+        // Sync titleSource for retitled sessions so syncTitle doesn't regenerate.
+        const retitledSet = new Set(result.retitledIssues);
+        for (const session of Object.values(this.state.sessions)) {
+          if (session.agentId === agentId && session.issueNumber && retitledSet.has(session.issueNumber)) {
+            session.titleSource = "llm";
+          }
+        }
+        this.api.logger.info?.(`clawmem: retitle migration for agent ${agentId}: ${result.updated} updated, ${result.skipped} skipped, ${result.failed} failed`);
+      } catch (e) {
+        this.warn(`retitle migration for agent ${agentId}`, e);
+      }
+    }
+    if (!this.state.migrations) this.state.migrations = {};
+    this.state.migrations.retitleV1 = new Date().toISOString();
+    await this.persistState();
+  }
+
   private getServices(agentId?: string): { conv: ConversationMirror; mem: MemoryStore } {
     const client = new GitHubIssueClient(resolveAgentRoute(this.config, agentId), this.api.logger);
     return {

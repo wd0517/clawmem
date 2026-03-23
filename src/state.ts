@@ -42,9 +42,17 @@ function sanitizeState(value: unknown): PluginState {
     raw.sessions && typeof raw.sessions === "object"
       ? (raw.sessions as Record<string, unknown>)
       : {};
+  const migrations: Record<string, string> = {};
+  if (raw.migrations && typeof raw.migrations === "object") {
+    for (const [k, v] of Object.entries(raw.migrations as Record<string, unknown>)) {
+      const s = readString(v);
+      if (s) migrations[k] = s;
+    }
+  }
   const out: PluginState = {
     version: 2,
     sessions: {},
+    ...(Object.keys(migrations).length > 0 ? { migrations } : {}),
   };
   for (const [storedKey, sessionValue] of Object.entries(sessions)) {
     if (!sessionValue || typeof sessionValue !== "object" || !storedKey.trim()) {
@@ -63,6 +71,7 @@ function sanitizeState(value: unknown): PluginState {
       agentId,
       issueNumber: readNumber(rawSession.issueNumber),
       issueTitle: readString(rawSession.issueTitle),
+      titleSource: readEnum(rawSession.titleSource, ["placeholder", "llm"]),
       lastMirroredCount: readNumber(rawSession.lastMirroredCount) ?? 0,
       turnCount: readNumber(rawSession.turnCount) ?? 0,
       lastMemorySyncCount: readNumber(rawSession.lastMemorySyncCount),
@@ -82,6 +91,11 @@ function readString(value: unknown): string | undefined {
   }
   const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function readEnum<T extends string>(value: unknown, allowed: T[]): T | undefined {
+  const s = readString(value);
+  return s && (allowed as string[]).includes(s) ? (s as T) : undefined;
 }
 
 function readNumber(value: unknown): number | undefined {

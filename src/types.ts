@@ -26,13 +26,13 @@ export type ClawMemResolvedRoute = {
 export type AnonymousSessionResponse = { token: string; owner_login: string; repo_name: string; repo_full_name: string };
 export type SessionMirrorState = {
   sessionId: string; sessionKey?: string; sessionFile?: string; agentId?: string;
-  issueNumber?: number; issueTitle?: string;
+  issueNumber?: number; issueTitle?: string; titleSource?: "placeholder" | "llm";
   lastMirroredCount: number; turnCount: number; lastAssistantText?: string;
   lastMemorySyncCount?: number;
   finalizedAt?: string; lastSummaryHash?: string; lastTurnHash?: string;
   createdAt?: string; updatedAt?: string;
 };
-export type PluginState = { version: 2; sessions: Record<string, SessionMirrorState> };
+export type PluginState = { version: 2; sessions: Record<string, SessionMirrorState>; migrations?: Record<string, string> };
 export type NormalizedMessage = { role: string; text: string; toolName?: string; timestamp?: string; stopReason?: string };
 export type TranscriptSnapshot = { sessionId?: string; messages: NormalizedMessage[] };
 export type ParsedMemoryIssue = {

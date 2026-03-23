@@ -6,54 +6,48 @@ function msg(role: string, text: string): NormalizedMessage {
   return { role, text };
 }
 
-const tests: Array<{ name: string; messages: NormalizedMessage[]; sessionId: string; expected: string | RegExp }> = [
+const tests: Array<{ name: string; messages: NormalizedMessage[]; sessionId: string; expected: string }> = [
   {
-    name: "uses first user message",
+    name: "returns placeholder regardless of user message content",
     messages: [msg("user", "How do I configure Redis rate limiting?")],
     sessionId: "abc123",
-    expected: "How do I configure Redis rate limiting?",
+    expected: "Session: abc123",
   },
   {
-    name: "truncates long messages to 50 chars",
+    name: "returns placeholder for long messages",
     messages: [msg("user", "I need help with configuring the distributed rate limiting system for our production Redis cluster")],
     sessionId: "abc123",
-    expected: /^I need help with configuring the distributed rate…$/,
+    expected: "Session: abc123",
   },
   {
-    name: "strips markdown formatting",
+    name: "returns placeholder for messages with markdown",
     messages: [msg("user", "## How do I **configure** `Redis` rate limiting?")],
     sessionId: "abc123",
-    expected: "How do I configure Redis rate limiting?",
+    expected: "Session: abc123",
   },
   {
-    name: "falls back to session ID for short messages",
+    name: "returns placeholder for short messages",
     messages: [msg("user", "hi")],
     sessionId: "abc-def-123",
     expected: "Session: abc-def-123",
   },
   {
-    name: "falls back to session ID when no user messages",
+    name: "returns placeholder when no user messages",
     messages: [msg("assistant", "Hello!")],
     sessionId: "xyz-789",
     expected: "Session: xyz-789",
   },
   {
-    name: "falls back to session ID for empty messages",
+    name: "returns placeholder for empty messages",
     messages: [],
     sessionId: "empty-sess",
     expected: "Session: empty-sess",
   },
   {
-    name: "collapses whitespace",
-    messages: [msg("user", "How do   I    configure\n\nRedis?")],
-    sessionId: "abc",
-    expected: "How do I configure Redis?",
-  },
-  {
-    name: "skips assistant messages, uses first user message",
+    name: "returns placeholder with session ID for any input",
     messages: [msg("assistant", "Welcome!"), msg("user", "Fix the login bug please")],
     sessionId: "abc",
-    expected: "Fix the login bug please",
+    expected: "Session: abc",
   },
 ];
 
@@ -62,9 +56,9 @@ let failed = 0;
 
 for (const t of tests) {
   const got = deriveInitialTitle(t.messages, t.sessionId);
-  const ok = t.expected instanceof RegExp ? t.expected.test(got) : got === t.expected;
+  const ok = got === t.expected;
   if (!ok) {
-    console.error(`FAIL: ${t.name}\n  got:      ${JSON.stringify(got)}\n  expected: ${t.expected instanceof RegExp ? t.expected.toString() : JSON.stringify(t.expected)}`);
+    console.error(`FAIL: ${t.name}\n  got:      ${JSON.stringify(got)}\n  expected: ${JSON.stringify(t.expected)}`);
     failed++;
   } else {
     console.log(`PASS: ${t.name}`);
