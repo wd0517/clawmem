@@ -65,6 +65,43 @@ class ClawMemService {
 
   private registerTools(): void {
     this.api.registerTool({
+      name: "memory_list",
+      description: "List ClawMem memories by status or schema so the agent can inspect the current memory index before deduping or saving.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          status: { type: "string", enum: ["active", "stale", "all"], description: "Which memories to list. Defaults to active." },
+          kind: { type: "string", minLength: 1, description: "Optional kind filter, for example core-fact, lesson, or task." },
+          topic: { type: "string", minLength: 1, description: "Optional topic filter." },
+          limit: { type: "integer", minimum: 1, maximum: 200, description: "Maximum number of memories to return." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
+        },
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
+        const { mem } = this.getServices(agentId);
+        const status = p.status === "stale" || p.status === "all" ? p.status : "active";
+        const limit = typeof p.limit === "number" && Number.isFinite(p.limit) ? Math.floor(p.limit) : 20;
+        const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
+        const topic = typeof p.topic === "string" && p.topic.trim() ? p.topic.trim() : undefined;
+        const memories = await mem.listMemories({ status, kind, topic, limit });
+        if (memories.length === 0) {
+          const filters = [status !== "active" ? `status=${status}` : "", kind ? `kind=${kind}` : "", topic ? `topic=${topic}` : ""].filter(Boolean).join(", ");
+          return toolText(`No memories matched${filters ? ` (${filters})` : ""}.`);
+        }
+        const lines = [
+          `Found ${memories.length} ${status === "all" ? "" : `${status} `}memor${memories.length === 1 ? "y" : "ies"}:`,
+          ...memories.map((memory) => `- ${renderMemoryLine(memory)}`),
+        ];
+        return toolText(lines.join("\n"));
+      },
+    });
+
+    this.api.registerTool({
       name: "memory_labels",
       description: "List existing ClawMem schema labels so the agent can reuse current kinds and topics before adding new ones.",
       required: true,
@@ -126,12 +163,37 @@ class ClawMemService {
         if (memories.length === 0) return toolText(`No active memories matched "${query}".`);
         const text = [
           `Found ${memories.length} active memor${memories.length === 1 ? "y" : "ies"} for "${query}":`,
-          ...memories.map((m) => {
-            const schema = [m.kind ? `kind:${m.kind}` : "", ...(m.topics ?? []).map((topic) => `topic:${topic}`)].filter(Boolean).join(", ");
-            return `- [${m.memoryId}] ${m.title || "Memory"}${schema ? ` (${schema})` : ""}: ${m.detail}`;
-          }),
+          ...memories.map((memory) => `- ${renderMemoryLine(memory)}`),
         ].join("\n");
         return toolText(text);
+      },
+    });
+
+    this.api.registerTool({
+      name: "memory_get",
+      description: "Fetch one ClawMem memory by memory id or issue number so the agent can verify an exact record.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          memoryId: { type: "string", minLength: 1, description: "The memory id or issue number to retrieve." },
+          status: { type: "string", enum: ["active", "stale", "all"], description: "Which status bucket to search. Defaults to all." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
+        },
+        required: ["memoryId"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const memoryId = typeof p.memoryId === "string" ? p.memoryId.trim() : "";
+        if (!memoryId) return toolText("memoryId is empty.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
+        const { mem } = this.getServices(agentId);
+        const status = p.status === "active" || p.status === "stale" ? p.status : "all";
+        const memory = await mem.get(memoryId, status);
+        if (!memory) return toolText(`No ${status === "all" ? "" : `${status} `}memory matched id "${memoryId}".`);
+        return toolText(renderMemoryBlock(memory));
       },
     });
 
@@ -168,9 +230,8 @@ class ClawMemService {
         const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
         const topics = Array.isArray(p.topics) ? p.topics.filter((topic): topic is string => typeof topic === "string" && topic.trim().length > 0) : undefined;
         const result = await mem.store({ detail, ...(kind ? { kind } : {}), ...(topics && topics.length > 0 ? { topics } : {}) }, sessionId);
-        const schema = [result.memory.kind ? `kind:${result.memory.kind}` : "", ...(result.memory.topics ?? []).map((topic) => `topic:${topic}`)].filter(Boolean).join(", ");
-        if (!result.created) return toolText(`Memory already exists as [${result.memory.memoryId}] ${result.memory.title || "Memory"}${schema ? ` (${schema})` : ""}.`);
-        return toolText(`Stored memory [${result.memory.memoryId}] ${result.memory.title || "Memory"}${schema ? ` (${schema})` : ""}: ${result.memory.detail}`);
+        if (!result.created) return toolText(`Memory already exists.\n${renderMemoryBlock(result.memory)}`);
+        return toolText(`Stored memory.\n${renderMemoryBlock(result.memory)}`);
       },
     });
 
@@ -510,6 +571,24 @@ class ClawMemService {
 function asRecord(v: unknown): Record<string, unknown> { return v && typeof v === "object" ? (v as Record<string, unknown>) : {}; }
 function toolText(text: string): { content: Array<{ type: "text"; text: string }> } {
   return { content: [{ type: "text", text }] };
+}
+function renderMemoryLine(memory: { memoryId: string; title?: string; detail: string; kind?: string; topics?: string[]; status: "active" | "stale" }): string {
+  const schema = [memory.kind ? `kind:${memory.kind}` : "", ...(memory.topics ?? []).map((topic) => `topic:${topic}`)].filter(Boolean).join(", ");
+  return `[${memory.memoryId}] ${memory.title || "Memory"}${schema ? ` (${schema})` : ""}${memory.status === "stale" ? " [stale]" : ""}: ${memory.detail}`;
+}
+function renderMemoryBlock(memory: { memoryId: string; issueNumber?: number; title?: string; detail: string; kind?: string; topics?: string[]; status: "active" | "stale"; sessionId?: string; date?: string }): string {
+  const lines = [
+    `Memory ID: ${memory.memoryId}`,
+    ...(typeof memory.issueNumber === "number" ? [`Issue Number: ${memory.issueNumber}`] : []),
+    `Status: ${memory.status}`,
+    `Title: ${memory.title || "Memory"}`,
+    ...(memory.kind ? [`Kind: ${memory.kind}`] : []),
+    ...(memory.topics && memory.topics.length > 0 ? [`Topics: ${memory.topics.join(", ")}`] : []),
+    ...(memory.sessionId ? [`Session: ${memory.sessionId}`] : []),
+    ...(memory.date ? [`Date: ${memory.date}`] : []),
+    `Detail: ${memory.detail}`,
+  ];
+  return lines.join("\n");
 }
 
 export function createClawMemPlugin(api: OpenClawPluginApi): void { new ClawMemService(api).register(); }

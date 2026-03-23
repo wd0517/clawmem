@@ -3,7 +3,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { LABEL_MEMORY_ACTIVE, LABEL_MEMORY_STALE, MEMORY_TITLE_PREFIX, extractLabelNames, labelVal } from "./config.js";
 import type { GitHubIssueClient } from "./github-client.js";
 import { normalizeMessages } from "./transcript.js";
-import type { ClawMemPluginConfig, MemoryDraft, MemorySchema, NormalizedMessage, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import type { ClawMemPluginConfig, MemoryDraft, MemoryListOptions, MemorySchema, NormalizedMessage, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { fmtTranscript, localDate, sha256, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 
@@ -14,7 +14,7 @@ export class MemoryStore {
   constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
 
   async search(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
-    const memories = await this.list("active");
+    const memories = await this.listByStatus("active");
     const q = normalizeSearch(query);
     if (!q) return [];
     return memories
@@ -43,17 +43,38 @@ export class MemoryStore {
       }
       if (batch.length < 100) break;
     }
-    for (const memory of await this.list("all")) {
+    for (const memory of await this.listByStatus("all")) {
       if (memory.kind) kinds.add(memory.kind);
       for (const topic of memory.topics ?? []) topics.add(topic);
     }
     return { kinds: [...kinds].sort(), topics: [...topics].sort() };
   }
 
+  async get(memoryId: string, status: "active" | "stale" | "all" = "all"): Promise<ParsedMemoryIssue | null> {
+    const id = memoryId.trim();
+    if (!id) throw new Error("memoryId is empty");
+    return (await this.listByStatus(status)).find((m) => m.memoryId === id || String(m.issueNumber) === id) ?? null;
+  }
+
+  async listMemories(options: MemoryListOptions = {}): Promise<ParsedMemoryIssue[]> {
+    const status = options.status ?? "active";
+    const kind = normalizeOptionalLabelValue(options.kind, "kind:");
+    const topic = normalizeOptionalLabelValue(options.topic, "topic:");
+    const limit = Math.min(200, Math.max(1, options.limit ?? 20));
+    return (await this.listByStatus(status))
+      .filter((memory) => {
+        if (kind && memory.kind !== kind) return false;
+        if (topic && !(memory.topics ?? []).includes(topic)) return false;
+        return true;
+      })
+      .sort((a, b) => b.issueNumber - a.issueNumber)
+      .slice(0, limit);
+  }
+
   async store(draft: MemoryDraft, sessionId = "manual"): Promise<{ created: boolean; memory: ParsedMemoryIssue }> {
     const normalized = normalizeDraft(draft);
     const detail = norm(normalized.detail);
-    const allActive = await this.list("active");
+    const allActive = await this.listByStatus("active");
     const hash = sha256(detail);
     const existing = allActive.find((m) => (m.memoryHash || sha256(norm(m.detail))) === hash);
     if (existing) {
@@ -87,7 +108,7 @@ export class MemoryStore {
   async forget(memoryId: string): Promise<ParsedMemoryIssue | null> {
     const id = memoryId.trim();
     if (!id) throw new Error("memoryId is empty");
-    const mem = (await this.list("active")).find((m) => m.memoryId === id || String(m.issueNumber) === id);
+    const mem = await this.get(id, "active");
     if (!mem) return null;
     await this.client.ensureLabels([LABEL_MEMORY_STALE]);
     await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.sessionId, mem.date, "stale"));
@@ -107,7 +128,7 @@ export class MemoryStore {
     }
   }
 
-  private async list(status: "active" | "stale" | "all"): Promise<ParsedMemoryIssue[]> {
+  private async listByStatus(status: "active" | "stale" | "all"): Promise<ParsedMemoryIssue[]> {
     const labels = ["type:memory"];
     if (status === "active") labels.push(LABEL_MEMORY_ACTIVE);
     else if (status === "stale") labels.push(LABEL_MEMORY_STALE);
@@ -141,7 +162,7 @@ export class MemoryStore {
   }
 
   private async applyDecision(sessionId: string, decision: MemoryDecision): Promise<{ savedCount: number; staledCount: number }> {
-    const allActive = await this.list("active");
+    const allActive = await this.listByStatus("active");
     const activeById = new Map(allActive.map((m) => [m.memoryId, m]));
     const activeByHash = new Map(allActive.map((m) => [m.memoryHash || sha256(norm(m.detail)), m]));
     let savedCount = 0;
@@ -188,7 +209,7 @@ export class MemoryStore {
 
   private async generateDecision(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<MemoryDecision> {
     if (snapshot.messages.length === 0) return { save: [], stale: [] };
-    const recent = (await this.list("active")).sort((a, b) => b.issueNumber - a.issueNumber).slice(0, 20);
+    const recent = (await this.listByStatus("active")).sort((a, b) => b.issueNumber - a.issueNumber).slice(0, 20);
     const existingBlock = recent.length === 0 ? "None." : recent.map((m) => {
       const schema = [m.kind ? `kind=${m.kind}` : "", ...(m.topics ?? []).map((topic) => `topic=${topic}`)].filter(Boolean).join(", ");
       return `[${m.memoryId}] ${schema ? `${schema} | ` : ""}${m.detail}`;
@@ -354,6 +375,13 @@ function normalizeLabelValue(value: string | undefined, prefix: string): string 
     .replace(/-{2,}/g, "-")
     .replace(/^-+|-+$/g, "");
   return normalized || undefined;
+}
+function normalizeOptionalLabelValue(value: string | undefined, prefix: string): string | undefined {
+  try {
+    return normalizeLabelValue(value, prefix);
+  } catch {
+    return undefined;
+  }
 }
 function uniqueNormalized(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort();

@@ -112,10 +112,56 @@ async function testStructuredStoreAndSchema(): Promise<void> {
   assert(schema.topics.includes("redis"), "expected schema to expose existing topic labels");
 }
 
+async function testGetAndListMemories(): Promise<void> {
+  const issues = [
+    issueFromMemory(memory({
+      issueNumber: 4,
+      title: "Memory: xiangz preferences",
+      detail: "xiangz likes F1 and watches Dota 2 as a viewer.",
+      kind: "core-fact",
+      topics: ["preferences", "hobbies"],
+    })),
+    issueFromMemory(memory({
+      issueNumber: 10,
+      title: "Memory: fruit preference",
+      detail: "xiangz likes mango.",
+      kind: "core-fact",
+      topics: ["food"],
+    })),
+    issueFromMemory(memory({
+      issueNumber: 11,
+      title: "Memory: old sports note",
+      detail: "xiangz follows F1.",
+      kind: "lesson",
+      status: "stale",
+      topics: ["sports"],
+    })),
+  ];
+  const client = {
+    listIssues: async (params?: { labels?: string[] }) => {
+      const labels = params?.labels ?? [];
+      return issues.filter((issue) => {
+        const issueLabels = issue.labels ?? [];
+        return labels.every((label) => issueLabels.includes(label));
+      });
+    },
+  };
+  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const exact = await store.get("4");
+  const activeFacts = await store.listMemories({ status: "active", kind: "core-fact", limit: 10 });
+  const sports = await store.listMemories({ status: "all", topic: "sports", limit: 10 });
+
+  assert(exact?.issueNumber === 4, "expected direct memory lookup to find issue #4");
+  assert(activeFacts.length === 2, "expected listMemories to filter active core facts");
+  assert(activeFacts[0]?.issueNumber === 10, "expected listMemories to sort newest-first");
+  assert(sports.length === 1 && sports[0]?.issueNumber === 11, "expected listMemories to filter by topic across statuses");
+}
+
 async function main(): Promise<void> {
   await testSearchRanking();
   testCjkScoring();
   await testStructuredStoreAndSchema();
+  await testGetAndListMemories();
   console.log("memory tests passed");
 }
 

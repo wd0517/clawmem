@@ -38,6 +38,12 @@ export type NormalizedMessage = { role: string; text: string; toolName?: string;
 export type TranscriptSnapshot = { sessionId?: string; messages: NormalizedMessage[] };
 export type MemoryDraft = { detail: string; kind?: string; topics?: string[] };
 export type MemorySchema = { kinds: string[]; topics: string[] };
+export type MemoryListOptions = {
+  status?: "active" | "stale" | "all";
+  kind?: string;
+  topic?: string;
+  limit?: number;
+};
 export type ParsedMemoryIssue = {
   issueNumber: number; title: string; memoryId: string; memoryHash?: string;
   sessionId: string; date: string; detail: string;
