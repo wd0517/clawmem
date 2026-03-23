@@ -107,6 +107,8 @@ async function testStructuredStoreAndSchema(): Promise<void> {
   assert(created[0]?.labels.includes("kind:lesson"), "expected created labels to include normalized kind");
   assert(created[0]?.labels.includes("topic:redis-ops"), "expected created labels to include normalized topic");
   assert(created[0]?.labels.includes("topic:rate-limit"), "expected created labels to include normalized topic");
+  assert(!created[0]?.labels.some((label) => label.startsWith("date:")), "expected new memory labels to omit date labels");
+  assert(created[0]?.body.includes(`date: ${result.memory.date}`), "expected new memory body to retain logical date metadata");
   assert(ensured[0]?.includes("kind:lesson"), "expected ensureLabels to include kind label");
   assert(schema.kinds.includes("lesson"), "expected schema to expose existing kind labels");
   assert(schema.topics.includes("redis"), "expected schema to expose existing topic labels");
