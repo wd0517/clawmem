@@ -90,7 +90,6 @@ Recommended labels:
 
 - `type:conversation`
 - `session:<session_id>`
-- `date:YYYY-MM-DD`
 
 Optional extensions:
 
@@ -101,7 +100,6 @@ These labels serve the following roles:
 
 - `type:conversation`: identify the issue type
 - `session:<session_id>`: directly associate related memory with the conversation
-- `date:YYYY-MM-DD`: support date-based filtering and retrieval
 
 ---
 
@@ -163,7 +161,6 @@ Recommended labels:
 
 - `type:memory`
 - `session:<session_id>`
-- `date:YYYY-MM-DD`
 - `kind:*`
 - `topic:*`
 
@@ -171,7 +168,6 @@ These labels serve the following roles:
 
 - `type:memory`: identify the issue type
 - `session:<session_id>`: identify the source session
-- `date:YYYY-MM-DD`: identify creation date
 - `kind:*`: classify the type of memory
 - `topic:*`: represent AI-extracted keywords
 
@@ -319,15 +315,14 @@ This proposal recommends using GitHub Issues as the storage backend for OpenClaw
 ### `type:conversation`
 - **body**: metadata + summary
 - **comments**: append-only transcript timeline
-- **labels**: `type:conversation`, `session:<id>`, `date:*`
+- **labels**: `type:conversation`, `session:<id>`
 
 ### `type:memory`
 - **body**: summary only
-- **labels**: `type:memory`, `session:<id>`, `date:*`, `kind:*`, `topic:*`
+- **labels**: `type:memory`, `session:<id>`, `kind:*`, `topic:*`
 
 At the same time, the plugin should expose only semantic conversation/memory capabilities to OpenClaw, rather than exposing GitHub Issue details directly.
 
 The key idea is not to make OpenClaw operate on issues, but to:
 
 > use GitHub Issues to implement a conversation/memory backend, while keeping that storage model encapsulated inside the plugin.
-

@@ -264,8 +264,7 @@ export class ConversationMirror {
   }
 
   private buildLabels(session: SessionMirrorState, snapshot: TranscriptSnapshot, closed: boolean): string[] {
-    const dates = this.resolveDates(session, snapshot.messages);
-    const labels = new Set([...DEFAULT_LABELS, "type:conversation", `session:${session.sessionId}`, `date:${dates.date}`]);
+    const labels = new Set([...DEFAULT_LABELS, "type:conversation", `session:${session.sessionId}`]);
     if (session.agentId) labels.add(`${AGENT_LABEL_PREFIX}${session.agentId}`);
     labels.add(closed ? LABEL_CLOSED : LABEL_ACTIVE);
     return [...labels].filter((l) => l.trim().length > 0);
