@@ -4,7 +4,7 @@
 
 **What it does:**
 - Creates one `type:conversation` issue per session, mirrors the full transcript as comments.
-- During the session and on session end: best-effort extracts durable memories and stores each as a `type:memory` issue.
+- During request-scoped hooks: best-effort extracts durable memories and stores each as a `type:memory` issue.
 - On session start: searches active memories by relevance and injects them into context.
 - Lets agents inspect existing memory schema and write structured memories with `kind:*` and `topic:*` labels through plugin tools.
 
@@ -79,7 +79,7 @@ Without it, every session starts from zero. With it, what you learn persists. On
 After installing clawmem, you have two memory systems running in parallel:
 
 1. **Workspace files** (`MEMORY.md`, `SOUL.md`, etc.) — always injected into every session via system prompt
-2. **clawmem** — auto-extracts memories at session end; selectively injects by relevance at session start
+2. **clawmem** — auto-extracts memories during request-scoped maintenance; selectively injects by relevance at session start
 
 These two systems do not sync. Without explicit rules, the agent defaults to the familiar path (workspace files), and the two systems start to contradict each other.
 
@@ -117,7 +117,7 @@ clawmem is my brain. One system per job — no exceptions:
 | What | Where |
 |---|---|
 | Credentials / API keys | `knowledge/MEMORY.md` (always injected) |
-| Everything I learn, conclude, or figure out | clawmem only — auto-captured at session end |
+| Everything I learn, conclude, or figure out | clawmem only — auto-captured during request-scoped maintenance |
 | Files | Only when a tool or another human needs to read them |
 | Workspace versioning | clawmem git service (not github.com) |
 
@@ -148,7 +148,7 @@ Strip everything except credentials. Add a header comment:
 
 ## Locking Key Insights Manually
 
-clawmem auto-extracts memories at session end — but important insights deserve to be locked immediately, not left to chance extraction.
+clawmem auto-extracts memories during later request-scoped maintenance — but important insights deserve to be locked immediately, not left to chance extraction.
 
 After any significant realization, create a memory issue directly:
 

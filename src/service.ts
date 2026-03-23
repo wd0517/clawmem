@@ -30,7 +30,7 @@ class ClawMemService {
   }
 
   register(): void {
-    this.api.on("before_agent_start", async (ev, ctx) => this.handleRecall(ev.prompt, ctx.agentId));
+    this.api.on("before_agent_start", async (ev, ctx) => this.handleBeforeAgentStart(ev.prompt, ctx.agentId));
     this.api.on("agent_end", (ev, ctx) => this.scheduleTurn({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, agentId: ctx.agentId, messages: ev.messages }));
     this.api.on("before_reset", (ev, ctx) => this.enqueueFinalize({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, sessionFile: ev.sessionFile, agentId: ctx.agentId, reason: ev.reason, messages: ev.messages }));
     this.api.on("session_end", (ev, ctx) => this.enqueueFinalize({ sessionId: ev.sessionId ?? ctx.sessionId, sessionKey: ev.sessionKey ?? ctx.sessionKey, agentId: ctx.agentId, reason: "session_end" }));
@@ -53,10 +53,6 @@ class ClawMemService {
             ? `clawmem: ready with ${configuredCount} configured agent route(s); missing routes will provision on first use via ${this.config.baseUrl}`
             : `clawmem: ready; agent routes will provision on first use via ${this.config.baseUrl}`,
         );
-        // One-time migration: retitle existing conversations with accurate LLM-generated titles.
-        if (!this.state.migrations?.retitleV1) {
-          void this.track(this.runRetitleMigration()).catch((e) => this.warn("retitle migration", e));
-        }
       },
       stop: async () => {
         this.unsubTranscript?.();
@@ -205,10 +201,11 @@ class ClawMemService {
     });
   }
 
-  private async handleRecall(prompt: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
-    if (typeof prompt !== "string" || prompt.trim().length < 5) return;
+  private async handleBeforeAgentStart(prompt: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
     const routeAgentId = normalizeAgentId(agentId);
     if (!(await this.ensureConfigured(routeAgentId))) return;
+    await this.runRequestMaintenance(routeAgentId);
+    if (typeof prompt !== "string" || prompt.trim().length < 5) return;
     try {
       const { mem } = this.getServices(routeAgentId);
       const memories = await mem.search(prompt, this.config.memoryRecallLimit);
@@ -258,7 +255,7 @@ class ClawMemService {
     if (!p.sessionId) return;
     const agentId = normalizeAgentId(p.agentId);
     if (!(await this.ensureConfigured(agentId))) return;
-    const { conv, mem } = this.getServices(agentId);
+    const { conv } = this.getServices(agentId);
     const s = this.getOrCreate(p.sessionId, agentId);
     s.sessionKey = p.sessionKey ?? s.sessionKey; s.agentId = agentId; s.updatedAt = new Date().toISOString();
     const snap = await conv.loadSnapshot(s, p.messages);
@@ -267,11 +264,6 @@ class ClawMemService {
     await conv.syncLabels(s, snap, false);
     const next = snap.messages.slice(s.lastMirroredCount);
     if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; }
-    await conv.syncTitle(s, snap);
-    if (snap.messages.length >= 2 && snap.messages.length > (s.lastMemorySyncCount ?? 0)) {
-      const ok = await mem.syncFromConversation(s, snap);
-      if (ok) s.lastMemorySyncCount = snap.messages.length;
-    }
     await this.persistState();
   }
 
@@ -287,7 +279,7 @@ class ClawMemService {
     if (!p.sessionId) return;
     const agentId = normalizeAgentId(p.agentId);
     if (!(await this.ensureConfigured(agentId))) return;
-    const { conv, mem } = this.getServices(agentId);
+    const { conv } = this.getServices(agentId);
     const s = this.getOrCreate(p.sessionId, agentId);
     if (s.finalizedAt) return;
     s.sessionKey = p.sessionKey ?? s.sessionKey; s.sessionFile = p.sessionFile ?? s.sessionFile;
@@ -299,22 +291,11 @@ class ClawMemService {
     const next = snap.messages.slice(s.lastMirroredCount);
     let allOk = true;
     if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; allOk = n === next.length; }
-    let summary = "pending";
-    let generatedTitle: string | undefined;
-    try {
-      const result = await conv.generateSummaryAndTitle(s, snap);
-      summary = result.summary;
-      generatedTitle = result.title;
-    } catch (e) { summary = `failed: ${String(e)}`; }
     await conv.syncLabels(s, snap, true);
-    await conv.syncBody(s, snap, summary, true, generatedTitle);
-    const memorySynced = await mem.syncFromConversation(s, snap);
-    if (memorySynced) s.lastMemorySyncCount = snap.messages.length;
+    await conv.syncBody(s, snap, "pending", true);
+    s.summaryStatus = "pending";
     if (allOk) s.finalizedAt = new Date().toISOString();
     await this.persistState();
-
-    // Auto-name the repo if it still has no description (first few conversations).
-    this.maybeAutoNameRepo(agentId, summary, generatedTitle);
   }
 
   // --- Infrastructure ---
@@ -440,29 +421,55 @@ class ClawMemService {
       },
     });
   }
-  private async runRetitleMigration(): Promise<void> {
-    const configuredAgents = Object.keys(this.config.agents).filter((agentId) => {
-      return isAgentConfigured(resolveAgentRoute(this.config, agentId));
-    });
-    for (const agentId of configuredAgents) {
-      try {
-        const { conv } = this.getServices(agentId);
-        const result = await conv.retitleConversations();
-        // Sync titleSource for retitled sessions so syncTitle doesn't regenerate.
-        const retitledSet = new Set(result.retitledIssues);
-        for (const session of Object.values(this.state.sessions)) {
-          if (session.agentId === agentId && session.issueNumber && retitledSet.has(session.issueNumber)) {
+  private async runRequestMaintenance(agentId: string): Promise<void> {
+    const sessions = Object.values(this.state.sessions)
+      .filter((session) => normalizeAgentId(session.agentId) === agentId)
+      .sort((a, b) => Date.parse(b.updatedAt ?? b.createdAt ?? "") - Date.parse(a.updatedAt ?? a.createdAt ?? ""))
+      .slice(0, 8);
+    if (sessions.length === 0) return;
+    const { conv, mem } = this.getServices(agentId);
+    let changed = false;
+    let workDone = 0;
+    for (const session of sessions) {
+      if (workDone >= 3) break;
+      const snap = await conv.loadSnapshot(session, []);
+      if (!conv.shouldMirror(session.sessionId, snap.messages) || snap.messages.length === 0) continue;
+      if (!session.issueNumber) {
+        await conv.ensureIssue(session, snap);
+        changed = true;
+      }
+      if (session.summaryStatus === "pending") {
+        try {
+          const result = await conv.generateSummaryAndTitle(session, snap);
+          await conv.syncLabels(session, snap, true);
+          await conv.syncBody(session, snap, result.summary, true, result.title);
+          session.summaryStatus = "complete";
+          if (result.title?.trim()) {
+            session.issueTitle = result.title.trim();
             session.titleSource = "llm";
           }
+          this.maybeAutoNameRepo(agentId, result.summary, result.title);
+          changed = true;
+          workDone++;
+        } catch (error) {
+          this.warn(`request-scoped summary sync for ${session.sessionId}`, error);
         }
-        this.api.logger.info?.(`clawmem: retitle migration for agent ${agentId}: ${result.updated} updated, ${result.skipped} skipped, ${result.failed} failed`);
-      } catch (e) {
-        this.warn(`retitle migration for agent ${agentId}`, e);
+      }
+      if (session.titleSource !== "llm" && snap.messages.length >= 2) {
+        await conv.syncTitle(session, snap);
+        changed = true;
+        workDone++;
+      }
+      if (snap.messages.length >= 2 && snap.messages.length > (session.lastMemorySyncCount ?? 0)) {
+        const ok = await mem.syncFromConversation(session, snap);
+        if (ok) {
+          session.lastMemorySyncCount = snap.messages.length;
+          changed = true;
+        }
+        workDone++;
       }
     }
-    if (!this.state.migrations) this.state.migrations = {};
-    this.state.migrations.retitleV1 = new Date().toISOString();
-    await this.persistState();
+    if (changed) await this.persistState();
   }
 
   private getServices(agentId?: string): { conv: ConversationMirror; mem: MemoryStore } {

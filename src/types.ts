@@ -29,6 +29,7 @@ export type SessionMirrorState = {
   issueNumber?: number; issueTitle?: string; titleSource?: "placeholder" | "llm";
   lastMirroredCount: number; turnCount: number; lastAssistantText?: string;
   lastMemorySyncCount?: number;
+  summaryStatus?: "pending" | "complete";
   finalizedAt?: string; lastSummaryHash?: string; lastTurnHash?: string;
   createdAt?: string; updatedAt?: string;
 };
