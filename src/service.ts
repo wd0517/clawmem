@@ -34,12 +34,14 @@ class ClawMemService {
     this.api.on("agent_end", (ev, ctx) => this.scheduleTurn({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, agentId: ctx.agentId, messages: ev.messages }));
     this.api.on("before_reset", (ev, ctx) => this.enqueueFinalize({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, sessionFile: ev.sessionFile, agentId: ctx.agentId, reason: ev.reason, messages: ev.messages }));
     this.api.on("session_end", (ev, ctx) => this.enqueueFinalize({ sessionId: ev.sessionId ?? ctx.sessionId, sessionKey: ev.sessionKey ?? ctx.sessionKey, agentId: ctx.agentId, reason: "session_end" }));
+    this.registerTools();
 
     this.api.registerService({
       id: "clawmem",
-      start: async (ctx) => {
+      start: async (ctx: { stateDir: string }) => {
         this.statePath = resolveStatePath(ctx.stateDir);
         await this.ensureLoaded();
+        this.warnIfInactiveMemorySlot();
         this.unsubTranscript = this.api.runtime.events.onSessionTranscriptUpdate((u) => {
           void this.track(this.handleTranscript(u.sessionFile)).catch((e) => this.warn("transcript update", e));
         });
@@ -57,6 +59,95 @@ class ClawMemService {
         for (const t of this.syncTimers.values()) clearTimeout(t);
         this.syncTimers.clear();
         await Promise.allSettled([...this.pending]);
+      },
+    });
+  }
+
+  private registerTools(): void {
+    this.api.registerTool({
+      name: "memory_recall",
+      description: "Search ClawMem active memories for relevant prior facts, decisions, conventions, and lessons.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          query: { type: "string", minLength: 1, description: "What to recall from memory." },
+          limit: { type: "integer", minimum: 1, maximum: 20, description: "Maximum number of memories to return." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
+        },
+        required: ["query"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const query = typeof p.query === "string" ? p.query.trim() : "";
+        if (!query) return toolText("Query is empty.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
+        const { mem } = this.getServices(agentId);
+        const rawLimit = typeof p.limit === "number" && Number.isFinite(p.limit) ? Math.floor(p.limit) : this.config.memoryRecallLimit;
+        const limit = Math.min(20, Math.max(1, rawLimit));
+        const memories = await mem.search(query, limit);
+        if (memories.length === 0) return toolText(`No active memories matched "${query}".`);
+        const text = [
+          `Found ${memories.length} active memor${memories.length === 1 ? "y" : "ies"} for "${query}":`,
+          ...memories.map((m) => `- [${m.memoryId}] ${m.title || "Memory"}: ${m.detail}`),
+        ].join("\n");
+        return toolText(text);
+      },
+    });
+
+    this.api.registerTool({
+      name: "memory_store",
+      description: "Store a durable ClawMem memory immediately instead of waiting for session finalization.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          detail: { type: "string", minLength: 1, description: "The durable fact, lesson, decision, or preference to remember." },
+          sessionId: { type: "string", minLength: 1, description: "Optional source session id label. Defaults to manual." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
+        },
+        required: ["detail"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const detail = typeof p.detail === "string" ? p.detail.trim() : "";
+        if (!detail) return toolText("Detail is empty.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
+        const { mem } = this.getServices(agentId);
+        const sessionId = typeof p.sessionId === "string" && p.sessionId.trim() ? p.sessionId.trim() : "manual";
+        const result = await mem.store(detail, sessionId);
+        if (!result.created) return toolText(`Memory already exists as [${result.memory.memoryId}] ${result.memory.title || "Memory"}.`);
+        return toolText(`Stored memory [${result.memory.memoryId}] ${result.memory.title || "Memory"}: ${result.memory.detail}`);
+      },
+    });
+
+    this.api.registerTool({
+      name: "memory_forget",
+      description: "Mark an active ClawMem memory as stale when it is superseded or no longer true.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          memoryId: { type: "string", minLength: 1, description: "The memory id or issue number to mark stale." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
+        },
+        required: ["memoryId"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const memoryId = typeof p.memoryId === "string" ? p.memoryId.trim() : "";
+        if (!memoryId) return toolText("memoryId is empty.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
+        const { mem } = this.getServices(agentId);
+        const forgotten = await mem.forget(memoryId);
+        if (!forgotten) return toolText(`No active memory matched id "${memoryId}".`);
+        return toolText(`Marked memory [${forgotten.memoryId}] stale: ${forgotten.detail}`);
       },
     });
   }
@@ -114,7 +205,7 @@ class ClawMemService {
     if (!p.sessionId) return;
     const agentId = normalizeAgentId(p.agentId);
     if (!(await this.ensureConfigured(agentId))) return;
-    const { conv } = this.getServices(agentId);
+    const { conv, mem } = this.getServices(agentId);
     const s = this.getOrCreate(p.sessionId, agentId);
     s.sessionKey = p.sessionKey ?? s.sessionKey; s.agentId = agentId; s.updatedAt = new Date().toISOString();
     const snap = await conv.loadSnapshot(s, p.messages);
@@ -123,6 +214,10 @@ class ClawMemService {
     await conv.syncLabels(s, snap, false);
     const next = snap.messages.slice(s.lastMirroredCount);
     if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; }
+    if (snap.messages.length >= 2 && snap.messages.length > (s.lastMemorySyncCount ?? 0)) {
+      const ok = await mem.syncFromConversation(s, snap);
+      if (ok) s.lastMemorySyncCount = snap.messages.length;
+    }
     await this.persistState();
   }
 
@@ -159,7 +254,8 @@ class ClawMemService {
     } catch (e) { summary = `failed: ${String(e)}`; }
     await conv.syncLabels(s, snap, true);
     await conv.syncBody(s, snap, summary, true, generatedTitle);
-    await mem.syncFromConversation(s, snap);
+    const memorySynced = await mem.syncFromConversation(s, snap);
+    if (memorySynced) s.lastMemorySyncCount = snap.messages.length;
     if (allOk) s.finalizedAt = new Date().toISOString();
     await this.persistState();
 
@@ -242,6 +338,27 @@ class ClawMemService {
       return true;
     } catch (error) { this.api.logger.warn(`clawmem: failed to provision Git credentials for agent ${agentId} via ${route.baseUrl}: ${String(error)}`); return false; }
   }
+  private warnIfInactiveMemorySlot(): void {
+    try {
+      const root = this.api.runtime.config.loadConfig();
+      const plugins = asRecord(root.plugins);
+      const slots = asRecord(plugins.slots);
+      const slot = typeof slots.memory === "string" ? String(slots.memory).trim() : "";
+      if (!slot) {
+        this.api.logger.warn(
+          `clawmem: plugins.slots.memory is not set, so OpenClaw may keep the default memory plugin active. Set plugins.slots.memory to "${this.api.id}" and restart the gateway.`,
+        );
+        return;
+      }
+      if (slot !== this.api.id) {
+        this.api.logger.warn(
+          `clawmem: plugins.slots.memory is "${slot}", so ClawMem is not the selected memory plugin. Set plugins.slots.memory to "${this.api.id}" and restart the gateway.`,
+        );
+      }
+    } catch (error) {
+      this.api.logger.warn(`clawmem: memory slot check failed: ${String(error)}`);
+    }
+  }
   private async persistAgentConfig(agentId: string, values: { baseUrl: string; authScheme: "token" | "bearer"; token: string; repo: string }): Promise<void> {
     const root = this.api.runtime.config.loadConfig();
     const plugins = root.plugins;
@@ -276,6 +393,9 @@ class ClawMemService {
       mem: new MemoryStore(client, this.api, this.config),
     };
   }
+  private resolveToolAgentId(agentId: unknown): string {
+    return normalizeAgentId(typeof agentId === "string" && agentId.trim() ? agentId : process.env.OPENCLAW_AGENT_ID);
+  }
   /**
    * After finalization, check if the repo still has an empty/default description.
    * If so, use the conversation summary to suggest a meaningful name and update
@@ -302,5 +422,8 @@ class ClawMemService {
 }
 
 function asRecord(v: unknown): Record<string, unknown> { return v && typeof v === "object" ? (v as Record<string, unknown>) : {}; }
+function toolText(text: string): { content: Array<{ type: "text"; text: string }> } {
+  return { content: [{ type: "text", text }] };
+}
 
 export function createClawMemPlugin(api: OpenClawPluginApi): void { new ClawMemService(api).register(); }

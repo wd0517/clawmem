@@ -8,35 +8,72 @@ import { fmtTranscript, localDate, sha256, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 
 type MemoryDecision = { save: string[]; stale: string[] };
+type SearchIndex = { title: string; detail: string; topics: string[] };
 
 export class MemoryStore {
   constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
 
   async search(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const memories = await this.list("active");
-    const q = query.trim().toLowerCase();
-    const tokens = q.split(/[^a-z0-9]+/i).filter((t) => t.length > 1);
+    const q = normalizeSearch(query);
+    if (!q) return [];
     return memories
-      .map((m) => {
-        const hay = `${m.title}\n${m.detail}`.toLowerCase();
-        let score = hay.includes(q) ? 10 : 0;
-        for (const t of tokens) if (hay.includes(t)) score += 1;
-        return { m, score };
-      })
+      .map((m) => ({ m, score: scoreMemoryMatch(m, q) }))
       .filter((e) => e.score > 0)
       .sort((a, b) => b.score - a.score || b.m.issueNumber - a.m.issueNumber)
       .slice(0, limit)
       .map((e) => e.m);
   }
 
-  async syncFromConversation(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<void> {
+  async store(detail: string, sessionId = "manual"): Promise<{ created: boolean; memory: ParsedMemoryIssue }> {
+    const normalized = norm(detail);
+    if (!normalized) throw new Error("memory detail is empty");
+    const allActive = await this.list("active");
+    const hash = sha256(normalized);
+    const existing = allActive.find((m) => (m.memoryHash || sha256(norm(m.detail))) === hash);
+    if (existing) return { created: false, memory: existing };
+
+    const date = localDate();
+    const labels = memLabels(sessionId, date, "active");
+    const title = `${MEMORY_TITLE_PREFIX}${trunc(normalized, 72)}`;
+    const body = stringifyFlatYaml([["memory_hash", hash], ["detail", normalized]]);
+    await this.client.ensureLabels(labels);
+    const issue = await this.client.createIssue({ title, body, labels });
+    return {
+      created: true,
+      memory: {
+        issueNumber: issue.number,
+        title,
+        memoryId: String(issue.number),
+        memoryHash: hash,
+        sessionId,
+        date,
+        detail: normalized,
+        status: "active",
+      },
+    };
+  }
+
+  async forget(memoryId: string): Promise<ParsedMemoryIssue | null> {
+    const id = memoryId.trim();
+    if (!id) throw new Error("memoryId is empty");
+    const mem = (await this.list("active")).find((m) => m.memoryId === id || String(m.issueNumber) === id);
+    if (!mem) return null;
+    await this.client.ensureLabels([LABEL_MEMORY_STALE]);
+    await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.sessionId, mem.date, "stale"));
+    return { ...mem, status: "stale" };
+  }
+
+  async syncFromConversation(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<boolean> {
     try {
       const decision = await this.generateDecision(session, snapshot);
       const { savedCount, staledCount } = await this.applyDecision(session.sessionId, decision);
       if (savedCount > 0 || staledCount > 0)
         this.api.logger.info?.(`clawmem: synced memories for ${session.sessionId} (saved=${savedCount}, stale=${staledCount})`);
+      return true;
     } catch (error) {
       this.api.logger.warn(`clawmem: memory capture failed: ${String(error)}`);
+      return false;
     }
   }
 
@@ -139,6 +176,73 @@ function memLabels(sessionId: string, date: string, status: "active" | "stale"):
 }
 function norm(v: string): string { return v.replace(/\s+/g, " ").trim(); }
 function trunc(v: string, max: number): string { const s = norm(v); return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`; }
+function normalizeSearch(v: string): string {
+  return v.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+}
+function buildSearchIndex(memory: ParsedMemoryIssue): SearchIndex {
+  return {
+    title: normalizeSearch(memory.title),
+    detail: normalizeSearch(memory.detail),
+    topics: (memory.topics ?? []).map(normalizeSearch).filter(Boolean),
+  };
+}
+function searchTokens(v: string): string[] {
+  const seen = new Set<string>();
+  for (const token of v.split(/[^0-9\p{L}]+/u)) {
+    if (token.length > 1) seen.add(token);
+  }
+  for (const chunk of v.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]{2,}/gu) ?? []) {
+    for (let i = 0; i < chunk.length; i++) {
+      seen.add(chunk[i]!);
+      if (i + 1 < chunk.length) seen.add(chunk.slice(i, i + 2));
+    }
+  }
+  return [...seen];
+}
+function charBigrams(v: string): Set<string> {
+  const compact = v.replace(/\s+/g, "");
+  if (compact.length < 2) return new Set(compact ? [compact] : []);
+  const out = new Set<string>();
+  for (let i = 0; i < compact.length - 1; i++) out.add(compact.slice(i, i + 2));
+  return out;
+}
+function overlapRatio(left: Set<string>, right: Set<string>): number {
+  if (left.size === 0 || right.size === 0) return 0;
+  let hits = 0;
+  for (const token of left) if (right.has(token)) hits++;
+  return hits / Math.max(left.size, right.size);
+}
+export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): number {
+  const query = normalizeSearch(rawQuery);
+  if (!query) return 0;
+  const idx = buildSearchIndex(memory);
+  const tokens = searchTokens(query);
+  const queryTokenSet = new Set(tokens);
+  const titleTokenSet = new Set(searchTokens(idx.title));
+  const detailTokenSet = new Set(searchTokens(idx.detail));
+  const topicTokenSet = new Set(idx.topics.flatMap(searchTokens));
+  let score = 0;
+
+  if (idx.title.includes(query)) score += 18;
+  if (idx.detail.includes(query)) score += 12;
+  for (const topic of idx.topics) if (topic.includes(query)) score += 10;
+
+  for (const token of tokens) {
+    if (idx.title.includes(token)) score += 4;
+    if (idx.detail.includes(token)) score += 2;
+    if (idx.topics.some((topic) => topic.includes(token))) score += 3;
+  }
+
+  score += overlapRatio(queryTokenSet, titleTokenSet) * 10;
+  score += overlapRatio(queryTokenSet, detailTokenSet) * 6;
+  score += overlapRatio(queryTokenSet, topicTokenSet) * 8;
+
+  const queryBigrams = charBigrams(query);
+  score += overlapRatio(queryBigrams, charBigrams(idx.title)) * 6;
+  score += overlapRatio(queryBigrams, charBigrams(idx.detail)) * 3;
+
+  return score;
+}
 function parseDecision(raw: string): MemoryDecision {
   const tryParse = (s: string): MemoryDecision | null => {
     try {

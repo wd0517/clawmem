@@ -28,6 +28,7 @@ export type SessionMirrorState = {
   sessionId: string; sessionKey?: string; sessionFile?: string; agentId?: string;
   issueNumber?: number; issueTitle?: string;
   lastMirroredCount: number; turnCount: number; lastAssistantText?: string;
+  lastMemorySyncCount?: number;
   finalizedAt?: string; lastSummaryHash?: string; lastTurnHash?: string;
   createdAt?: string; updatedAt?: string;
 };

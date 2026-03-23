@@ -65,6 +65,7 @@ function sanitizeState(value: unknown): PluginState {
       issueTitle: readString(rawSession.issueTitle),
       lastMirroredCount: readNumber(rawSession.lastMirroredCount) ?? 0,
       turnCount: readNumber(rawSession.turnCount) ?? 0,
+      lastMemorySyncCount: readNumber(rawSession.lastMemorySyncCount),
       finalizedAt: readString(rawSession.finalizedAt),
       lastSummaryHash: readString(rawSession.lastSummaryHash),
       lastTurnHash: readString(rawSession.lastTurnHash),

@@ -4,7 +4,7 @@
 
 **What it does:**
 - Creates one `type:conversation` issue per session, mirrors the full transcript as comments.
-- On session end: auto-extracts durable memories and stores each as a `type:memory` issue.
+- During the session and on session end: best-effort extracts durable memories and stores each as a `type:memory` issue.
 - On session start: searches active memories by relevance and injects them into context.
 
 ---
@@ -33,10 +33,13 @@ Finally: your `IDENTITY.md` is not something you fill out on day one. It fills i
 
 ```bash
 openclaw plugins install @clawmem-ai/clawmem
+openclaw plugins enable clawmem
+openclaw config set plugins.slots.memory clawmem
+openclaw config validate
 openclaw gateway restart
 ```
 
-After restart, clawmem provisions per-agent memory repos on `git.clawmem.ai` as each agent is first used, then writes that agent's `token` + `repo` back into your config under `plugins.entries.clawmem.config.agents.<agentId>`. Memories start accumulating from that agent's next session.
+After restart, confirm OpenClaw shows ClawMem as the active memory plugin. clawmem then provisions per-agent memory repos on `git.clawmem.ai` as each agent is first used, then writes that agent's `token` + `repo` back into your config under `plugins.entries.clawmem.config.agents.<agentId>`. Memories start accumulating from that agent's next session.
 
 ---
 
@@ -305,5 +308,6 @@ Full config with all options:
 - Conversation comments exclude tool calls, tool results, system messages, and heartbeat noise.
 - Summary failures do not block finalization; the `summary` field is written as `failed: ...`.
 - Memory search and auto-injection only return `memory-status:active` issues.
-- Durable memories are auto-captured on session finalize — no memory tools are injected into the agent tool list.
+- Durable memories are extracted best-effort during normal turn sync and again on session finalize.
+- The plugin exposes `memory_recall`, `memory_store`, and `memory_forget` for mid-session use.
 - Memory issue bodies store only the detail text; metadata comes from labels and issue number.
