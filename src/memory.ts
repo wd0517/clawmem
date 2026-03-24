@@ -14,15 +14,15 @@ export class MemoryStore {
   constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
 
   async search(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
-    const memories = await this.listByStatus("active");
     const q = normalizeSearch(query);
     if (!q) return [];
-    return memories
-      .map((m) => ({ m, score: scoreMemoryMatch(m, q) }))
-      .filter((e) => e.score > 0)
-      .sort((a, b) => b.score - a.score || b.m.issueNumber - a.m.issueNumber)
-      .slice(0, limit)
-      .map((e) => e.m);
+    try {
+      const results = await this.searchViaBackend(query, limit);
+      if (results.length > 0) return results;
+    } catch (error) {
+      this.api.logger?.warn?.(`clawmem: backend memory search failed, falling back to local lexical ranking: ${String(error)}`);
+    }
+    return this.searchLocally(q, limit);
   }
 
   async listSchema(): Promise<MemorySchema> {
@@ -173,6 +173,27 @@ export class MemoryStore {
       if (batch.length < 100) break;
     }
     return out;
+  }
+
+  private async searchViaBackend(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
+    const repo = this.client.repo();
+    if (!repo) return [];
+    const qualified = buildMemorySearchQuery(query, repo);
+    const batch = await this.client.searchIssues(qualified, { perPage: Math.min(100, Math.max(limit * 3, 20)) });
+    return batch
+      .map((issue) => this.parseIssue(issue))
+      .filter((memory): memory is ParsedMemoryIssue => memory !== null && memory.status === "active")
+      .slice(0, limit);
+  }
+
+  private async searchLocally(normalizedQuery: string, limit: number): Promise<ParsedMemoryIssue[]> {
+    const memories = await this.listByStatus("active");
+    return memories
+      .map((m) => ({ m, score: scoreMemoryMatch(m, normalizedQuery) }))
+      .filter((e) => e.score > 0)
+      .sort((a, b) => b.score - a.score || b.m.issueNumber - a.m.issueNumber)
+      .slice(0, limit)
+      .map((e) => e.m);
   }
 
   private parseIssue(issue: { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> }): ParsedMemoryIssue | null {
@@ -354,6 +375,10 @@ function overlapRatio(left: Set<string>, right: Set<string>): number {
   let hits = 0;
   for (const token of left) if (right.has(token)) hits++;
   return hits / Math.max(left.size, right.size);
+}
+function buildMemorySearchQuery(query: string, repo: string): string {
+  const parts = [query.trim(), `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].filter(Boolean);
+  return parts.join(" ");
 }
 export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): number {
   const query = normalizeSearch(rawQuery);

@@ -68,6 +68,63 @@ async function testSearchRanking(): Promise<void> {
   assert(found[0]?.issueNumber === 1, "expected the more specific Redis rate limiting memory to rank first");
 }
 
+async function testBackendSearchPreferredForRecall(): Promise<void> {
+  const listed = [
+    issueFromMemory(memory({
+      issueNumber: 1,
+      title: "Memory: lexical decoy",
+      detail: "redis rate limiting checklist",
+      kind: "lesson",
+    })),
+  ];
+  const searched = [
+    issueFromMemory(memory({
+      issueNumber: 2,
+      title: "Memory: semantic winner",
+      detail: "Use Lua scripts to keep Redis rate limiting atomic.",
+      kind: "lesson",
+      topics: ["redis"],
+    })),
+  ];
+  const queries: string[] = [];
+  const client = {
+    repo: () => "owner/main-memory",
+    listIssues: async () => listed,
+    searchIssues: async (query: string) => {
+      queries.push(query);
+      return searched;
+    },
+  };
+  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const found = await store.search("redis rate limiting", 5);
+
+  assert(queries.length === 1, "expected backend search to be called once");
+  assert(queries[0]?.includes('repo:owner/main-memory'), "expected backend query to scope to the current repo");
+  assert(queries[0]?.includes('label:\"type:memory\"') || queries[0]?.includes('label:"type:memory"'), "expected backend query to filter memory issues");
+  assert(found.length === 1 && found[0]?.issueNumber === 2, "expected backend search results to be preferred");
+}
+
+async function testBackendSearchFallsBackToLocalLexical(): Promise<void> {
+  const issues = [
+    issueFromMemory(memory({
+      issueNumber: 3,
+      title: "Memory: Redis rate limit tuning",
+      detail: "Distributed Redis rate limiting must use Lua scripts to stay atomic.",
+      kind: "lesson",
+      topics: ["redis"],
+    })),
+  ];
+  const client = {
+    repo: () => "owner/main-memory",
+    listIssues: async () => issues,
+    searchIssues: async () => { throw new Error("search unavailable"); },
+  };
+  const store = new MemoryStore(client as never, { logger: { warn: () => {} } } as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const found = await store.search("redis rate limiting", 5);
+
+  assert(found.length === 1 && found[0]?.issueNumber === 3, "expected lexical fallback when backend search fails");
+}
+
 function testCjkScoring(): void {
   const billing = memory({
     issueNumber: 3,
@@ -299,6 +356,8 @@ async function testForgetClosesMemoryIssue(): Promise<void> {
 
 async function main(): Promise<void> {
   await testSearchRanking();
+  await testBackendSearchPreferredForRecall();
+  await testBackendSearchFallsBackToLocalLexical();
   testCjkScoring();
   await testStructuredStoreAndSchema();
   await testGetAndListMemories();
