@@ -51,40 +51,6 @@
           }
         }
       },
-      "issueTitlePrefix": {
-        "type": "string"
-      },
-      "memoryTitlePrefix": {
-        "type": "string"
-      },
-      "defaultLabels": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        },
-        "default": []
-      },
-      "agentLabelPrefix": {
-        "type": "string"
-      },
-      "activeStatusLabel": {
-        "type": "string"
-      },
-      "closedStatusLabel": {
-        "type": "string"
-      },
-      "memoryActiveStatusLabel": {
-        "type": "string"
-      },
-      "memoryStaleStatusLabel": {
-        "type": "string"
-      },
-      "autoCreateLabels": {
-        "type": "boolean"
-      },
-      "closeIssueOnReset": {
-        "type": "boolean"
-      },
       "turnCommentDelayMs": {
         "type": "integer",
         "minimum": 0,
@@ -99,15 +65,6 @@
         "type": "integer",
         "minimum": 1,
         "maximum": 20
-      },
-      "labelColor": {
-        "type": "string",
-        "pattern": "^#?[0-9a-fA-F]{6}$"
-      },
-      "maxExcerptChars": {
-        "type": "integer",
-        "minimum": 120,
-        "maximum": 4000
       }
     }
   },
@@ -135,40 +92,6 @@
       "label": "Agent Routes",
       "help": "Per-agent ClawMem credentials keyed by agent id. Missing repo/token are provisioned automatically on first use."
     },
-    "defaultLabels": {
-      "label": "Default Labels",
-      "help": "Labels added to every new session issue. Good place for topic:* tags."
-    },
-    "memoryTitlePrefix": {
-      "label": "Memory Title Prefix",
-      "help": "Prefix used when creating memory issue titles."
-    },
-    "agentLabelPrefix": {
-      "label": "Agent Label Prefix",
-      "help": "Dynamic agent label prefix, for example agent:coder."
-    },
-    "activeStatusLabel": {
-      "label": "Active Status Label",
-      "help": "Deprecated compatibility setting. Conversation lifecycle now uses native issue state."
-    },
-    "closedStatusLabel": {
-      "label": "Closed Status Label",
-      "help": "Deprecated compatibility setting. Conversation lifecycle now uses native issue state."
-    },
-    "memoryActiveStatusLabel": {
-      "label": "Memory Active Status Label",
-      "help": "Deprecated compatibility setting. Memory lifecycle now uses native issue state."
-    },
-    "memoryStaleStatusLabel": {
-      "label": "Memory Stale Status Label",
-      "help": "Deprecated compatibility setting. Memory lifecycle now uses native issue state."
-    },
-    "autoCreateLabels": {
-      "label": "Auto Create Labels"
-    },
-    "closeIssueOnReset": {
-      "label": "Close On Reset"
-    },
     "turnCommentDelayMs": {
       "label": "Turn Sync Delay (ms)",
       "help": "Small delay so transcript writes settle before a turn comment is mirrored."
@@ -180,14 +103,6 @@
     "memoryRecallLimit": {
       "label": "Memory Recall Limit",
       "help": "Maximum number of active memories injected into context before an agent starts."
-    },
-    "labelColor": {
-      "label": "Fallback Label Color",
-      "placeholder": "0e8a16"
-    },
-    "maxExcerptChars": {
-      "label": "Max Excerpt Chars",
-      "help": "Soft cap used when rendering summaries and comment sections."
     }
   }
 }

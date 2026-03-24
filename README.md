@@ -283,12 +283,6 @@ Full config with all options:
               token: "<token>"
             }
           },
-          issueTitlePrefix: "Session: ",
-          memoryTitlePrefix: "Memory: ",
-          defaultLabels: [],
-          agentLabelPrefix: "agent:",
-          autoCreateLabels: true,
-          closeIssueOnReset: true,
           turnCommentDelayMs: 1000,
           summaryWaitTimeoutMs: 120000,
           memoryRecallLimit: 5
