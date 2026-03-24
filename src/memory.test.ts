@@ -1,5 +1,6 @@
 import { MemoryStore, scoreMemoryMatch } from "./memory.js";
 import type { ParsedMemoryIssue } from "./types.js";
+import { stringifyFlatYaml } from "./yaml.js";
 
 function memory(overrides: Partial<ParsedMemoryIssue> = {}): ParsedMemoryIssue {
   return {
@@ -16,19 +17,22 @@ function memory(overrides: Partial<ParsedMemoryIssue> = {}): ParsedMemoryIssue {
   };
 }
 
-type IssueRecord = { number: number; title?: string; body?: string; labels?: string[] };
+type IssueRecord = { number: number; title?: string; body?: string; state?: "open" | "closed"; labels?: string[] };
 type LabelRecord = { name?: string };
 
 function issueFromMemory(m: ParsedMemoryIssue): IssueRecord {
   return {
     number: m.issueNumber,
     title: m.title,
-    body: m.detail,
+    body: stringifyFlatYaml([
+      ["memory_hash", m.memoryHash ?? ""],
+      ["date", m.date],
+      ["detail", m.detail],
+    ]),
+    state: m.status === "stale" ? "closed" : "open",
     labels: [
       "type:memory",
       `session:${m.sessionId}`,
-      `date:${m.date}`,
-      m.status === "stale" ? "memory-status:stale" : "memory-status:active",
       ...(m.kind ? [`kind:${m.kind}`] : []),
       ...(m.topics ?? []).map((topic) => `topic:${topic}`),
     ],
@@ -140,11 +144,14 @@ async function testGetAndListMemories(): Promise<void> {
     })),
   ];
   const client = {
-    listIssues: async (params?: { labels?: string[] }) => {
+    listIssues: async (params?: { labels?: string[]; state?: "open" | "closed" | "all" }) => {
       const labels = params?.labels ?? [];
+      const state = params?.state ?? "open";
       return issues.filter((issue) => {
         const issueLabels = issue.labels ?? [];
-        return labels.every((label) => issueLabels.includes(label));
+        if (!labels.every((label) => issueLabels.includes(label))) return false;
+        if (state === "all") return true;
+        return (issue.state ?? "open") === state;
       });
     },
   };
@@ -165,15 +172,18 @@ async function testLegacyMemoriesWithoutSessionOrDate(): Promise<void> {
       number: 4,
       title: "Memory: xiangz preferences",
       body: "xiangz likes F1 and watches Dota 2 as a viewer.",
-      labels: ["type:memory", "memory-status:active", "kind:core-fact", "topic:preferences"],
+      labels: ["type:memory", "kind:core-fact", "topic:preferences"],
     },
   ];
   const client = {
-    listIssues: async (params?: { labels?: string[] }) => {
+    listIssues: async (params?: { labels?: string[]; state?: "open" | "closed" | "all" }) => {
       const labels = params?.labels ?? [];
+      const state = params?.state ?? "open";
       return issues.filter((issue) => {
         const issueLabels = issue.labels ?? [];
-        return labels.every((label) => issueLabels.includes(label));
+        if (!labels.every((label) => issueLabels.includes(label))) return false;
+        if (state === "all") return true;
+        return (issue.state ?? "open") === state;
       });
     },
   };
@@ -201,11 +211,14 @@ async function testUpdateMemoryInPlace(): Promise<void> {
   const updatedIssues: Array<{ number: number; title?: string; body?: string }> = [];
   const syncedLabels: Array<{ number: number; labels: string[] }> = [];
   const client = {
-    listIssues: async (params?: { labels?: string[] }) => {
+    listIssues: async (params?: { labels?: string[]; state?: "open" | "closed" | "all" }) => {
       const labels = params?.labels ?? [];
+      const state = params?.state ?? "open";
       return issues.filter((issue) => {
         const issueLabels = issue.labels ?? [];
-        return labels.every((label) => issueLabels.includes(label));
+        if (!labels.every((label) => issueLabels.includes(label))) return false;
+        if (state === "all") return true;
+        return (issue.state ?? "open") === state;
       });
     },
     ensureLabels: async (labels: string[]) => { ensured.push(labels); },
@@ -239,6 +252,51 @@ async function testUpdateMemoryInPlace(): Promise<void> {
   assert(syncedLabels[0]?.labels.includes("kind:core-fact"), "expected existing kind label to be preserved");
 }
 
+async function testForgetClosesMemoryIssue(): Promise<void> {
+  const issues: IssueRecord[] = [
+    issueFromMemory(memory({
+      issueNumber: 12,
+      title: "Memory: outdated deployment rule",
+      detail: "Always restart the full cluster after deploy.",
+      kind: "convention",
+      topics: ["deploy"],
+    })),
+  ];
+  const syncedLabels: Array<{ number: number; labels: string[] }> = [];
+  const updatedIssues: Array<{ number: number; state?: "open" | "closed" }> = [];
+  const client = {
+    listIssues: async (params?: { labels?: string[]; state?: "open" | "closed" | "all" }) => {
+      const labels = params?.labels ?? [];
+      const state = params?.state ?? "open";
+      return issues.filter((issue) => {
+        const issueLabels = issue.labels ?? [];
+        if (!labels.every((label) => issueLabels.includes(label))) return false;
+        if (state === "all") return true;
+        return (issue.state ?? "open") === state;
+      });
+    },
+    syncManagedLabels: async (number: number, labels: string[]) => {
+      syncedLabels.push({ number, labels });
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      issue.labels = labels;
+    },
+    updateIssue: async (number: number, patch: { state?: "open" | "closed" }) => {
+      updatedIssues.push({ number, state: patch.state });
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      if (patch.state) issue.state = patch.state;
+      return issue;
+    },
+  };
+  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const forgotten = await store.forget("12");
+
+  assert(forgotten?.status === "stale", "expected forgotten memory to be returned as stale");
+  assert(updatedIssues[0]?.state === "closed", "expected memory_forget to close the issue");
+  assert(syncedLabels[0]?.labels.every((label) => !label.startsWith("memory-status:")), "expected memory_forget to stop writing lifecycle labels");
+}
+
 async function main(): Promise<void> {
   await testSearchRanking();
   testCjkScoring();
@@ -246,6 +304,7 @@ async function main(): Promise<void> {
   await testGetAndListMemories();
   await testLegacyMemoriesWithoutSessionOrDate();
   await testUpdateMemoryInPlace();
+  await testForgetClosesMemoryIssue();
   console.log("memory tests passed");
 }
 

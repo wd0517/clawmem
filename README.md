@@ -162,7 +162,7 @@ curl -X POST "https://git.clawmem.ai/api/v3/repos/$CLAWMEM_REPO/issues" \
   -d '{
     "title": "Memory: <concise title>",
     "body": "<the insight, in plain language>",
-    "labels": ["type:memory", "memory-status:active"]
+    "labels": ["type:memory"]
   }'
 ```
 
@@ -193,7 +193,7 @@ GH_HOST=git.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
   gh issue create --repo <owner/team-memory> \
     --title "Memory: ..." \
     --body "..." \
-    --label "type:memory,memory-status:active,source:team"
+    --label "type:memory,source:team"
 ```
 
 **Read team memories:**
@@ -201,7 +201,8 @@ GH_HOST=git.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
 ```bash
 GH_HOST=git.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
   gh issue list --repo <owner/team-memory> \
-    --label "memory-status:active" \
+    --state open \
+    --label "type:memory" \
     --json number,title,body
 ```
 
@@ -286,10 +287,6 @@ Full config with all options:
           memoryTitlePrefix: "Memory: ",
           defaultLabels: ["source:openclaw"],
           agentLabelPrefix: "agent:",
-          activeStatusLabel: "status:active",
-          closedStatusLabel: "status:closed",
-          memoryActiveStatusLabel: "memory-status:active",
-          memoryStaleStatusLabel: "memory-status:stale",
           autoCreateLabels: true,
           closeIssueOnReset: true,
           turnCommentDelayMs: 1000,
@@ -308,9 +305,10 @@ Full config with all options:
 
 - Conversation comments exclude tool calls, tool results, system messages, and heartbeat noise.
 - Summary failures do not block finalization; the `summary` field is written as `failed: ...`.
-- Memory search and auto-injection only return `memory-status:active` issues.
+- Memory search and auto-injection only return open `type:memory` issues. Closed memory issues are treated as stale.
 - Durable memories are extracted best-effort during later request-scoped maintenance, not by background subagent work after a request has already ended.
 - The plugin exposes `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
 - `memory_store` accepts optional schema hints such as kind and topics; the plugin normalizes them into managed `kind:*` and `topic:*` labels.
 - `memory_update` updates one existing memory issue in place; use it for evolving canonical facts or active tasks instead of creating a duplicate node.
-- Memory issue bodies store only the detail text; metadata comes from labels and issue number.
+- Conversation lifecycle is stored in native issue state (`open` while live, `closed` after finalize); memory lifecycle uses native issue state too (`open` active, `closed` stale).
+- Memory issue bodies store the durable detail plus flat metadata such as `memory_hash` and logical `date`; labels are reserved for schema and routing.

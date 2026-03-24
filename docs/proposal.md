@@ -92,14 +92,13 @@ Recommended labels:
 - `session:<session_id>`
 
 Optional extensions:
-
-- `status:active`
-- `status:closed`
+- `agent:<agent_id>`
 
 These labels serve the following roles:
 
 - `type:conversation`: identify the issue type
 - `session:<session_id>`: directly associate related memory with the conversation
+- `agent:<agent_id>`: identify the OpenClaw route or persona that owned the session
 
 ---
 
@@ -117,7 +116,6 @@ Recommended minimum fields:
 - `date`
 - `started_at`
 - `ended_at`
-- `status`
 - `summary`
 
 The summary should be stored in the **issue body**, not appended later as a separate summary comment.
