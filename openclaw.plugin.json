@@ -62,7 +62,7 @@
         "items": {
           "type": "string"
         },
-        "default": ["source:openclaw"]
+        "default": []
       },
       "agentLabelPrefix": {
         "type": "string"

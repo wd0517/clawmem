@@ -7,7 +7,7 @@ function memory(overrides: Partial<ParsedMemoryIssue> = {}): ParsedMemoryIssue {
     issueNumber: overrides.issueNumber ?? 1,
     title: overrides.title ?? "Memory: Example",
     memoryId: overrides.memoryId ?? String(overrides.issueNumber ?? 1),
-    sessionId: overrides.sessionId ?? "sess-1",
+    ...(overrides.sessionId !== undefined ? { sessionId: overrides.sessionId } : { sessionId: "sess-1" }),
     date: overrides.date ?? "2026-03-23",
     detail: overrides.detail ?? "Example durable detail",
     status: overrides.status ?? "active",
@@ -32,7 +32,7 @@ function issueFromMemory(m: ParsedMemoryIssue): IssueRecord {
     state: m.status === "stale" ? "closed" : "open",
     labels: [
       "type:memory",
-      `session:${m.sessionId}`,
+      ...(m.sessionId ? [`session:${m.sessionId}`] : []),
       ...(m.kind ? [`kind:${m.kind}`] : []),
       ...(m.topics ?? []).map((topic) => `topic:${topic}`),
     ],
@@ -158,7 +158,7 @@ async function testStructuredStoreAndSchema(): Promise<void> {
     },
   };
   const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
-  const result = await store.store({ detail: "Redis Lua scripts are required for atomic rate limiting.", kind: "Lesson", topics: ["Redis Ops", "rate_limit"] }, "manual");
+  const result = await store.store({ detail: "Redis Lua scripts are required for atomic rate limiting.", kind: "Lesson", topics: ["Redis Ops", "rate_limit"] });
   const schema = await store.listSchema();
 
   assert(result.created === true, "expected a new structured memory to be created");
@@ -168,6 +168,7 @@ async function testStructuredStoreAndSchema(): Promise<void> {
   assert(created[0]?.labels.includes("kind:lesson"), "expected created labels to include normalized kind");
   assert(created[0]?.labels.includes("topic:redis-ops"), "expected created labels to include normalized topic");
   assert(created[0]?.labels.includes("topic:rate-limit"), "expected created labels to include normalized topic");
+  assert(!created[0]?.labels.some((label) => label.startsWith("session:")), "expected manual memory_store writes to omit synthetic session labels");
   assert(!created[0]?.labels.some((label) => label.startsWith("date:")), "expected new memory labels to omit date labels");
   assert(created[0]?.body.includes(`date: ${result.memory.date}`), "expected new memory body to retain logical date metadata");
   assert(ensured[0]?.includes("kind:lesson"), "expected ensureLabels to include kind label");
@@ -249,7 +250,7 @@ async function testLegacyMemoriesWithoutSessionOrDate(): Promise<void> {
   const recalled = await store.search("F1 Dota 2", 5);
 
   assert(exact?.issueNumber === 4, "expected legacy memory without session/date to be readable");
-  assert(exact?.sessionId === "legacy", "expected missing session label to fall back to legacy");
+  assert(exact?.sessionId === undefined, "expected missing session label to stay absent");
   assert(exact?.date === "1970-01-01", "expected missing date label to fall back to a placeholder");
   assert(recalled.some((memory) => memory.issueNumber === 4), "expected legacy memory to participate in recall");
 }

@@ -5,7 +5,7 @@ import { normalizeAgentId } from "./utils.js";
 
 export const SESSION_TITLE_PREFIX = "Session: ";
 export const MEMORY_TITLE_PREFIX = "Memory: ";
-export const DEFAULT_LABELS: readonly string[] = ["source:openclaw"];
+export const DEFAULT_LABELS: readonly string[] = [];
 export const AGENT_LABEL_PREFIX = "agent:";
 export const LABEL_ACTIVE = "status:active";
 export const LABEL_CLOSED = "status:closed";

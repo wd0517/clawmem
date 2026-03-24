@@ -71,7 +71,7 @@ export class MemoryStore {
       .slice(0, limit);
   }
 
-  async store(draft: MemoryDraft, sessionId = "manual"): Promise<{ created: boolean; memory: ParsedMemoryIssue }> {
+  async store(draft: MemoryDraft, sessionId?: string): Promise<{ created: boolean; memory: ParsedMemoryIssue }> {
     const normalized = normalizeDraft(draft);
     const detail = norm(normalized.detail);
     const allActive = await this.listByStatus("active");
@@ -95,7 +95,7 @@ export class MemoryStore {
         title,
         memoryId: String(issue.number),
         memoryHash: hash,
-        sessionId,
+        ...(sessionId ? { sessionId } : {}),
         date,
         detail,
         ...(normalized.kind ? { kind: normalized.kind } : {}),
@@ -210,7 +210,7 @@ export class MemoryStore {
       issueNumber: issue.number, title: issue.title?.trim() || "",
       memoryId: body.memory_id?.trim() || String(issue.number),
       memoryHash: body.memory_hash?.trim() || undefined,
-      sessionId: sessionId || "legacy",
+      ...(sessionId ? { sessionId } : {}),
       date: body.date?.trim() || "1970-01-01",
       detail,
       ...(kind ? { kind } : {}),
@@ -246,7 +246,7 @@ export class MemoryStore {
         title,
         memoryId: String(issue.number),
         memoryHash: hash,
-        sessionId,
+        ...(sessionId ? { sessionId } : {}),
         date,
         detail,
         ...(draft.kind ? { kind: draft.kind } : {}),
@@ -329,10 +329,10 @@ export class MemoryStore {
   }
 }
 
-function memLabels(sessionId: string, kind?: string, topics?: string[]): string[] {
+function memLabels(sessionId?: string, kind?: string, topics?: string[]): string[] {
   return [
     "type:memory",
-    `session:${sessionId}`,
+    ...(sessionId ? [`session:${sessionId}`] : []),
     ...(kind ? [`kind:${kind}`] : []),
     ...((topics ?? []).map((topic) => `topic:${topic}`)),
   ];

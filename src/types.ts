@@ -46,6 +46,6 @@ export type MemoryListOptions = {
 };
 export type ParsedMemoryIssue = {
   issueNumber: number; title: string; memoryId: string; memoryHash?: string;
-  sessionId: string; date: string; detail: string;
+  sessionId?: string; date: string; detail: string;
   kind?: string; topics?: string[]; status: "active" | "stale";
 };
