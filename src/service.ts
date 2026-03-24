@@ -214,7 +214,6 @@ class ClawMemService {
             minItems: 1,
             maxItems: 10,
           },
-          sessionId: { type: "string", minLength: 1, description: "Optional real source session id. Omit it unless you intentionally want to link this memory to a specific conversation." },
           agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
         },
         required: ["detail"],
@@ -226,10 +225,9 @@ class ClawMemService {
         const agentId = this.resolveToolAgentId(p.agentId);
         if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
         const { mem } = this.getServices(agentId);
-        const sessionId = typeof p.sessionId === "string" && p.sessionId.trim() ? p.sessionId.trim() : undefined;
         const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
         const topics = Array.isArray(p.topics) ? p.topics.filter((topic): topic is string => typeof topic === "string" && topic.trim().length > 0) : undefined;
-        const result = await mem.store({ detail, ...(kind ? { kind } : {}), ...(topics && topics.length > 0 ? { topics } : {}) }, sessionId);
+        const result = await mem.store({ detail, ...(kind ? { kind } : {}), ...(topics && topics.length > 0 ? { topics } : {}) });
         if (!result.created) return toolText(`Memory already exists.\n${renderMemoryBlock(result.memory)}`);
         return toolText(`Stored memory.\n${renderMemoryBlock(result.memory)}`);
       },
@@ -620,7 +618,7 @@ function renderMemoryLine(memory: { memoryId: string; title?: string; detail: st
   const schema = [memory.kind ? `kind:${memory.kind}` : "", ...(memory.topics ?? []).map((topic) => `topic:${topic}`)].filter(Boolean).join(", ");
   return `[${memory.memoryId}] ${memory.title || "Memory"}${schema ? ` (${schema})` : ""}${memory.status === "stale" ? " [stale]" : ""}: ${memory.detail}`;
 }
-function renderMemoryBlock(memory: { memoryId: string; issueNumber?: number; title?: string; detail: string; kind?: string; topics?: string[]; status: "active" | "stale"; sessionId?: string; date?: string }): string {
+function renderMemoryBlock(memory: { memoryId: string; issueNumber?: number; title?: string; detail: string; kind?: string; topics?: string[]; status: "active" | "stale"; date?: string }): string {
   const lines = [
     `Memory ID: ${memory.memoryId}`,
     ...(typeof memory.issueNumber === "number" ? [`Issue Number: ${memory.issueNumber}`] : []),
@@ -628,7 +626,6 @@ function renderMemoryBlock(memory: { memoryId: string; issueNumber?: number; tit
     `Title: ${memory.title || "Memory"}`,
     ...(memory.kind ? [`Kind: ${memory.kind}`] : []),
     ...(memory.topics && memory.topics.length > 0 ? [`Topics: ${memory.topics.join(", ")}`] : []),
-    ...(memory.sessionId ? [`Session: ${memory.sessionId}`] : []),
     ...(memory.date ? [`Date: ${memory.date}`] : []),
     `Detail: ${memory.detail}`,
   ];

@@ -7,7 +7,6 @@ function memory(overrides: Partial<ParsedMemoryIssue> = {}): ParsedMemoryIssue {
     issueNumber: overrides.issueNumber ?? 1,
     title: overrides.title ?? "Memory: Example",
     memoryId: overrides.memoryId ?? String(overrides.issueNumber ?? 1),
-    ...(overrides.sessionId !== undefined ? { sessionId: overrides.sessionId } : { sessionId: "sess-1" }),
     date: overrides.date ?? "2026-03-23",
     detail: overrides.detail ?? "Example durable detail",
     status: overrides.status ?? "active",
@@ -32,7 +31,6 @@ function issueFromMemory(m: ParsedMemoryIssue): IssueRecord {
     state: m.status === "stale" ? "closed" : "open",
     labels: [
       "type:memory",
-      ...(m.sessionId ? [`session:${m.sessionId}`] : []),
       ...(m.kind ? [`kind:${m.kind}`] : []),
       ...(m.topics ?? []).map((topic) => `topic:${topic}`),
     ],
@@ -250,7 +248,6 @@ async function testLegacyMemoriesWithoutSessionOrDate(): Promise<void> {
   const recalled = await store.search("F1 Dota 2", 5);
 
   assert(exact?.issueNumber === 4, "expected legacy memory without session/date to be readable");
-  assert(exact?.sessionId === undefined, "expected missing session label to stay absent");
   assert(exact?.date === "1970-01-01", "expected missing date label to fall back to a placeholder");
   assert(recalled.some((memory) => memory.issueNumber === 4), "expected legacy memory to participate in recall");
 }
