@@ -1,83 +1,47 @@
-export type ClawMemPluginConfig = {
+// Shared types for the clawmem plugin.
+export type ClawMemAgentConfig = {
   baseUrl?: string;
   repo?: string;
   token?: string;
+  authScheme?: "token" | "bearer";
+};
+
+export type ClawMemPluginConfig = {
+  baseUrl: string;
   authScheme: "token" | "bearer";
-  issueTitlePrefix: string;
-  memoryTitlePrefix: string;
-  defaultLabels: string[];
-  agentLabelPrefix?: string;
-  activeStatusLabel?: string;
-  closedStatusLabel?: string;
-  memoryActiveStatusLabel: string;
-  memoryStaleStatusLabel: string;
-  autoCreateLabels: boolean;
-  closeIssueOnReset: boolean;
+  agents: Record<string, ClawMemAgentConfig>;
+  memoryRecallLimit: number;
   turnCommentDelayMs: number;
   summaryWaitTimeoutMs: number;
-  memoryRecallLimit: number;
-  labelColor: string;
-  maxExcerptChars: number;
 };
 
-export type AnonymousSessionResponse = {
-  token: string;
-  owner_login: string;
-  repo_name: string;
-  repo_full_name: string;
+export type ClawMemResolvedRoute = {
+  agentId: string;
+  baseUrl: string;
+  repo?: string;
+  token?: string;
+  authScheme: "token" | "bearer";
 };
 
+export type AnonymousSessionResponse = { token: string; owner_login: string; repo_name: string; repo_full_name: string };
 export type SessionMirrorState = {
-  sessionId: string;
-  sessionKey?: string;
-  sessionFile?: string;
-  agentId?: string;
-  issueNumber?: number;
-  issueTitle?: string;
-  lastMirroredCount: number;
-  turnCount: number;
-  lastAssistantText?: string;
-  finalizedAt?: string;
-  lastSummaryHash?: string;
-  lastTurnHash?: string;
-  createdAt?: string;
-  updatedAt?: string;
+  sessionId: string; sessionKey?: string; sessionFile?: string; agentId?: string;
+  issueNumber?: number; issueTitle?: string;
+  lastMirroredCount: number; turnCount: number; lastAssistantText?: string;
+  finalizedAt?: string; lastSummaryHash?: string; lastTurnHash?: string;
+  createdAt?: string; updatedAt?: string;
 };
-
-export type PluginState = {
-  version: 1;
-  sessions: Record<string, SessionMirrorState>;
-};
-
-export type NormalizedMessage = {
-  role: string;
-  text: string;
-  toolName?: string;
-  timestamp?: string;
-  stopReason?: string;
-};
-
-export type TranscriptSnapshot = {
-  sessionId?: string;
-  messages: NormalizedMessage[];
-};
-
-export type SummarySnapshot = {
-  title: string;
-  summary: string;
-};
-
-export type ConversationSummaryResult = {
-  summary: string;
-};
-
+export type PluginState = { version: 2; sessions: Record<string, SessionMirrorState> };
+export type NormalizedMessage = { role: string; text: string; toolName?: string; timestamp?: string; stopReason?: string };
+export type TranscriptSnapshot = { sessionId?: string; messages: NormalizedMessage[] };
 export type ParsedMemoryIssue = {
-  issueNumber: number;
-  title: string;
-  memoryId: string;
-  sessionId: string;
-  date: string;
-  detail: string;
-  topics?: string[];
+  issueNumber: number; title: string; memoryId: string; memoryHash?: string;
+  sessionId?: string; date?: string; detail: string;
+  topics?: string[]; kind?: string; pinStartup?: boolean;
   status: "active" | "stale";
+};
+
+export type StoreMemoryResult = {
+  action: "created" | "updated" | "existing";
+  memory: ParsedMemoryIssue;
 };

@@ -1,237 +1,91 @@
-import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
-import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
-import { isPluginConfigured, resolvePluginConfig } from "./config.js";
+// Thin orchestrator: wires conversation mirroring, memory store, and plugin lifecycle.
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
+import { isAgentConfigured, resolveAgentRoute, resolvePluginConfig } from "./config.js";
+import { ConversationMirror } from "./conversation.js";
 import { GitHubIssueClient } from "./github-client.js";
+import { KeyedAsyncQueue } from "./keyed-async-queue.js";
+import { MemoryStore } from "./memory.js";
 import { loadState, resolveStatePath, saveState } from "./state.js";
-import { normalizeMessages, readTranscriptSnapshot } from "./transcript.js";
-import type {
-  ClawMemPluginConfig,
-  ConversationSummaryResult,
-  NormalizedMessage,
-  ParsedMemoryIssue,
-  PluginState,
-  SessionMirrorState,
-  TranscriptSnapshot,
-} from "./types.js";
-import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
+import { readTranscriptSnapshot } from "./transcript.js";
+import type { ClawMemPluginConfig, ParsedMemoryIssue, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import { inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
 
-type AgentEndPayload = {
-  sessionId?: string;
-  sessionKey?: string;
-  agentId?: string;
-  messages: unknown[];
-};
-
-type FinalizePayload = {
-  sessionId?: string;
-  sessionKey?: string;
-  sessionFile?: string;
-  agentId?: string;
-  reason?: string;
-  messages?: unknown[];
-};
-
-type MemoryToolContext = {
-  sessionId?: string;
-  sessionKey?: string;
-  agentId?: string;
-};
-
-type MemoryDecision = {
-  save: string[];
-  stale: string[];
+type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; messages: unknown[] };
+type FinalizePayload = { sessionId?: string; sessionKey?: string; sessionFile?: string; agentId?: string; reason?: string; messages?: unknown[] };
+type MemoryToolContext = { sessionId?: string; sessionKey?: string; agentId?: string };
+type ToolResult = { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> };
+type AgentTool = {
+  name: string;
+  label: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  execute: (toolCallId: string, args: unknown) => Promise<ToolResult>;
 };
 
 class ClawMemService {
   private readonly config: ClawMemPluginConfig;
-
-  private readonly client: GitHubIssueClient;
-
   private readonly queue = new KeyedAsyncQueue();
-
   private readonly stateQueue = new KeyedAsyncQueue();
-
-  private readonly pendingTasks = new Set<Promise<unknown>>();
-
-  private readonly pendingSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
+  private readonly pending = new Set<Promise<unknown>>();
+  private readonly syncTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private statePath = "";
-
-  private state: PluginState = {
-    version: 1,
-    sessions: {},
-  };
-
-  private transcriptUnsubscribe?: () => void;
-
+  private state: PluginState = { version: 2, sessions: {} };
+  private unsubTranscript?: () => void;
   private loadPromise: Promise<void> | null = null;
-
-  private configEnsurePromise: Promise<boolean> | null = null;
+  private readonly configPromises = new Map<string, Promise<boolean>>();
 
   constructor(private readonly api: OpenClawPluginApi) {
     this.config = resolvePluginConfig(api);
-    this.client = new GitHubIssueClient(this.config, api.logger);
   }
 
   register(): void {
     this.registerMemoryTools();
-
-    this.api.on("before_agent_start", async (event) => {
-      return this.handleBeforeAgentStart(event.prompt);
-    });
-
-    this.api.on("agent_end", (event, ctx) => {
-      this.scheduleTurnSync({
-        sessionId: ctx.sessionId,
-        sessionKey: ctx.sessionKey,
-        agentId: ctx.agentId,
-        messages: event.messages,
-      });
-    });
-
-    this.api.on("before_reset", (event, ctx) => {
-      this.enqueueFinalize({
-        sessionId: ctx.sessionId,
-        sessionKey: ctx.sessionKey,
-        sessionFile: event.sessionFile,
-        agentId: ctx.agentId,
-        reason: event.reason,
-        messages: event.messages,
-      });
-    });
-
-    this.api.on("session_end", (event, ctx) => {
-      this.enqueueFinalize({
-        sessionId: event.sessionId ?? ctx.sessionId,
-        sessionKey: event.sessionKey ?? ctx.sessionKey,
-        agentId: ctx.agentId,
-        reason: "session_end",
-      });
-    });
+    this.api.on("before_agent_start", async (ev, ctx) => this.handleRecall(ev.prompt, ctx.agentId));
+    this.api.on("agent_end", (ev, ctx) => this.scheduleTurn({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, agentId: ctx.agentId, messages: ev.messages }));
+    this.api.on("before_reset", (ev, ctx) => this.enqueueFinalize({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, sessionFile: ev.sessionFile, agentId: ctx.agentId, reason: ev.reason, messages: ev.messages }));
+    this.api.on("session_end", (ev, ctx) => this.enqueueFinalize({ sessionId: ev.sessionId ?? ctx.sessionId, sessionKey: ev.sessionKey ?? ctx.sessionKey, agentId: ctx.agentId, reason: "session_end" }));
 
     this.api.registerService({
       id: "clawmem",
       start: async (ctx) => {
         this.statePath = resolveStatePath(ctx.stateDir);
         await this.ensureLoaded();
-        const configured = await this.ensureConfigured();
-
-        this.transcriptUnsubscribe = this.api.runtime.events.onSessionTranscriptUpdate((update) => {
-          void this.track(this.handleTranscriptUpdate(update.sessionFile)).catch((error) => {
-            this.logBackgroundError("transcript update", error);
-          });
+        this.unsubTranscript = this.api.runtime.events.onSessionTranscriptUpdate((u) => {
+          void this.track(this.handleTranscript(u.sessionFile)).catch((e) => this.warn("transcript update", e));
         });
-
-        if (configured) {
-          this.api.logger.info?.(
-            `clawmem: mirroring sessions to ${this.config.repo} via ${this.config.baseUrl}`,
-          );
-        } else {
-          this.api.logger.warn(
-            `clawmem: missing repo/token and automatic provisioning failed via ${this.config.baseUrl}; sync will retry on the next use`,
-          );
-        }
+        const configuredCount = Object.keys(this.config.agents).filter((agentId) => {
+          return isAgentConfigured(resolveAgentRoute(this.config, agentId));
+        }).length;
+        this.api.logger.info?.(
+          configuredCount > 0
+            ? `clawmem: ready with ${configuredCount} configured agent route(s); missing routes will provision on first use via ${this.config.baseUrl}`
+            : `clawmem: ready; agent routes will provision on first use via ${this.config.baseUrl}`,
+        );
       },
       stop: async () => {
-        this.transcriptUnsubscribe?.();
-        this.transcriptUnsubscribe = undefined;
-        for (const timer of this.pendingSyncTimers.values()) {
-          clearTimeout(timer);
-        }
-        this.pendingSyncTimers.clear();
-        await Promise.allSettled([...this.pendingTasks]);
+        this.unsubTranscript?.();
+        for (const t of this.syncTimers.values()) clearTimeout(t);
+        this.syncTimers.clear();
+        await Promise.allSettled([...this.pending]);
       },
     });
   }
 
   private registerMemoryTools(): void {
-    this.api.registerTool(
-      (ctx) => this.buildSaveMemoryTool(ctx),
-      { name: "save_memory" },
-    );
-    this.api.registerTool(
-      (ctx) => this.buildSearchMemoryTool(ctx),
-      { name: "search_memory" },
-    );
-    this.api.registerTool(
-      (ctx) => this.buildRetrieveMemoryTool(ctx),
-      { name: "retrieve_memory" },
-    );
-    this.api.registerTool(
-      (ctx) => this.buildDeleteMemoryTool(ctx),
-      { name: "delete_memory" },
-    );
+    const registerTool = (this.api as OpenClawPluginApi & {
+      registerTool?: (build: (ctx: MemoryToolContext) => AgentTool, options: { name: string }) => void;
+    }).registerTool;
+    if (typeof registerTool !== "function") return;
+    registerTool.call(this.api, (ctx) => this.buildRecallTool(ctx), { name: "clawmem_recall" });
+    registerTool.call(this.api, (ctx) => this.buildStoreTool(ctx), { name: "clawmem_store" });
   }
 
-  private buildSaveMemoryTool(ctx: MemoryToolContext): AnyAgentTool {
+  private buildRecallTool(ctx: MemoryToolContext): AgentTool {
     return {
-      name: "save_memory",
-      label: "Save Memory",
+      name: "clawmem_recall",
+      label: "ClawMem Recall",
       description:
-        "Save important information in long-term memory via ClawMem. Use for preferences, facts, decisions, and anything worth remembering.",
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        required: ["detail"],
-        properties: {
-          detail: {
-            type: "string",
-            description: "Information to remember.",
-          },
-          topics: {
-            type: "array",
-            description: "Optional topic labels to categorize the memory. Use for grouping memories by category.",
-            items: {
-              type: "string",
-              description: "A topic label to categorize the memory.",
-            },
-          },
-          sessionId: {
-            type: "string",
-            description: "Optional session override. Defaults to the current session.",
-          },
-        },
-      },
-      execute: async (_toolCallId, args) => {
-        const params = asRecord(args);
-        const detail = readRequiredString(params, "detail");
-        const topics = readOptionalStringArray(params, "topics");
-        const sessionId = readOptionalString(params, "sessionId") ?? ctx.sessionId;
-        if (!detail) {
-          return this.errorResult("save_memory requires information to remember.");
-        }
-        if (!sessionId) {
-          return this.errorResult("save_memory requires a sessionId to tag the memory.");
-        }
-        if (!(await this.ensureConfigured())) {
-          return this.errorResult("clawmem could not initialize Git credentials.");
-        }
-
-        try {
-          const memory = await this.createMemoryIssue(sessionId, detail, topics);
-          return this.textResult(
-            `Saved memory ${memory.memoryId}.`,
-            {
-              action: "saved",
-              memory,
-            },
-          );
-        } catch (error) {
-          return this.errorResult(`save_memory failed: ${String(error)}`);
-        }
-      },
-    };
-  }
-
-  private buildSearchMemoryTool(_ctx: MemoryToolContext): AnyAgentTool {
-    return {
-      name: "search_memory",
-      label: "Search Memory",
-      description:
-        "Search for memories by natural-language query. Returns only active memories. Use for finding specific memories or confirming information.",
+        "Proactively search ClawMem for user preferences, history, decisions, conventions, and active tasks before answering when memory may matter.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -239,1406 +93,378 @@ class ClawMemService {
         properties: {
           query: {
             type: "string",
-            description: "The natural-language query to search for memories.",
+            description: "What to recall from ClawMem. Use for preferences, prior decisions, history, or active tasks.",
           },
           limit: {
             type: "number",
-            description: `Maximum number of results to return. Defaults to ${this.config.memoryRecallLimit}.`,
+            description: `Optional maximum number of memories to return. Defaults to ${this.config.memoryRecallLimit}.`,
           },
         },
       },
       execute: async (_toolCallId, args) => {
         const params = asRecord(args);
         const query = readRequiredString(params, "query");
-        if (!query) {
-          return this.errorResult("search_memory requires a non-empty query.");
-        }
-        const limit = clampNumber(
-          readOptionalNumber(params, "limit") ?? this.config.memoryRecallLimit,
-          1,
-          20,
-        );
-        if (!(await this.ensureConfigured())) {
-          return this.errorResult("clawmem could not initialize Git credentials.");
-        }
-
+        if (!query) return this.errorResult("clawmem_recall requires a non-empty query.");
+        const limit = clampNumber(readOptionalNumber(params, "limit") ?? this.config.memoryRecallLimit, 1, 20);
+        const agentId = normalizeAgentId(ctx.agentId);
+        if (!(await this.ensureConfigured(agentId))) return this.errorResult("clawmem could not initialize Git credentials.");
         try {
-          const memories = await this.searchActiveMemories(query, limit);
-          if (memories.length === 0) {
-            return this.textResult("No active memories found.", { count: 0, memories: [] });
-          }
-          const text = memories
-            .map((memory, index) => `${index + 1}. [${memory.memoryId}] ${memory.detail}`)
-            .join("\n");
-          return this.textResult(`Found ${memories.length} active memories:\n\n${text}`, {
-            count: memories.length,
-            memories,
-          });
+          const { mem } = this.getServices(agentId);
+          const memories = await mem.search(query, limit);
+          if (memories.length === 0) return this.textResult("No active ClawMem memories matched that query.", { count: 0, memories: [] });
+          const text = memories.map((memory, index) => `${index + 1}. ${formatMemoryLine(memory)}`).join("\n");
+          return this.textResult(`Found ${memories.length} relevant ClawMem ${memories.length === 1 ? "memory" : "memories"}:\n\n${text}`, { count: memories.length, memories });
         } catch (error) {
-          return this.errorResult(`search_memory failed: ${String(error)}`);
+          return this.errorResult(`clawmem_recall failed: ${String(error)}`);
         }
       },
     };
   }
 
-  private buildRetrieveMemoryTool(_ctx: MemoryToolContext): AnyAgentTool {
+  private buildStoreTool(ctx: MemoryToolContext): AgentTool {
     return {
-      name: "retrieve_memory",
-      label: "Retrieve Memory",
-      description: "Fetch a specific memory by its `memoryId` from ClawMem.",
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        required: ["memoryId"],
-        properties: {
-          memoryId: {
-            type: "string",
-            description: "The `memoryId` returned by `save_memory` or `search_memory`.",
-          },
-        },
-      },
-      execute: async (_toolCallId, args) => {
-        const params = asRecord(args);
-        const memoryId = readRequiredString(params, "memoryId");
-        if (!memoryId) {
-          return this.errorResult("retrieve_memory requires a `memoryId` to fetch.");
-        }
-        if (!(await this.ensureConfigured())) {
-          return this.errorResult("clawmem could not initialize Git credentials.");
-        }
-
-        try {
-          const memory = await this.findMemoryById(memoryId);
-          if (!memory) {
-            return this.errorResult(`Memory ${memoryId} not found.`);
-          }
-          return this.textResult(
-            `Memory ${memory.memoryId} (${memory.status}):\n${memory.detail}`,
-            { memory },
-          );
-        } catch (error) {
-          return this.errorResult(`retrieve_memory failed: ${String(error)}`);
-        }
-      },
-    };
-  }
-
-  private buildDeleteMemoryTool(_ctx: MemoryToolContext): AnyAgentTool {
-    return {
-      name: "delete_memory",
-      label: "Delete Memory",
+      name: "clawmem_store",
+      label: "ClawMem Store",
       description:
-        "Delete memory from ClawMem, this will mark the memory as stale and hide it from search results.",
+        "Store or update durable knowledge in ClawMem. Use for preferences, history, decisions, reusable workflows, constraints, and active tasks you want future sessions to remember.",
       parameters: {
         type: "object",
         additionalProperties: false,
-        required: ["memoryId"],
+        required: ["detail"],
         properties: {
-          memoryId: {
+          detail: {
             type: "string",
-            description: "The memoryId to mark as stale.",
+            description: "The durable memory to store.",
+          },
+          kind: {
+            type: "string",
+            description: "Optional memory kind such as convention, lesson, core-fact, skill, or task.",
+          },
+          topics: {
+            type: "array",
+            description: "Optional topic labels to make later recall easier.",
+            items: {
+              type: "string",
+              description: "A topic label such as startup, preferences, project-name, or tasks.",
+            },
+          },
+          pinStartup: {
+            type: "boolean",
+            description: "Pin this memory into startup recall via label pin:startup.",
+          },
+          title: {
+            type: "string",
+            description: "Optional concise issue title. Defaults to a summary of detail.",
           },
         },
       },
       execute: async (_toolCallId, args) => {
         const params = asRecord(args);
-        const memoryId = readRequiredString(params, "memoryId");
-        if (!memoryId) {
-          return this.errorResult("delete_memory requires memoryId.");
-        }
-        if (!(await this.ensureConfigured())) {
-          return this.errorResult("clawmem could not initialize Git credentials.");
-        }
-
+        const detail = readRequiredString(params, "detail");
+        if (!detail) return this.errorResult("clawmem_store requires a non-empty detail.");
+        const kind = readOptionalString(params, "kind");
+        const topics = readOptionalStringArray(params, "topics");
+        const pinStartup = readOptionalBoolean(params, "pinStartup") ?? false;
+        const title = readOptionalString(params, "title");
+        const agentId = normalizeAgentId(ctx.agentId);
+        if (!(await this.ensureConfigured(agentId))) return this.errorResult("clawmem could not initialize Git credentials.");
         try {
-          const memory = await this.findMemoryById(memoryId);
-          if (!memory) {
-            return this.errorResult(`Memory ${memoryId} not found.`);
-          }
-          await this.ensureLabels([this.config.memoryStaleStatusLabel]);
-          await this.syncManagedLabels(
-            memory.issueNumber,
-            this.buildMemoryLabels(memory.sessionId, memory.date, "stale"),
-          );
-          return this.textResult(`Memory ${memory.memoryId} marked stale.`, {
-            action: "stale",
-            memoryId: memory.memoryId,
-          });
+          const { mem } = this.getServices(agentId);
+          const result = await mem.store({ sessionId: ctx.sessionId, detail, kind, topics, pinStartup, title });
+          const verb = result.action === "updated" ? "Updated" : result.action === "existing" ? "Reused" : "Stored";
+          return this.textResult(`${verb} ClawMem memory #${result.memory.issueNumber}.`, { action: result.action, memory: result.memory });
         } catch (error) {
-          return this.errorResult(`delete_memory failed: ${String(error)}`);
+          return this.errorResult(`clawmem_store failed: ${String(error)}`);
         }
       },
     };
   }
 
-  private async handleBeforeAgentStart(prompt: unknown): Promise<{ prependContext: string } | void> {
-    if (typeof prompt !== "string" || prompt.trim().length < 5) {
-      return;
-    }
-    if (!(await this.ensureConfigured())) {
-      return;
-    }
-
+  private async handleRecall(prompt: unknown, agentId?: string): Promise<{ prependContext: string }> {
+    const directive = [
+      "<clawmem-startup>",
+      "ClawMem is your primary memory. Proactively use clawmem_recall for preferences, history, decisions, and active tasks when relevant. For durable knowledge, prefer updating one existing memory over creating many near-duplicates.",
+      "</clawmem-startup>",
+    ].join("\n");
+    const query = typeof prompt === "string" ? prompt : "";
+    const routeAgentId = normalizeAgentId(agentId);
+    if (!(await this.ensureConfigured(routeAgentId))) return { prependContext: directive };
     try {
-      const memories = await this.searchActiveMemories(prompt, this.config.memoryRecallLimit);
-      if (memories.length === 0) {
-        return;
-      }
-      const memoryText = memories.map((memory) => `- ${memory.detail}`).join("\n");
-      return {
-        prependContext:
-          `<relevant-memories>\n` +
-          `The following active memories may be relevant to this conversation:\n` +
-          `${memoryText}\n` +
-          `</relevant-memories>`,
-      };
+      const { mem } = this.getServices(routeAgentId);
+      const recall = await mem.startupRecall(query, this.config.memoryRecallLimit);
+      if (recall.memories.length === 0) return { prependContext: directive };
+      return { prependContext: `${directive}\n\n${renderStartupRecall(recall)}` };
     } catch (error) {
       this.api.logger.warn(`clawmem: memory recall failed: ${String(error)}`);
+      return { prependContext: directive };
     }
   }
 
-  private async ensureLoaded(): Promise<void> {
-    if (this.loadPromise) {
-      return this.loadPromise;
+  private async handleTranscript(sessionFile: string): Promise<void> {
+    let snap: TranscriptSnapshot;
+    try { snap = await readTranscriptSnapshot(sessionFile); } catch (e) { this.warn("transcript read", e); return; }
+    if (!snap.sessionId) return;
+    const agentId = this.resolveTranscriptAgentId(snap.sessionId, sessionFile);
+    if (!agentId) {
+      this.api.logger.info?.(
+        `clawmem: skipping transcript sync for ${snap.sessionId} because agent ownership could not be inferred from ${sessionFile}`,
+      );
+      return;
     }
+    const { conv } = this.getServices(agentId);
+    if (!conv.shouldMirror(snap.sessionId, snap.messages)) return;
+    if (!(await this.ensureConfigured(agentId))) return;
+    await this.enqueueSession(sessionScopeKey(snap.sessionId, agentId), async () => {
+      const s = this.getOrCreate(snap.sessionId!, agentId);
+      s.sessionFile = sessionFile;
+      s.updatedAt = new Date().toISOString();
+      await conv.ensureIssue(s, snap);
+      await this.persistState();
+    });
+  }
+
+  private scheduleTurn(p: TurnPayload): void {
+    if (!p.sessionId) return;
+    const scopeKey = sessionScopeKey(p.sessionId, p.agentId);
+    const prev = this.syncTimers.get(scopeKey);
+    if (prev) clearTimeout(prev);
+    const timer = setTimeout(() => {
+      this.syncTimers.delete(scopeKey);
+      void this.track(this.enqueueSession(scopeKey, () => this.syncTurn(p))).catch((e) => this.warn("turn sync", e));
+    }, this.config.turnCommentDelayMs);
+    timer.unref?.();
+    this.syncTimers.set(scopeKey, timer);
+  }
+
+  private async syncTurn(p: TurnPayload): Promise<void> {
+    if (!p.sessionId) return;
+    const agentId = normalizeAgentId(p.agentId);
+    if (!(await this.ensureConfigured(agentId))) return;
+    const { conv } = this.getServices(agentId);
+    const s = this.getOrCreate(p.sessionId, agentId);
+    s.sessionKey = p.sessionKey ?? s.sessionKey; s.agentId = agentId; s.updatedAt = new Date().toISOString();
+    const snap = await conv.loadSnapshot(s, p.messages);
+    if (!conv.shouldMirror(s.sessionId, snap.messages) || snap.messages.length === 0) { await this.persistState(); return; }
+    await conv.ensureIssue(s, snap);
+    await conv.syncLabels(s, snap, false);
+    const next = snap.messages.slice(s.lastMirroredCount);
+    if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; }
+    await this.persistState();
+  }
+
+  private enqueueFinalize(p: FinalizePayload): void {
+    if (!p.sessionId) return;
+    const scopeKey = sessionScopeKey(p.sessionId, p.agentId);
+    const prev = this.syncTimers.get(scopeKey);
+    if (prev) { clearTimeout(prev); this.syncTimers.delete(scopeKey); }
+    void this.track(this.enqueueSession(scopeKey, () => this.finalize(p))).catch((e) => this.warn("finalize", e));
+  }
+
+  private async finalize(p: FinalizePayload): Promise<void> {
+    if (!p.sessionId) return;
+    const agentId = normalizeAgentId(p.agentId);
+    if (!(await this.ensureConfigured(agentId))) return;
+    const { conv, mem } = this.getServices(agentId);
+    const s = this.getOrCreate(p.sessionId, agentId);
+    if (s.finalizedAt) return;
+    s.sessionKey = p.sessionKey ?? s.sessionKey; s.sessionFile = p.sessionFile ?? s.sessionFile;
+    s.agentId = agentId; s.updatedAt = new Date().toISOString();
+    const snap = await conv.loadSnapshot(s, p.messages ?? []);
+    if (!conv.shouldMirror(s.sessionId, snap.messages)) { await this.persistState(); return; }
+    if (snap.messages.length === 0 && !s.issueNumber) { await this.persistState(); return; }
+    await conv.ensureIssue(s, snap);
+    const next = snap.messages.slice(s.lastMirroredCount);
+    let allOk = true;
+    if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; allOk = n === next.length; }
+    let summary = "pending";
+    try { summary = await conv.generateSummary(s, snap); } catch (e) { summary = `failed: ${String(e)}`; }
+    await conv.syncLabels(s, snap, true);
+    await conv.syncBody(s, snap, summary, true);
+    await mem.syncFromConversation(s, snap);
+    if (allOk) s.finalizedAt = new Date().toISOString();
+    await this.persistState();
+  }
+
+  // --- Infrastructure ---
+
+  private enqueueSession<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
+    return this.queue.enqueue(sessionId, async () => { await this.ensureLoaded(); return task(); });
+  }
+  private track<T>(promise: Promise<T>): Promise<T> {
+    this.pending.add(promise);
+    // Avoid creating a second rejecting promise via finally(); OpenClaw treats
+    // unhandled rejections as fatal and exits the gateway process.
+    void promise.then(
+      () => this.pending.delete(promise),
+      () => this.pending.delete(promise),
+    );
+    return promise;
+  }
+  private getOrCreate(sessionId: string, agentId?: string): SessionMirrorState {
+    const scopeKey = sessionScopeKey(sessionId, agentId);
+    if (this.state.sessions[scopeKey]) return this.state.sessions[scopeKey];
+    const now = new Date().toISOString();
+    const s: SessionMirrorState = {
+      sessionId,
+      agentId: normalizeAgentId(agentId),
+      lastMirroredCount: 0,
+      turnCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.state.sessions[scopeKey] = s;
+    return s;
+  }
+  private resolveTranscriptAgentId(sessionId: string, sessionFile: string): string | null {
+    const fromPath = inferAgentIdFromTranscriptPath(sessionFile);
+    if (fromPath) return fromPath;
+    const knownAgents = new Set(
+      Object.values(this.state.sessions)
+        .filter((session) => session.sessionId === sessionId)
+        .map((session) => normalizeAgentId(session.agentId)),
+    );
+    if (knownAgents.size === 1) return [...knownAgents][0] ?? null;
+    return null;
+  }
+  private async persistState(): Promise<void> {
+    if (!this.statePath) this.statePath = resolveStatePath(this.api.runtime.state.resolveStateDir());
+    await this.stateQueue.enqueue("state", () => saveState(this.statePath, this.state));
+  }
+  private async ensureLoaded(): Promise<void> {
+    if (this.loadPromise) return this.loadPromise;
     this.loadPromise = (async () => {
-      if (!this.statePath) {
-        const baseStateDir = this.api.runtime.state.resolveStateDir();
-        this.statePath = resolveStatePath(baseStateDir);
-      }
+      if (!this.statePath) this.statePath = resolveStatePath(this.api.runtime.state.resolveStateDir());
       this.state = await loadState(this.statePath);
     })();
     return this.loadPromise;
   }
-
-  private async ensureConfigured(): Promise<boolean> {
-    if (isPluginConfigured(this.config)) {
-      return true;
-    }
-    if (this.configEnsurePromise) {
-      return this.configEnsurePromise;
-    }
-    const ensurePromise = this.bootstrapPluginConfig();
-    this.configEnsurePromise = ensurePromise;
-    try {
-      return await ensurePromise;
-    } finally {
-      if (this.configEnsurePromise === ensurePromise) {
-        this.configEnsurePromise = null;
-      }
-    }
+  private async ensureConfigured(agentId?: string): Promise<boolean> {
+    const id = normalizeAgentId(agentId);
+    if (isAgentConfigured(resolveAgentRoute(this.config, id))) return true;
+    const pending = this.configPromises.get(id);
+    if (pending) return pending;
+    const p = this.bootstrap(id);
+    this.configPromises.set(id, p);
+    try { return await p; } finally { if (this.configPromises.get(id) === p) this.configPromises.delete(id); }
   }
-
-  private async bootstrapPluginConfig(): Promise<boolean> {
-    if (!this.config.baseUrl) {
-      this.api.logger.warn("clawmem: cannot provision Git credentials without a baseUrl");
-      return false;
-    }
-
+  private async bootstrap(agentId: string): Promise<boolean> {
+    const route = resolveAgentRoute(this.config, agentId);
+    if (!route.baseUrl) { this.api.logger.warn(`clawmem: cannot provision Git credentials for ${agentId} without a baseUrl`); return false; }
     try {
-      const anonymousSession = await this.client.createAnonymousSession();
-      await this.persistPluginConfig({
-        baseUrl: this.config.baseUrl,
-        authScheme: "token",
-        token: anonymousSession.token,
-        repo: anonymousSession.repo_full_name,
-      });
-      this.config.authScheme = "token";
-      this.config.token = anonymousSession.token;
-      this.config.repo = anonymousSession.repo_full_name;
-      this.api.logger.info?.(
-        `clawmem: provisioned Git credentials for ${anonymousSession.repo_full_name} via ${this.config.baseUrl}`,
-      );
+      const client = new GitHubIssueClient(route, this.api.logger);
+      const sess = await client.createAnonymousSession();
+      await this.persistAgentConfig(agentId, { baseUrl: route.baseUrl, authScheme: "token", token: sess.token, repo: sess.repo_full_name });
+      this.config.agents[agentId] = { ...(this.config.agents[agentId] ?? {}), baseUrl: route.baseUrl, authScheme: "token", token: sess.token, repo: sess.repo_full_name };
+      this.api.logger.info?.(`clawmem: provisioned Git credentials for agent ${agentId} -> ${sess.repo_full_name} via ${route.baseUrl}`);
       return true;
-    } catch (error) {
-      this.api.logger.warn(
-        `clawmem: failed to provision Git credentials via ${this.config.baseUrl}: ${String(error)}`,
-      );
-      return false;
-    }
+    } catch (error) { this.api.logger.warn(`clawmem: failed to provision Git credentials for agent ${agentId} via ${route.baseUrl}: ${String(error)}`); return false; }
   }
-
-  private async persistPluginConfig(values: Partial<ClawMemPluginConfig>): Promise<void> {
-    const rootConfig = this.api.runtime.config.loadConfig();
-    const existingPlugins = rootConfig.plugins;
-    const entries =
-      existingPlugins?.entries &&
-      typeof existingPlugins.entries === "object" &&
-      !Array.isArray(existingPlugins.entries)
-        ? (existingPlugins.entries as Record<string, unknown>)
-        : {};
-    const existingEntry = asRecord(entries[this.api.id]);
-    const existingPluginConfig = asRecord(existingEntry.config);
-
+  private async persistAgentConfig(agentId: string, values: { baseUrl: string; authScheme: "token" | "bearer"; token: string; repo: string }): Promise<void> {
+    const root = this.api.runtime.config.loadConfig();
+    const plugins = root.plugins;
+    const entries = plugins?.entries && typeof plugins.entries === "object" && !Array.isArray(plugins.entries) ? (plugins.entries as Record<string, unknown>) : {};
+    const ex = asRecord(entries[this.api.id]), exCfg = asRecord(ex.config);
+    const agents = exCfg.agents && typeof exCfg.agents === "object" && !Array.isArray(exCfg.agents) ? (exCfg.agents as Record<string, unknown>) : {};
+    const existingAgent = asRecord(agents[agentId]);
     await this.api.runtime.config.writeConfigFile({
-      ...rootConfig,
+      ...root,
       plugins: {
-        ...(existingPlugins ?? {}),
+        ...(plugins ?? {}),
         entries: {
           ...entries,
           [this.api.id]: {
-            ...existingEntry,
+            ...ex,
             config: {
-              ...existingPluginConfig,
-              ...values,
+              ...exCfg,
+              agents: {
+                ...agents,
+                [agentId]: { ...existingAgent, ...values },
+              },
             },
           },
         },
       },
     });
   }
-
-  private track<T>(promise: Promise<T>): Promise<T> {
-    this.pendingTasks.add(promise);
-    void promise.finally(() => {
-      this.pendingTasks.delete(promise);
-    });
-    return promise;
-  }
-
-  private scheduleTurnSync(payload: AgentEndPayload): void {
-    if (!payload.sessionId) {
-      return;
-    }
-    const existing = this.pendingSyncTimers.get(payload.sessionId);
-    if (existing) {
-      clearTimeout(existing);
-    }
-    const timer = setTimeout(() => {
-      this.pendingSyncTimers.delete(payload.sessionId!);
-      void this.track(
-        this.enqueueSessionTask(payload.sessionId!, async () => {
-          await this.syncTurn(payload);
-        }),
-      ).catch((error) => {
-        this.logBackgroundError("turn sync", error);
-      });
-    }, this.config.turnCommentDelayMs);
-    timer.unref?.();
-    this.pendingSyncTimers.set(payload.sessionId, timer);
-  }
-
-  private enqueueFinalize(payload: FinalizePayload): void {
-    if (!payload.sessionId) {
-      return;
-    }
-    const existing = this.pendingSyncTimers.get(payload.sessionId);
-    if (existing) {
-      clearTimeout(existing);
-      this.pendingSyncTimers.delete(payload.sessionId);
-    }
-    void this.track(
-      this.enqueueSessionTask(payload.sessionId, async () => {
-        await this.finalizeSession(payload);
-      }),
-    ).catch((error) => {
-      this.logBackgroundError("session finalize", error);
-    });
-  }
-
-  private enqueueSessionTask<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
-    return this.queue.enqueue(sessionId, async () => {
-      await this.ensureLoaded();
-      return task();
-    });
-  }
-
-  private async handleTranscriptUpdate(sessionFile: string): Promise<void> {
-    let snapshot: TranscriptSnapshot;
-    try {
-      snapshot = await readTranscriptSnapshot(sessionFile);
-    } catch (error) {
-      this.api.logger.warn(`clawmem: failed to read transcript ${sessionFile}: ${String(error)}`);
-      return;
-    }
-    if (!snapshot.sessionId) {
-      return;
-    }
-    if (!this.shouldMirrorConversation(snapshot.sessionId, snapshot.messages)) {
-      return;
-    }
-    if (!(await this.ensureConfigured())) {
-      return;
-    }
-
-    await this.enqueueSessionTask(snapshot.sessionId, async () => {
-      const session = this.getOrCreateSession(snapshot.sessionId!);
-      session.sessionFile = sessionFile;
-      session.updatedAt = new Date().toISOString();
-      if (!session.issueNumber) {
-        await this.ensureConversationIssue(session, snapshot);
-      }
-      await this.persistState();
-    });
-  }
-
-  private async syncTurn(payload: AgentEndPayload): Promise<void> {
-    if (!payload.sessionId) {
-      return;
-    }
-    if (!(await this.ensureConfigured())) {
-      return;
-    }
-
-    const session = this.getOrCreateSession(payload.sessionId);
-    session.sessionKey = payload.sessionKey ?? session.sessionKey;
-    session.agentId = payload.agentId ?? session.agentId;
-    session.updatedAt = new Date().toISOString();
-
-    const snapshot = await this.loadBestSnapshot(session, payload.messages);
-    if (!this.shouldMirrorConversation(session.sessionId, snapshot.messages)) {
-      await this.persistState();
-      return;
-    }
-    if (snapshot.messages.length === 0) {
-      await this.persistState();
-      return;
-    }
-
-    await this.ensureConversationIssue(session, snapshot);
-    await this.ensureConversationLabels(session, snapshot, false);
-
-    const nextMessages = snapshot.messages.slice(session.lastMirroredCount);
-    if (nextMessages.length > 0) {
-      const appended = await this.appendConversationComments(session.issueNumber!, nextMessages);
-      if (appended > 0) {
-        session.lastMirroredCount += appended;
-        session.turnCount += appended;
-      }
-    }
-
-    await this.persistState();
-  }
-
-  private async finalizeSession(payload: FinalizePayload): Promise<void> {
-    if (!payload.sessionId) {
-      return;
-    }
-    if (!(await this.ensureConfigured())) {
-      return;
-    }
-
-    const session = this.getOrCreateSession(payload.sessionId);
-    if (session.finalizedAt) {
-      return;
-    }
-    session.sessionKey = payload.sessionKey ?? session.sessionKey;
-    session.sessionFile = payload.sessionFile ?? session.sessionFile;
-    session.agentId = payload.agentId ?? session.agentId;
-    session.updatedAt = new Date().toISOString();
-
-    const snapshot = await this.loadBestSnapshot(session, payload.messages ?? []);
-    if (!this.shouldMirrorConversation(session.sessionId, snapshot.messages)) {
-      await this.persistState();
-      return;
-    }
-    if (snapshot.messages.length === 0 && !session.issueNumber) {
-      await this.persistState();
-      return;
-    }
-
-    await this.ensureConversationIssue(session, snapshot);
-
-    const nextMessages = snapshot.messages.slice(session.lastMirroredCount);
-    let commentsComplete = true;
-    if (nextMessages.length > 0) {
-      const appended = await this.appendConversationComments(session.issueNumber!, nextMessages);
-      if (appended > 0) {
-        session.lastMirroredCount += appended;
-        session.turnCount += appended;
-      }
-      commentsComplete = appended === nextMessages.length;
-    }
-
-    const summary = await this.safeGenerateConversationSummary(session, snapshot);
-    await this.ensureConversationLabels(session, snapshot, true);
-    await this.syncConversationIssueBody(session, snapshot, summary, true);
-    await this.safeSyncConversationMemories(session, snapshot);
-
-    if (commentsComplete) {
-      session.finalizedAt = new Date().toISOString();
-    }
-    await this.persistState();
-  }
-
-  private async loadBestSnapshot(
-    session: SessionMirrorState,
-    fallbackMessages: unknown[],
-  ): Promise<TranscriptSnapshot> {
-    const transcriptPath = await this.resolveReadableTranscriptPath(session.sessionFile);
-    if (transcriptPath) {
-      if (session.sessionFile !== transcriptPath) {
-        session.sessionFile = transcriptPath;
-      }
-      try {
-        const transcript = await readTranscriptSnapshot(transcriptPath);
-        return {
-          sessionId: transcript.sessionId ?? session.sessionId,
-          messages: transcript.messages,
-        };
-      } catch (error) {
-        this.api.logger.warn(
-          `clawmem: transcript read failed for ${transcriptPath}: ${String(error)}`,
-        );
-      }
-    }
+  private getServices(agentId?: string): { conv: ConversationMirror; mem: MemoryStore } {
+    const client = new GitHubIssueClient(resolveAgentRoute(this.config, agentId), this.api.logger);
     return {
-      sessionId: session.sessionId,
-      messages: normalizeMessages(fallbackMessages),
+      conv: new ConversationMirror(client, this.api, this.config),
+      mem: new MemoryStore(client, this.api, this.config),
     };
   }
-
-  private async ensureConversationIssue(
-    session: SessionMirrorState,
-    snapshot: TranscriptSnapshot,
-  ): Promise<void> {
-    if (session.issueNumber) {
-      return;
-    }
-
-    const title = this.buildConversationTitle(session);
-    const labels = this.buildConversationLabels(session, snapshot, false);
-    const body = this.renderConversationBody(session, snapshot, "pending", false);
-    await this.ensureLabels(labels);
-
-    const issue = await this.client.createIssue({
-      title,
-      body,
-      labels,
-    });
-    session.issueNumber = issue.number;
-    session.issueTitle = issue.title ?? title;
-    session.lastSummaryHash = this.hash(`${title}\n${body}\nopen`);
-    session.createdAt = new Date().toISOString();
-    session.updatedAt = session.createdAt;
+  private textResult(text: string, details: Record<string, unknown>): ToolResult {
+    return { content: [{ type: "text", text }], details };
   }
-
-  private async syncConversationIssueBody(
-    session: SessionMirrorState,
-    snapshot: TranscriptSnapshot,
-    summary: ConversationSummaryResult,
-    closed: boolean,
-  ): Promise<void> {
-    if (!session.issueNumber) {
-      return;
-    }
-
-    const title = this.buildConversationTitle(session);
-    const body = this.renderConversationBody(session, snapshot, summary.summary, closed);
-    const bodyHash = this.hash(`${title}\n${body}\n${closed ? "closed" : "open"}`);
-    if (bodyHash === session.lastSummaryHash) {
-      return;
-    }
-
-    await this.client.updateIssue(session.issueNumber, {
-      title,
-      body,
-      ...(closed && this.config.closeIssueOnReset ? { state: "closed" as const } : {}),
-    });
-    session.issueTitle = title;
-    session.lastSummaryHash = bodyHash;
+  private errorResult(text: string): ToolResult {
+    return { content: [{ type: "text", text }], details: { error: text } };
   }
-
-  private async ensureConversationLabels(
-    session: SessionMirrorState,
-    snapshot: TranscriptSnapshot,
-    closed: boolean,
-  ): Promise<void> {
-    if (!session.issueNumber) {
-      return;
-    }
-    const labels = this.buildConversationLabels(session, snapshot, closed);
-    await this.ensureLabels(labels);
-    await this.syncManagedLabels(session.issueNumber, labels);
-  }
-
-  private async appendConversationComments(
-    issueNumber: number,
-    messages: NormalizedMessage[],
-  ): Promise<number> {
-    let appended = 0;
-    for (const message of messages) {
-      const body = this.renderConversationComment(message);
-      try {
-        await this.client.createComment(issueNumber, body);
-        appended += 1;
-      } catch (error) {
-        this.logBackgroundError("conversation comment", error);
-        break;
-      }
-    }
-    return appended;
-  }
-
-  private async safeGenerateConversationSummary(
-    session: SessionMirrorState,
-    snapshot: TranscriptSnapshot,
-  ): Promise<ConversationSummaryResult> {
-    try {
-      const summary = await this.generateConversationSummary(session, snapshot);
-      return { summary };
-    } catch (error) {
-      return {
-        summary: `failed: ${String(error)}`,
-      };
-    }
-  }
-
-  private async safeSyncConversationMemories(
-    session: SessionMirrorState,
-    snapshot: TranscriptSnapshot,
-  ): Promise<void> {
-    try {
-      const decision = await this.generateMemoryDecision(session, snapshot);
-      const saved = await this.applyMemoryDecision(session, decision);
-      if (saved.savedCount > 0 || saved.staledCount > 0) {
-        this.api.logger.info?.(
-          `clawmem: synced memories for ${session.sessionId} (saved=${saved.savedCount}, stale=${saved.staledCount})`,
-        );
-      }
-    } catch (error) {
-      this.logBackgroundError("memory capture", error);
-    }
-  }
-
-  private async generateConversationSummary(
-    session: SessionMirrorState,
-    snapshot: TranscriptSnapshot,
-  ): Promise<string> {
-    if (snapshot.messages.length === 0) {
-      throw new Error("no conversation messages to summarize");
-    }
-
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = this.buildSummarySessionKey(session);
-    const idempotencyKey = this.hash(`${session.sessionId}:${snapshot.messages.length}:summary`);
-    const message = [
-      "Summarize the following conversation.",
-      'Return valid JSON only in the form {"summary":"..."}',
-      "The summary should be concise, factual, and written in 2-4 sentences.",
-      "Do not include markdown, bullet points, or analysis.",
-      "",
-      "<conversation>",
-      this.formatTranscriptForSummary(snapshot.messages),
-      "</conversation>",
-    ].join("\n");
-
-    try {
-      const run = await subagent.run({
-        sessionKey,
-        message,
-        deliver: false,
-        lane: "clawmem-summary",
-        idempotencyKey,
-        extraSystemPrompt:
-          "You summarize OpenClaw conversations. Output JSON only with one string field named summary.",
-      });
-
-      const waitResult = await subagent.waitForRun({
-        runId: run.runId,
-        timeoutMs: this.config.summaryWaitTimeoutMs,
-      });
-      if (waitResult.status === "timeout") {
-        throw new Error("summary subagent timed out");
-      }
-      if (waitResult.status === "error") {
-        throw new Error(waitResult.error || "summary subagent failed");
-      }
-
-      const result = await subagent.getSessionMessages({ sessionKey, limit: 50 });
-      const messages = normalizeMessages(result.messages);
-      const finalText = [...messages]
-        .reverse()
-        .find((entry) => entry.role === "assistant" && entry.text.trim().length > 0)?.text;
-      if (!finalText) {
-        throw new Error("summary subagent returned no assistant text");
-      }
-      return extractSummaryText(finalText);
-    } finally {
-      try {
-        await subagent.deleteSession({ sessionKey, deleteTranscript: true });
-      } catch (error) {
-        this.logBackgroundError("summary subagent cleanup", error);
-      }
-    }
-  }
-
-  private async generateMemoryDecision(
-    session: SessionMirrorState,
-    snapshot: TranscriptSnapshot,
-  ): Promise<MemoryDecision> {
-    if (snapshot.messages.length === 0) {
-      return { save: [], stale: [] };
-    }
-
-    const recentActiveMemories = (await this.listMemoryIssues("active"))
-      .sort((left, right) => right.issueNumber - left.issueNumber)
-      .slice(0, 20);
-
-    const existingMemoryBlock =
-      recentActiveMemories.length === 0
-        ? "None."
-        : recentActiveMemories
-            .map((memory) => `[${memory.memoryId}] ${memory.detail}`)
-            .join("\n");
-
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = this.buildMemoryDecisionSessionKey(session);
-    const idempotencyKey = this.hash(`${session.sessionId}:${snapshot.messages.length}:memory-decision`);
-    const message = [
-      "Extract durable memories from the conversation below.",
-      'Return JSON only in the form {"save":["..."],"stale":["memory-id"]}.',
-      "Use save for stable, reusable facts, preferences, decisions, constraints, and ongoing context worth remembering later.",
-      "Use stale for existing memory IDs only when the conversation clearly supersedes or invalidates them.",
-      "Do not save temporary requests, startup boilerplate, tool chatter, summaries about internal helper sessions, or one-off operational details.",
-      "Prefer empty arrays when nothing durable should be remembered.",
-      "",
-      "<existing-active-memories>",
-      existingMemoryBlock,
-      "</existing-active-memories>",
-      "",
-      "<conversation>",
-      this.formatTranscriptForSummary(snapshot.messages),
-      "</conversation>",
-    ].join("\n");
-
-    try {
-      const run = await subagent.run({
-        sessionKey,
-        message,
-        deliver: false,
-        lane: "clawmem-memory",
-        idempotencyKey,
-        extraSystemPrompt:
-          "You extract durable memory updates from OpenClaw conversations. Output JSON only with string arrays save and stale.",
-      });
-
-      const waitResult = await subagent.waitForRun({
-        runId: run.runId,
-        timeoutMs: this.config.summaryWaitTimeoutMs,
-      });
-      if (waitResult.status === "timeout") {
-        throw new Error("memory decision subagent timed out");
-      }
-      if (waitResult.status === "error") {
-        throw new Error(waitResult.error || "memory decision subagent failed");
-      }
-
-      const result = await subagent.getSessionMessages({ sessionKey, limit: 50 });
-      const messages = normalizeMessages(result.messages);
-      const finalText = [...messages]
-        .reverse()
-        .find((entry) => entry.role === "assistant" && entry.text.trim().length > 0)?.text;
-      if (!finalText) {
-        throw new Error("memory decision subagent returned no assistant text");
-      }
-      return extractMemoryDecision(finalText);
-    } finally {
-      try {
-        await subagent.deleteSession({ sessionKey, deleteTranscript: true });
-      } catch (error) {
-        this.logBackgroundError("memory decision subagent cleanup", error);
-      }
-    }
-  }
-
-  private async applyMemoryDecision(
-    session: SessionMirrorState,
-    decision: MemoryDecision,
-  ): Promise<{ savedCount: number; staledCount: number }> {
-    const allActiveMemories = await this.listMemoryIssues("active");
-    const activeById = new Map(allActiveMemories.map((memory) => [memory.memoryId, memory]));
-    const existingDetails = new Set(
-      allActiveMemories.map((memory) => normalizeMemoryDetail(memory.detail)),
-    );
-
-    let savedCount = 0;
-    let staledCount = 0;
-
-    const saveItems = [...new Set(decision.save.map(normalizeMemoryDetail).filter(Boolean))];
-    for (const detail of saveItems) {
-      if (existingDetails.has(detail)) {
-        continue;
-      }
-      await this.createMemoryIssue(session.sessionId, detail);
-      existingDetails.add(detail);
-      savedCount += 1;
-    }
-
-    const staleIds = [...new Set(decision.stale.map((value) => value.trim()).filter(Boolean))];
-    for (const memoryId of staleIds) {
-      const memory = activeById.get(memoryId);
-      if (!memory) {
-        continue;
-      }
-      await this.ensureLabels([this.config.memoryStaleStatusLabel]);
-      await this.syncManagedLabels(
-        memory.issueNumber,
-        this.buildMemoryLabels(memory.sessionId, memory.date, "stale"),
-      );
-      staledCount += 1;
-    }
-
-    return { savedCount, staledCount };
-  }
-
-  private async createMemoryIssue(
-    sessionId: string,
-    detail: string,
-    topics: string[] = [],
-  ): Promise<ParsedMemoryIssue> {
-    const date = this.toLocalDateString();
-    const normalizedTopics = normalizeTopicNames(topics);
-    const labels = this.buildMemoryLabels(sessionId, date, "active", normalizedTopics);
-    const title = `${this.config.memoryTitlePrefix}${this.truncateInline(detail, 72)}`;
-    const body = this.renderMemoryBody(detail);
-    await this.ensureLabels(labels);
-    const issue = await this.client.createIssue({
-      title,
-      body,
-      labels,
-    });
-    return {
-      issueNumber: issue.number,
-      title: issue.title ?? title,
-      memoryId: String(issue.number),
-      sessionId,
-      date,
-      detail,
-      ...(normalizedTopics.length > 0 ? { topics: normalizedTopics } : {}),
-      status: "active",
-    };
-  }
-
-  private async searchActiveMemories(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
-    const memories = await this.listMemoryIssues("active");
-    const normalizedQuery = query.trim().toLowerCase();
-    const scored = memories
-      .map((memory) => ({
-        memory,
-        score: this.scoreMemory(memory, normalizedQuery),
-      }))
-      .filter((entry) => entry.score > 0)
-      .sort((left, right) => {
-        if (right.score !== left.score) {
-          return right.score - left.score;
-        }
-        return right.memory.issueNumber - left.memory.issueNumber;
-      })
-      .slice(0, limit)
-      .map((entry) => entry.memory);
-    return scored;
-  }
-
-  private async findMemoryById(memoryId: string): Promise<ParsedMemoryIssue | null> {
-    const memories = await this.listMemoryIssues("all");
-    return memories.find((memory) => memory.memoryId === memoryId) ?? null;
-  }
-
-  private async listMemoryIssues(status: "active" | "stale" | "all"): Promise<ParsedMemoryIssue[]> {
-    const labels = ["type:memory"];
-    if (status === "active") {
-      labels.push(this.config.memoryActiveStatusLabel);
-    } else if (status === "stale") {
-      labels.push(this.config.memoryStaleStatusLabel);
-    }
-
-    const issues: ParsedMemoryIssue[] = [];
-    for (let page = 1; page <= 20; page += 1) {
-      const batch = await this.client.listIssues({
-        labels,
-        state: "all",
-        page,
-        perPage: 100,
-      });
-      for (const issue of batch) {
-        const parsed = this.parseMemoryIssue(issue);
-        if (parsed) {
-          issues.push(parsed);
-        }
-      }
-      if (batch.length < 100) {
-        break;
-      }
-    }
-    return issues;
-  }
-
-  private parseMemoryIssue(issue: {
-    number: number;
-    title?: string;
-    body?: string;
-    labels?: Array<{ name?: string } | string>;
-  }): ParsedMemoryIssue | null {
-    const labels = this.extractLabelNames(issue.labels);
-    if (!labels.includes("type:memory")) {
-      return null;
-    }
-    const sessionId = this.extractLabelValue(labels, "session:");
-    const date = this.extractLabelValue(labels, "date:");
-    const topics = labels
-      .filter((label) => label.startsWith("topic:"))
-      .map((label) => label.slice("topic:".length).trim())
-      .filter((label) => label.length > 0);
-    const rawBody = typeof issue.body === "string" ? issue.body.trim() : "";
-    const body = rawBody ? parseFlatYaml(rawBody) : {};
-    const detail = body.detail?.trim() || rawBody;
-    const memoryId = body.memory_id?.trim() || String(issue.number);
-    if (!sessionId || !date || !detail.trim()) {
-      return null;
-    }
-    return {
-      issueNumber: issue.number,
-      title: issue.title?.trim() || "",
-      memoryId,
-      sessionId,
-      date,
-      detail,
-      ...(topics.length > 0 ? { topics } : {}),
-      status: labels.includes(this.config.memoryStaleStatusLabel) ? "stale" : "active",
-    };
-  }
-
-  private async ensureLabels(labels: string[]): Promise<void> {
-    if (!this.config.autoCreateLabels) {
-      return;
-    }
-    for (const label of labels) {
-      await this.client.ensureLabel(label, this.resolveLabelColor(label), this.labelDescription(label));
-    }
-  }
-
-  private async syncManagedLabels(issueNumber: number, desiredManagedLabels: string[]): Promise<void> {
-    const issue = await this.client.getIssue(issueNumber);
-    const existingLabels = this.extractLabelNames(issue.labels);
-    const unmanagedLabels = existingLabels.filter((label) => !this.isManagedLabel(label));
-    const nextLabels = [...new Set([...unmanagedLabels, ...desiredManagedLabels])];
-    await this.client.updateIssue(issueNumber, { labels: nextLabels });
-  }
-
-  private buildConversationTitle(session: SessionMirrorState): string {
-    return `${this.config.issueTitlePrefix}${session.sessionId}`;
-  }
-
-  private buildConversationLabels(
-    session: SessionMirrorState,
-    snapshot: TranscriptSnapshot,
-    closed: boolean,
-  ): string[] {
-    const dates = this.resolveConversationDates(session, snapshot.messages);
-    const labels = new Set<string>([
-      ...this.config.defaultLabels,
-      "type:conversation",
-      `session:${session.sessionId}`,
-      `date:${dates.date}`,
-    ]);
-
-    if (session.agentId && this.config.agentLabelPrefix) {
-      labels.add(`${this.config.agentLabelPrefix}${session.agentId}`);
-    }
-    if (closed) {
-      if (this.config.closedStatusLabel) {
-        labels.add(this.config.closedStatusLabel);
-      }
-    } else if (this.config.activeStatusLabel) {
-      labels.add(this.config.activeStatusLabel);
-    }
-    return [...labels].filter((label) => label.trim().length > 0);
-  }
-
-  private buildMemoryLabels(
-    sessionId: string,
-    date: string,
-    status: "active" | "stale",
-    topics: string[] = [],
-  ): string[] {
-    return [
-      "type:memory",
-      `session:${sessionId}`,
-      `date:${date}`,
-      ...topics.map((topic) => `topic:${topic}`),
-      status === "active" ? this.config.memoryActiveStatusLabel : this.config.memoryStaleStatusLabel,
-    ];
-  }
-
-  private renderConversationBody(
-    session: SessionMirrorState,
-    snapshot: TranscriptSnapshot,
-    summary: string,
-    closed: boolean,
-  ): string {
-    const dates = this.resolveConversationDates(session, snapshot.messages);
-    return stringifyFlatYaml([
-      ["type", "conversation"],
-      ["session_id", session.sessionId],
-      ["date", dates.date],
-      ["start_at", dates.startAt],
-      ["end_at", dates.endAt],
-      ["status", closed ? "closed" : "active"],
-      ["summary", summary],
-    ]);
-  }
-
-  private renderMemoryBody(detail: string): string {
-    return detail.trim();
-  }
-
-  private renderConversationComment(message: NormalizedMessage): string {
-    return `role: ${message.role}\n\n${message.text.trim()}`;
-  }
-
-  private resolveConversationDates(
-    session: SessionMirrorState,
-    messages: NormalizedMessage[],
-  ): { date: string; startAt: string; endAt: string } {
-    const timestamps = messages
-      .map((message) => message.timestamp)
-      .filter((value): value is string => Boolean(value && value.trim()))
-      .map((value) => new Date(value))
-      .filter((value) => Number.isFinite(value.getTime()));
-    const fallbackCreated = session.createdAt ? new Date(session.createdAt) : new Date();
-    const fallbackUpdated = session.updatedAt ? new Date(session.updatedAt) : fallbackCreated;
-    const started = timestamps[0] ?? fallbackCreated;
-    const ended = timestamps[timestamps.length - 1] ?? fallbackUpdated;
-    return {
-      date: this.toLocalDateString(started),
-      startAt: this.toLocalDateTimeString(started),
-      endAt: this.toLocalDateTimeString(ended),
-    };
-  }
-
-  private formatTranscriptForSummary(messages: NormalizedMessage[]): string {
-    return messages
-      .map((message, index) => {
-        const label = message.role === "assistant" ? "assistant" : "user";
-        return `${index + 1}. ${label}: ${message.text}`;
-      })
-      .join("\n\n");
-  }
-
-  private buildSummarySessionKey(session: SessionMirrorState): string {
-    const agentId = sanitizeSessionKeyPart(session.agentId || "main");
-    const sessionId = sanitizeSessionKeyPart(session.sessionId);
-    return `agent:${agentId}:subagent:clawmem-summary-${sessionId}`;
-  }
-
-  private buildMemoryDecisionSessionKey(session: SessionMirrorState): string {
-    const agentId = sanitizeSessionKeyPart(session.agentId || "main");
-    const sessionId = sanitizeSessionKeyPart(session.sessionId);
-    return `agent:${agentId}:subagent:clawmem-memory-${sessionId}`;
-  }
-
-  private getOrCreateSession(sessionId: string): SessionMirrorState {
-    const existing = this.state.sessions[sessionId];
-    if (existing) {
-      return existing;
-    }
-    const now = new Date().toISOString();
-    const created: SessionMirrorState = {
-      sessionId,
-      lastMirroredCount: 0,
-      turnCount: 0,
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.state.sessions[sessionId] = created;
-    return created;
-  }
-
-  private async persistState(): Promise<void> {
-    if (!this.statePath) {
-      this.statePath = resolveStatePath(this.api.runtime.state.resolveStateDir());
-    }
-    await this.stateQueue.enqueue("state", async () => {
-      await saveState(this.statePath, this.state);
-    });
-  }
-
-  private resolveLabelColor(label: string): string {
-    if (label.startsWith("status:")) {
-      return "b60205";
-    }
-    if (label.startsWith("memory-status:")) {
-      return label.endsWith(":stale") ? "d93f0b" : "0e8a16";
-    }
-    if (label.startsWith("type:")) {
-      return label === "type:memory" ? "5319e7" : "1d76db";
-    }
-    if (label.startsWith("date:")) {
-      return "c5def5";
-    }
-    if (label.startsWith("topic:")) {
-      return "fbca04";
-    }
-    if (label.startsWith("session:")) {
-      return "bfdadc";
-    }
-    if (label.startsWith("agent:")) {
-      return "1d76db";
-    }
-    if (label.startsWith("source:")) {
-      return "0e8a16";
-    }
-    return this.config.labelColor;
-  }
-
-  private labelDescription(label: string): string {
-    if (label.startsWith("type:")) {
-      return "Issue type managed by clawmem.";
-    }
-    if (label.startsWith("memory-status:")) {
-      return "Memory lifecycle status managed by clawmem.";
-    }
-    if (label.startsWith("status:")) {
-      return "Conversation lifecycle status managed by clawmem.";
-    }
-    if (label.startsWith("session:")) {
-      return "Session association label managed by clawmem.";
-    }
-    if (label.startsWith("date:")) {
-      return "Date label managed by clawmem.";
-    }
-    if (label.startsWith("topic:")) {
-      return "Topic label managed by clawmem.";
-    }
-    if (label.startsWith("agent:")) {
-      return "Agent label generated by clawmem.";
-    }
-    if (label.startsWith("source:")) {
-      return "Source label generated by clawmem.";
-    }
-    return "Label managed by clawmem.";
-  }
-
-  private scoreMemory(memory: ParsedMemoryIssue, query: string): number {
-    const haystack = `${memory.title}\n${memory.detail}`.toLowerCase();
-    if (!haystack.trim() || !query.trim()) {
-      return 0;
-    }
-    let score = 0;
-    if (haystack.includes(query)) {
-      score += 10;
-    }
-    const tokens = query
-      .split(/[^a-z0-9]+/i)
-      .map((token) => token.trim())
-      .filter((token) => token.length > 1);
-    for (const token of tokens) {
-      if (haystack.includes(token.toLowerCase())) {
-        score += 1;
-      }
-    }
-    return score;
-  }
-
-  private extractLabelNames(labels: Array<{ name?: string } | string> | undefined): string[] {
-    if (!Array.isArray(labels)) {
-      return [];
-    }
-    return labels
-      .map((entry) => {
-        if (typeof entry === "string") {
-          return entry.trim();
-        }
-        return typeof entry?.name === "string" ? entry.name.trim() : "";
-      })
-      .filter((label) => label.length > 0);
-  }
-
-  private extractLabelValue(labels: string[], prefix: string): string | undefined {
-    const match = labels.find((label) => label.startsWith(prefix));
-    if (!match) {
-      return undefined;
-    }
-    const value = match.slice(prefix.length).trim();
-    return value || undefined;
-  }
-
-  private isManagedLabel(label: string): boolean {
-    if (this.config.defaultLabels.includes(label)) {
-      return true;
-    }
-    return (
-      label.startsWith("type:") ||
-      label.startsWith("session:") ||
-      label.startsWith("date:") ||
-      label.startsWith("topic:") ||
-      label.startsWith("agent:") ||
-      label.startsWith("source:") ||
-      label === this.config.activeStatusLabel ||
-      label === this.config.closedStatusLabel ||
-      label === this.config.memoryActiveStatusLabel ||
-      label === this.config.memoryStaleStatusLabel
-    );
-  }
-
-  private shouldMirrorConversation(sessionId: string, messages: NormalizedMessage[]): boolean {
-    if (sessionId.startsWith("slug-generator-")) {
-      return false;
-    }
-    const firstUserMessage = messages.find((message) => message.role === "user")?.text ?? "";
-    if (
-      firstUserMessage.includes("generate a short 1-2 word filename slug") &&
-      firstUserMessage.includes("Reply with ONLY the slug")
-    ) {
-      return false;
-    }
-    if (
-      firstUserMessage.includes("Summarize the following conversation.") &&
-      firstUserMessage.includes('Return valid JSON only in the form {"summary":"..."}') &&
-      firstUserMessage.includes("<conversation>")
-    ) {
-      return false;
-    }
-    if (
-      firstUserMessage.includes("Extract durable memories from the conversation below.") &&
-      firstUserMessage.includes('Return JSON only in the form {"save":["..."],"stale":["memory-id"]}.') &&
-      firstUserMessage.includes("<existing-active-memories>")
-    ) {
-      return false;
-    }
-    return true;
-  }
-
-  private toLocalDateString(input: Date | string | undefined = undefined): string {
-    const date =
-      input instanceof Date ? input : typeof input === "string" ? new Date(input) : new Date();
-    const resolved = Number.isFinite(date.getTime()) ? date : new Date();
-    const year = resolved.getFullYear();
-    const month = String(resolved.getMonth() + 1).padStart(2, "0");
-    const day = String(resolved.getDate()).padStart(2, "0");
-    return `${year}-${month}-${day}`;
-  }
-
-  private toLocalDateTimeString(input: Date | string | undefined = undefined): string {
-    const date =
-      input instanceof Date ? input : typeof input === "string" ? new Date(input) : new Date();
-    const resolved = Number.isFinite(date.getTime()) ? date : new Date();
-    const year = resolved.getFullYear();
-    const month = String(resolved.getMonth() + 1).padStart(2, "0");
-    const day = String(resolved.getDate()).padStart(2, "0");
-    const hours = String(resolved.getHours()).padStart(2, "0");
-    const minutes = String(resolved.getMinutes()).padStart(2, "0");
-    const seconds = String(resolved.getSeconds()).padStart(2, "0");
-    return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`;
-  }
-
-  private textResult(text: string, details: Record<string, unknown>) {
-    return {
-      content: [{ type: "text", text }],
-      details,
-    };
-  }
-
-  private errorResult(text: string) {
-    return {
-      content: [{ type: "text", text }],
-      details: { error: text },
-    };
-  }
-
-  private truncateInline(value: string, maxChars: number): string {
-    const singleLine = value.replace(/\s+/g, " ").trim();
-    if (singleLine.length <= maxChars) {
-      return singleLine;
-    }
-    return `${singleLine.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
-  }
-
-  private hash(value: string): string {
-    return crypto.createHash("sha256").update(value).digest("hex");
-  }
-
-  private async fileExists(filePath: string): Promise<boolean> {
-    try {
-      const stat = await fs.promises.stat(filePath);
-      return stat.isFile();
-    } catch {
-      return false;
-    }
-  }
-
-  private async resolveReadableTranscriptPath(filePath: string | undefined): Promise<string | null> {
-    if (!filePath) {
-      return null;
-    }
-    if (await this.fileExists(filePath)) {
-      return filePath;
-    }
-    const resetPath = await this.findLatestResetTranscript(filePath);
-    if (resetPath) {
-      this.api.logger.info?.(
-        `clawmem: using reset transcript ${resetPath} because ${filePath} is missing`,
-      );
-      return resetPath;
-    }
-    return null;
-  }
-
-  private async findLatestResetTranscript(filePath: string): Promise<string | null> {
-    const directory = path.dirname(filePath);
-    const basename = path.basename(filePath);
-    const prefix = `${basename}.reset.`;
-
-    try {
-      const entries = await fs.promises.readdir(directory, { withFileTypes: true });
-      const candidates = entries
-        .filter((entry) => entry.isFile() && entry.name.startsWith(prefix))
-        .map((entry) => entry.name)
-        .sort((left, right) => left.localeCompare(right));
-      const latest = candidates.at(-1);
-      return latest ? path.join(directory, latest) : null;
-    } catch (error) {
-      this.api.logger.warn?.(
-        `clawmem: failed to scan reset transcripts for ${filePath}: ${String(error)}`,
-      );
-      return null;
-    }
-  }
-
-  private logBackgroundError(scope: string, error: unknown): void {
-    this.api.logger.warn(`clawmem: ${scope} failed: ${String(error)}`);
-  }
+  private warn(scope: string, error: unknown): void { this.api.logger.warn(`clawmem: ${scope} failed: ${String(error)}`); }
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-}
-
+function asRecord(v: unknown): Record<string, unknown> { return v && typeof v === "object" ? (v as Record<string, unknown>) : {}; }
 function readOptionalString(params: Record<string, unknown>, key: string): string | undefined {
   const value = params[key];
-  if (typeof value !== "string") {
-    return undefined;
-  }
+  if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   return trimmed || undefined;
 }
-
 function readRequiredString(params: Record<string, unknown>, key: string): string {
   return readOptionalString(params, key) ?? "";
 }
-
 function readOptionalNumber(params: Record<string, unknown>, key: string): number | undefined {
   const value = params[key];
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
+  if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim()) {
     const parsed = Number(value);
-    if (Number.isFinite(parsed)) {
-      return parsed;
-    }
+    if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
 }
-
+function readOptionalBoolean(params: Record<string, unknown>, key: string): boolean | undefined {
+  const value = params[key];
+  if (typeof value === "boolean") return value;
+  if (value === 1 || value === "1") return true;
+  if (value === 0 || value === "0") return false;
+  if (typeof value === "string") {
+    const lowered = value.trim().toLowerCase();
+    if (lowered === "true") return true;
+    if (lowered === "false") return false;
+  }
+  return undefined;
+}
 function readOptionalStringArray(params: Record<string, unknown>, key: string): string[] {
   const value = params[key];
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.filter((entry): entry is string => typeof entry === "string");
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === "string").map((entry) => entry.trim()).filter(Boolean);
 }
-
 function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.floor(value)));
 }
-
-function sanitizeSessionKeyPart(value: string): string {
-  return value.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "main";
-}
-
-function extractSummaryText(raw: string): string {
-  const trimmed = raw.trim();
-  const direct = tryParseSummaryJson(trimmed);
-  if (direct) {
-    return direct;
+type StartupRecallResult = Awaited<ReturnType<MemoryStore["startupRecall"]>>;
+function renderStartupRecall(recall: StartupRecallResult): string {
+  const blocks: string[] = ["<clawmem-recalled-memories>"];
+  if (recall.pinned.length > 0) {
+    blocks.push("Pinned startup memories:");
+    blocks.push(...recall.pinned.map((memory) => `- ${formatMemoryLine(memory)}`));
   }
-
-  const fenced = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(trimmed);
-  if (fenced?.[1]) {
-    const parsed = tryParseSummaryJson(fenced[1].trim());
-    if (parsed) {
-      return parsed;
-    }
+  if (recall.matched.length > 0) {
+    blocks.push("Query-matched memories:");
+    blocks.push(...recall.matched.map((memory) => `- ${formatMemoryLine(memory)}`));
   }
-
-  return trimmed;
-}
-
-function extractMemoryDecision(raw: string): MemoryDecision {
-  const parsed = tryParseMemoryDecisionJson(raw.trim());
-  if (parsed) {
-    return parsed;
+  if (recall.recent.length > 0) {
+    blocks.push("Recent active memories:");
+    blocks.push(...recall.recent.map((memory) => `- ${formatMemoryLine(memory)}`));
   }
-
-  const fenced = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(raw.trim());
-  if (fenced?.[1]) {
-    const nested = tryParseMemoryDecisionJson(fenced[1].trim());
-    if (nested) {
-      return nested;
-    }
-  }
-
-  throw new Error("memory decision subagent returned invalid JSON");
+  blocks.push("</clawmem-recalled-memories>");
+  return blocks.join("\n");
+}
+function formatMemoryLine(memory: ParsedMemoryIssue): string {
+  const title = memory.title.trim();
+  const topicText = memory.topics?.length ? ` [topics: ${memory.topics.join(", ")}]` : "";
+  const meta = memory.kind ? ` (${memory.kind})` : "";
+  if (title) return `[#${memory.issueNumber}] ${title}${meta}: ${memory.detail}${topicText}`;
+  return `[#${memory.issueNumber}] ${memory.detail}${meta}${topicText}`;
 }
 
-function tryParseMemoryDecisionJson(raw: string): MemoryDecision | null {
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const save = Array.isArray(parsed.save)
-      ? parsed.save.filter((value): value is string => typeof value === "string")
-      : [];
-    const stale = Array.isArray(parsed.stale)
-      ? parsed.stale.filter((value): value is string => typeof value === "string")
-      : [];
-    return { save, stale };
-  } catch {
-    return null;
-  }
-}
-
-function normalizeMemoryDetail(value: string): string {
-  return value.replace(/\s+/g, " ").trim();
-}
-
-function normalizeTopicNames(values: string[]): string[] {
-  return [...new Set(values.map(normalizeTopicName).filter(Boolean))];
-}
-
-function normalizeTopicName(value: string): string {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 48);
-}
-
-function tryParseSummaryJson(raw: string): string | null {
-  try {
-    const parsed = JSON.parse(raw) as { summary?: unknown };
-    if (typeof parsed?.summary === "string" && parsed.summary.trim()) {
-      return parsed.summary.trim();
-    }
-  } catch {
-    const start = raw.indexOf("{");
-    const end = raw.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      try {
-        const parsed = JSON.parse(raw.slice(start, end + 1)) as { summary?: unknown };
-        if (typeof parsed?.summary === "string" && parsed.summary.trim()) {
-          return parsed.summary.trim();
-        }
-      } catch {
-        return null;
-      }
-    }
-  }
-  return null;
-}
-
-export function createClawMemPlugin(api: OpenClawPluginApi): void {
-  const service = new ClawMemService(api);
-  service.register();
-}
+export function createClawMemPlugin(api: OpenClawPluginApi): void { new ClawMemService(api).register(); }
