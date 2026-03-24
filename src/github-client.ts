@@ -6,6 +6,7 @@ type IssueResponse = { number: number; title?: string; body?: string; state?: st
 type SearchIssuesResponse = { items?: IssueResponse[]; total_count?: number; incomplete_results?: boolean };
 type CommentResponse = { id?: number; body?: string; created_at?: string };
 type LabelResponse = { name?: string; color?: string; description?: string };
+type RepoResponse = { name?: string; full_name?: string; description?: string; private?: boolean; owner?: { login?: string } };
 type ReqOpts = { allowNotFound?: boolean; allowValidationError?: boolean; omitAuth?: boolean };
 
 export class GitHubIssueClient {
@@ -13,6 +14,9 @@ export class GitHubIssueClient {
 
   repo(): string | undefined {
     return this.config.repo?.trim() || undefined;
+  }
+  defaultRepo(): string | undefined {
+    return this.config.defaultRepo?.trim() || undefined;
   }
 
   async createIssue(params: { title: string; body: string; labels: string[] }): Promise<IssueResponse> {
@@ -52,6 +56,20 @@ export class GitHubIssueClient {
     q.set("page", String(params?.page ?? 1));
     q.set("per_page", String(params?.perPage ?? 100));
     return this.req<LabelResponse[]>(`${this.repoPath("labels")}?${q}`, { method: "GET" });
+  }
+  async listUserRepos(): Promise<RepoResponse[]> {
+    return this.req<RepoResponse[]>("user/repos", { method: "GET" });
+  }
+  async createUserRepo(params: { name: string; description?: string; private?: boolean; autoInit?: boolean }): Promise<RepoResponse> {
+    return this.req<RepoResponse>("user/repos", {
+      method: "POST",
+      body: JSON.stringify({
+        name: params.name,
+        ...(params.description ? { description: params.description } : {}),
+        private: params.private ?? true,
+        auto_init: params.autoInit ?? false,
+      }),
+    });
   }
   async ensureLabels(labels: string[]): Promise<void> {
     for (const label of labels) {
