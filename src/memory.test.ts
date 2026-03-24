@@ -1,4 +1,5 @@
 import { MemoryStore, scoreMemoryMatch } from "./memory.js";
+import type { MemorySemanticProvider } from "./semantic-search.js";
 import type { ParsedMemoryIssue } from "./types.js";
 import { stringifyFlatYaml } from "./yaml.js";
 
@@ -116,6 +117,47 @@ async function testStructuredStoreAndSchema(): Promise<void> {
   assert(ensured[0]?.includes("kind:lesson"), "expected ensureLabels to include kind label");
   assert(schema.kinds.includes("lesson"), "expected schema to expose existing kind labels");
   assert(schema.topics.includes("redis"), "expected schema to expose existing topic labels");
+}
+
+async function testHybridSemanticRecallRescuesLexicalMiss(): Promise<void> {
+  const issues = [
+    issueFromMemory(memory({
+      issueNumber: 21,
+      title: "Memory: node-21",
+      detail: "草莓 西瓜 凤梨 F1 赛车 Dota 2 云玩家。",
+    })),
+    issueFromMemory(memory({
+      issueNumber: 22,
+      title: "Memory: favorite hobbies and sports checklist",
+      detail: "Generic onboarding checklist for spectator events.",
+    })),
+  ];
+  const client = {
+    listIssues: async () => issues,
+  };
+  const semanticProvider: MemorySemanticProvider = {
+    score: async () => new Map([
+      [21, 0.86],
+      [22, 0.14],
+    ]),
+  };
+  const lexicalStore = new MemoryStore(
+    client as never,
+    { logger: { warn: () => {} } } as never,
+    { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000, semanticSearchWeight: 0.65 } as never,
+  );
+  const store = new MemoryStore(
+    client as never,
+    { logger: { warn: () => {} } } as never,
+    { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000, semanticSearchWeight: 0.65 } as never,
+    semanticProvider,
+  );
+  const lexicalOnly = await lexicalStore.search("favorite hobbies and spectator sports", 5);
+  const found = await store.search("favorite hobbies and sports", 5);
+
+  assert(lexicalOnly[0]?.issueNumber === 22, "expected lexical-only search to be distracted by the obvious wording match");
+  assert(found.length >= 1, "expected hybrid recall to return at least one semantically relevant memory");
+  assert(found[0]?.issueNumber === 21, "expected hybrid recall to rank the semantically matching memory first");
 }
 
 async function testGetAndListMemories(): Promise<void> {
@@ -301,6 +343,7 @@ async function main(): Promise<void> {
   await testSearchRanking();
   testCjkScoring();
   await testStructuredStoreAndSchema();
+  await testHybridSemanticRecallRescuesLexicalMiss();
   await testGetAndListMemories();
   await testLegacyMemoriesWithoutSessionOrDate();
   await testUpdateMemoryInPlace();

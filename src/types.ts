@@ -13,6 +13,14 @@ export type ClawMemPluginConfig = {
   memoryRecallLimit: number;
   turnCommentDelayMs: number;
   summaryWaitTimeoutMs: number;
+  embeddingsBaseUrl?: string;
+  embeddingsApiKey?: string;
+  embeddingsModel?: string;
+  embeddingsAuthScheme: "token" | "bearer";
+  embeddingsDimensions?: number;
+  semanticSearchWeight: number;
+  semanticSearchMaxCandidates: number;
+  semanticSearchBatchSize: number;
 };
 
 export type ClawMemResolvedRoute = {

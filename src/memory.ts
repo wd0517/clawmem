@@ -2,6 +2,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { LABEL_MEMORY_STALE, MEMORY_TITLE_PREFIX, extractLabelNames, labelVal } from "./config.js";
 import type { GitHubIssueClient } from "./github-client.js";
+import { createSemanticProvider, type MemorySemanticProvider } from "./semantic-search.js";
 import { normalizeMessages } from "./transcript.js";
 import type { ClawMemPluginConfig, MemoryDraft, MemoryListOptions, MemorySchema, NormalizedMessage, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { fmtTranscript, localDate, sha256, subKey } from "./utils.js";
@@ -11,18 +12,36 @@ type MemoryDecision = { save: MemoryDraft[]; stale: string[] };
 type SearchIndex = { title: string; detail: string; kind?: string; topics: string[] };
 
 export class MemoryStore {
-  constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
+  private readonly semanticProvider?: MemorySemanticProvider;
+
+  constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig, semanticProvider?: MemorySemanticProvider) {
+    this.semanticProvider = semanticProvider ?? createSemanticProvider(api, config);
+  }
 
   async search(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const memories = await this.listByStatus("active");
     const q = normalizeSearch(query);
     if (!q) return [];
-    return memories
-      .map((m) => ({ m, score: scoreMemoryMatch(m, q) }))
-      .filter((e) => e.score > 0)
-      .sort((a, b) => b.score - a.score || b.m.issueNumber - a.m.issueNumber)
+    const lexical = memories.map((m) => ({ memory: m, lexical: scoreMemoryMatch(m, q) }));
+    const lexicalMax = Math.max(0, ...lexical.map((entry) => entry.lexical));
+    let semanticScores = new Map<number, number>();
+    if (this.semanticProvider) {
+      try {
+        semanticScores = await this.semanticProvider.score(query, memories);
+      } catch (error) {
+        this.api.logger.warn(`clawmem: semantic recall failed, falling back to lexical search: ${String(error)}`);
+      }
+    }
+    return lexical
+      .map((entry) => {
+        const semantic = semanticScores.get(entry.memory.issueNumber);
+        const combined = hybridScore(entry.lexical, lexicalMax, semantic, this.config.semanticSearchWeight);
+        return { memory: entry.memory, lexical: entry.lexical, semantic: semantic ?? Number.NEGATIVE_INFINITY, combined };
+      })
+      .filter((entry) => shouldKeepHybridCandidate(entry.lexical, lexicalMax, entry.semantic, entry.combined, semanticScores.size > 0))
+      .sort((a, b) => b.combined - a.combined || b.lexical - a.lexical || b.memory.issueNumber - a.memory.issueNumber)
       .slice(0, limit)
-      .map((e) => e.m);
+      .map((entry) => entry.memory);
   }
 
   async listSchema(): Promise<MemorySchema> {
@@ -354,6 +373,31 @@ function overlapRatio(left: Set<string>, right: Set<string>): number {
   let hits = 0;
   for (const token of left) if (right.has(token)) hits++;
   return hits / Math.max(left.size, right.size);
+}
+function normalizeLexicalScore(score: number, maxScore: number): number {
+  if (score <= 0 || maxScore <= 0) return 0;
+  return score / maxScore;
+}
+function normalizeSemanticScore(score: number | undefined): number {
+  if (score === undefined || !Number.isFinite(score)) return 0;
+  if (score <= 0.18) return 0;
+  return Math.min(1, (score - 0.18) / 0.62);
+}
+function hybridScore(lexical: number, lexicalMax: number, semantic: number | undefined, semanticWeight: number): number {
+  const lexicalNorm = normalizeLexicalScore(lexical, lexicalMax);
+  const semanticNorm = normalizeSemanticScore(semantic);
+  if (semantic === undefined || !Number.isFinite(semantic)) return lexicalNorm;
+  const lexicalWeight = 1 - semanticWeight;
+  let combined = lexicalNorm * lexicalWeight + semanticNorm * semanticWeight;
+  if (lexical > 0 && semanticNorm === 0) combined += 0.02;
+  if (semanticNorm > 0 && lexical === 0) combined += 0.03;
+  return combined;
+}
+function shouldKeepHybridCandidate(lexical: number, lexicalMax: number, semantic: number, combined: number, hasSemantic: boolean): boolean {
+  if (!hasSemantic) return lexical > 0;
+  if (combined >= 0.2) return true;
+  if (lexical >= Math.max(6, lexicalMax * 0.35)) return true;
+  return Number.isFinite(semantic) && semantic >= 0.48;
 }
 export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): number {
   const query = normalizeSearch(rawQuery);
