@@ -71,7 +71,7 @@ export class MemoryStore {
       .slice(0, limit);
   }
 
-  async store(draft: MemoryDraft, sessionId = "manual"): Promise<{ created: boolean; memory: ParsedMemoryIssue }> {
+  async store(draft: MemoryDraft): Promise<{ created: boolean; memory: ParsedMemoryIssue }> {
     const normalized = normalizeDraft(draft);
     const detail = norm(normalized.detail);
     const allActive = await this.listByStatus("active");
@@ -83,7 +83,7 @@ export class MemoryStore {
     }
 
     const date = localDate();
-    const labels = memLabels(sessionId, normalized.kind, normalized.topics);
+    const labels = memLabels(normalized.kind, normalized.topics);
     const title = `${MEMORY_TITLE_PREFIX}${trunc(detail, 72)}`;
     const body = stringifyFlatYaml([["memory_hash", hash], ["date", date], ["detail", detail]]);
     await this.client.ensureLabels(labels);
@@ -95,7 +95,6 @@ export class MemoryStore {
         title,
         memoryId: String(issue.number),
         memoryHash: hash,
-        sessionId,
         date,
         detail,
         ...(normalized.kind ? { kind: normalized.kind } : {}),
@@ -121,7 +120,7 @@ export class MemoryStore {
     if (duplicate) throw new Error(`another active memory already stores this detail as [${duplicate.memoryId}]`);
     const nextTitle = `${MEMORY_TITLE_PREFIX}${trunc(nextDetail, 72)}`;
     const nextBody = stringifyFlatYaml([["memory_hash", nextHash], ["date", current.date], ["detail", nextDetail]]);
-    const nextLabels = memLabels(current.sessionId, nextKind, nextTopics);
+    const nextLabels = memLabels(nextKind, nextTopics);
     await this.client.ensureLabels(nextLabels);
     await this.client.updateIssue(current.issueNumber, { title: nextTitle, body: nextBody });
     await this.client.syncManagedLabels(current.issueNumber, nextLabels);
@@ -140,7 +139,7 @@ export class MemoryStore {
     if (!id) throw new Error("memoryId is empty");
     const mem = await this.get(id, "active");
     if (!mem) return null;
-    await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.sessionId, mem.kind, mem.topics));
+    await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.kind, mem.topics));
     await this.client.updateIssue(mem.issueNumber, { state: "closed" });
     return { ...mem, status: "stale" };
   }
@@ -148,7 +147,7 @@ export class MemoryStore {
   async syncFromConversation(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<boolean> {
     try {
       const decision = await this.generateDecision(session, snapshot);
-      const { savedCount, staledCount } = await this.applyDecision(session.sessionId, decision);
+      const { savedCount, staledCount } = await this.applyDecision(decision);
       if (savedCount > 0 || staledCount > 0)
         this.api.logger.info?.(`clawmem: synced memories for ${session.sessionId} (saved=${savedCount}, stale=${staledCount})`);
       return true;
@@ -199,7 +198,7 @@ export class MemoryStore {
   private parseIssue(issue: { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> }): ParsedMemoryIssue | null {
     const labels = extractLabelNames(issue.labels);
     if (!labels.includes("type:memory")) return null;
-    const sessionId = labelVal(labels, "session:"), kind = labelVal(labels, "kind:");
+    const kind = labelVal(labels, "kind:");
     const topics = labels.filter((l) => l.startsWith("topic:")).map((l) => l.slice(6).trim()).filter(Boolean);
     const rawBody = (issue.body ?? "").trim();
     const body = rawBody ? parseFlatYaml(rawBody) : {};
@@ -210,7 +209,6 @@ export class MemoryStore {
       issueNumber: issue.number, title: issue.title?.trim() || "",
       memoryId: body.memory_id?.trim() || String(issue.number),
       memoryHash: body.memory_hash?.trim() || undefined,
-      sessionId: sessionId || "legacy",
       date: body.date?.trim() || "1970-01-01",
       detail,
       ...(kind ? { kind } : {}),
@@ -219,7 +217,7 @@ export class MemoryStore {
     };
   }
 
-  private async applyDecision(sessionId: string, decision: MemoryDecision): Promise<{ savedCount: number; staledCount: number }> {
+  private async applyDecision(decision: MemoryDecision): Promise<{ savedCount: number; staledCount: number }> {
     const allActive = await this.listByStatus("active");
     const activeById = new Map(allActive.map((m) => [m.memoryId, m]));
     const activeByHash = new Map(allActive.map((m) => [m.memoryHash || sha256(norm(m.detail)), m]));
@@ -235,7 +233,7 @@ export class MemoryStore {
         activeByHash.set(hash, merged);
         continue;
       }
-      const labels = memLabels(sessionId, draft.kind, draft.topics);
+      const labels = memLabels(draft.kind, draft.topics);
       const date = localDate();
       const title = `${MEMORY_TITLE_PREFIX}${trunc(detail, 72)}`;
       const body = stringifyFlatYaml([["memory_hash", hash], ["date", date], ["detail", detail]]);
@@ -246,7 +244,6 @@ export class MemoryStore {
         title,
         memoryId: String(issue.number),
         memoryHash: hash,
-        sessionId,
         date,
         detail,
         ...(draft.kind ? { kind: draft.kind } : {}),
@@ -259,7 +256,7 @@ export class MemoryStore {
     for (const id of [...new Set(decision.stale.map((s) => s.trim()).filter(Boolean))]) {
       const mem = activeById.get(id);
       if (!mem) continue;
-      await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.sessionId, mem.kind, mem.topics));
+      await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.kind, mem.topics));
       await this.client.updateIssue(mem.issueNumber, { state: "closed" });
       staledCount++;
     }
@@ -318,7 +315,7 @@ export class MemoryStore {
     const sameKind = (memory.kind ?? "") === (nextKind ?? "");
     const sameTopics = JSON.stringify(currentTopics) === JSON.stringify(nextTopics);
     if (sameKind && sameTopics) return memory;
-    const labels = memLabels(memory.sessionId, nextKind, nextTopics);
+    const labels = memLabels(nextKind, nextTopics);
     await this.client.ensureLabels(labels);
     await this.client.syncManagedLabels(memory.issueNumber, labels);
     return {
@@ -329,10 +326,9 @@ export class MemoryStore {
   }
 }
 
-function memLabels(sessionId: string, kind?: string, topics?: string[]): string[] {
+function memLabels(kind?: string, topics?: string[]): string[] {
   return [
     "type:memory",
-    `session:${sessionId}`,
     ...(kind ? [`kind:${kind}`] : []),
     ...((topics ?? []).map((topic) => `topic:${topic}`)),
   ];

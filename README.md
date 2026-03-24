@@ -283,12 +283,6 @@ Full config with all options:
               token: "<token>"
             }
           },
-          issueTitlePrefix: "Session: ",
-          memoryTitlePrefix: "Memory: ",
-          defaultLabels: ["source:openclaw"],
-          agentLabelPrefix: "agent:",
-          autoCreateLabels: true,
-          closeIssueOnReset: true,
           turnCommentDelayMs: 1000,
           summaryWaitTimeoutMs: 120000,
           memoryRecallLimit: 5
@@ -310,6 +304,7 @@ Full config with all options:
 - Durable memories are extracted best-effort during later request-scoped maintenance, not by background subagent work after a request has already ended.
 - The plugin exposes `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
 - `memory_store` accepts optional schema hints such as kind and topics; the plugin normalizes them into managed `kind:*` and `topic:*` labels.
+- Memory issues no longer use `session:*` labels. Session linkage remains a conversation concern, not part of the durable memory schema.
 - `memory_update` updates one existing memory issue in place; use it for evolving canonical facts or active tasks instead of creating a duplicate node.
 - Conversation lifecycle is stored in native issue state (`open` while live, `closed` after finalize); memory lifecycle uses native issue state too (`open` active, `closed` stale).
 - Memory issue bodies store the durable detail plus flat metadata such as `memory_hash` and logical `date`; labels are reserved for schema and routing.
