@@ -74,6 +74,8 @@ function sanitizeState(value: unknown): PluginState {
       titleSource: readEnum(rawSession.titleSource, ["placeholder", "llm"]),
       lastMirroredCount: readNumber(rawSession.lastMirroredCount) ?? 0,
       turnCount: readNumber(rawSession.turnCount) ?? 0,
+      lastMemorySyncCount: readNumber(rawSession.lastMemorySyncCount),
+      summaryStatus: readEnum(rawSession.summaryStatus, ["pending", "complete"]),
       finalizedAt: readString(rawSession.finalizedAt),
       lastSummaryHash: readString(rawSession.lastSummaryHash),
       lastTurnHash: readString(rawSession.lastTurnHash),

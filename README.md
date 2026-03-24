@@ -4,8 +4,9 @@
 
 **What it does:**
 - Creates one `type:conversation` issue per session, mirrors the full transcript as comments.
-- On session end: auto-extracts durable memories and stores each as a `type:memory` issue.
+- During request-scoped hooks: best-effort extracts durable memories and stores each as a `type:memory` issue.
 - On session start: searches active memories by relevance and injects them into context.
+- Lets agents inspect memory indexes and schema, fetch exact memories, update canonical facts in place, and write structured memories with `kind:*` and `topic:*` labels through plugin tools.
 
 ---
 
@@ -33,10 +34,13 @@ Finally: your `IDENTITY.md` is not something you fill out on day one. It fills i
 
 ```bash
 openclaw plugins install @clawmem-ai/clawmem
+openclaw plugins enable clawmem
+openclaw config set plugins.slots.memory clawmem
+openclaw config validate
 openclaw gateway restart
 ```
 
-After restart, clawmem provisions per-agent memory repos on `git.clawmem.ai` as each agent is first used, then writes that agent's `token` + `repo` back into your config under `plugins.entries.clawmem.config.agents.<agentId>`. Memories start accumulating from that agent's next session.
+After restart, confirm OpenClaw shows ClawMem as the active memory plugin. clawmem then provisions per-agent memory repos on `git.clawmem.ai` as each agent is first used, then writes that agent's `token` + `repo` back into your config under `plugins.entries.clawmem.config.agents.<agentId>`. Memories start accumulating from that agent's next session.
 
 ---
 
@@ -75,7 +79,7 @@ Without it, every session starts from zero. With it, what you learn persists. On
 After installing clawmem, you have two memory systems running in parallel:
 
 1. **Workspace files** (`MEMORY.md`, `SOUL.md`, etc.) — always injected into every session via system prompt
-2. **clawmem** — auto-extracts memories at session end; selectively injects by relevance at session start
+2. **clawmem** — auto-extracts memories during request-scoped maintenance; selectively injects by relevance at session start
 
 These two systems do not sync. Without explicit rules, the agent defaults to the familiar path (workspace files), and the two systems start to contradict each other.
 
@@ -113,7 +117,7 @@ clawmem is my brain. One system per job — no exceptions:
 | What | Where |
 |---|---|
 | Credentials / API keys | `knowledge/MEMORY.md` (always injected) |
-| Everything I learn, conclude, or figure out | clawmem only — auto-captured at session end |
+| Everything I learn, conclude, or figure out | clawmem only — auto-captured during request-scoped maintenance |
 | Files | Only when a tool or another human needs to read them |
 | Workspace versioning | clawmem git service (not github.com) |
 
@@ -144,7 +148,7 @@ Strip everything except credentials. Add a header comment:
 
 ## Locking Key Insights Manually
 
-clawmem auto-extracts memories at session end — but important insights deserve to be locked immediately, not left to chance extraction.
+clawmem auto-extracts memories during later request-scoped maintenance — but important insights deserve to be locked immediately, not left to chance extraction.
 
 After any significant realization, create a memory issue directly:
 
@@ -158,7 +162,7 @@ curl -X POST "https://git.clawmem.ai/api/v3/repos/$CLAWMEM_REPO/issues" \
   -d '{
     "title": "Memory: <concise title>",
     "body": "<the insight, in plain language>",
-    "labels": ["type:memory", "memory-status:active"]
+    "labels": ["type:memory"]
   }'
 ```
 
@@ -189,7 +193,7 @@ GH_HOST=git.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
   gh issue create --repo <owner/team-memory> \
     --title "Memory: ..." \
     --body "..." \
-    --label "type:memory,memory-status:active,source:team"
+    --label "type:memory,source:team"
 ```
 
 **Read team memories:**
@@ -197,7 +201,8 @@ GH_HOST=git.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
 ```bash
 GH_HOST=git.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
   gh issue list --repo <owner/team-memory> \
-    --label "memory-status:active" \
+    --state open \
+    --label "type:memory" \
     --json number,title,body
 ```
 
@@ -282,10 +287,6 @@ Full config with all options:
           memoryTitlePrefix: "Memory: ",
           defaultLabels: ["source:openclaw"],
           agentLabelPrefix: "agent:",
-          activeStatusLabel: "status:active",
-          closedStatusLabel: "status:closed",
-          memoryActiveStatusLabel: "memory-status:active",
-          memoryStaleStatusLabel: "memory-status:stale",
           autoCreateLabels: true,
           closeIssueOnReset: true,
           turnCommentDelayMs: 1000,
@@ -304,6 +305,11 @@ Full config with all options:
 
 - Conversation comments exclude tool calls, tool results, system messages, and heartbeat noise.
 - Summary failures do not block finalization; the `summary` field is written as `failed: ...`.
-- Memory search and auto-injection only return `memory-status:active` issues.
-- Durable memories are auto-captured on session finalize — no memory tools are injected into the agent tool list.
-- Memory issue bodies store only the detail text; metadata comes from labels and issue number.
+- Memory search and auto-injection only return open `type:memory` issues. Closed memory issues are treated as stale.
+- `memory_recall` now prefers the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`; if backend search fails, clawmem falls back to local lexical ranking.
+- Durable memories are extracted best-effort during later request-scoped maintenance, not by background subagent work after a request has already ended.
+- The plugin exposes `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
+- `memory_store` accepts optional schema hints such as kind and topics; the plugin normalizes them into managed `kind:*` and `topic:*` labels.
+- `memory_update` updates one existing memory issue in place; use it for evolving canonical facts or active tasks instead of creating a duplicate node.
+- Conversation lifecycle is stored in native issue state (`open` while live, `closed` after finalize); memory lifecycle uses native issue state too (`open` active, `closed` stale).
+- Memory issue bodies store the durable detail plus flat metadata such as `memory_hash` and logical `date`; labels are reserved for schema and routing.

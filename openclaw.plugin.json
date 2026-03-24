@@ -148,16 +148,20 @@
       "help": "Dynamic agent label prefix, for example agent:coder."
     },
     "activeStatusLabel": {
-      "label": "Active Status Label"
+      "label": "Active Status Label",
+      "help": "Deprecated compatibility setting. Conversation lifecycle now uses native issue state."
     },
     "closedStatusLabel": {
-      "label": "Closed Status Label"
+      "label": "Closed Status Label",
+      "help": "Deprecated compatibility setting. Conversation lifecycle now uses native issue state."
     },
     "memoryActiveStatusLabel": {
-      "label": "Memory Active Status Label"
+      "label": "Memory Active Status Label",
+      "help": "Deprecated compatibility setting. Memory lifecycle now uses native issue state."
     },
     "memoryStaleStatusLabel": {
-      "label": "Memory Stale Status Label"
+      "label": "Memory Stale Status Label",
+      "help": "Deprecated compatibility setting. Memory lifecycle now uses native issue state."
     },
     "autoCreateLabels": {
       "label": "Auto Create Labels"

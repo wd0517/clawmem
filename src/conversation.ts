@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { AGENT_LABEL_PREFIX, DEFAULT_LABELS, LABEL_ACTIVE, LABEL_CLOSED, SESSION_TITLE_PREFIX, extractLabelNames } from "./config.js";
+import { AGENT_LABEL_PREFIX, DEFAULT_LABELS, SESSION_TITLE_PREFIX, extractLabelNames } from "./config.js";
 import type { GitHubIssueClient } from "./github-client.js";
 import { normalizeMessages, readTranscriptSnapshot } from "./transcript.js";
 import type { ClawMemPluginConfig, NormalizedMessage, SessionMirrorState, TranscriptSnapshot } from "./types.js";
@@ -263,20 +263,18 @@ export class ConversationMirror {
     }
   }
 
-  private buildLabels(session: SessionMirrorState, snapshot: TranscriptSnapshot, closed: boolean): string[] {
-    const dates = this.resolveDates(session, snapshot.messages);
-    const labels = new Set([...DEFAULT_LABELS, "type:conversation", `session:${session.sessionId}`, `date:${dates.date}`]);
+  private buildLabels(session: SessionMirrorState, _snapshot: TranscriptSnapshot, _closed: boolean): string[] {
+    const labels = new Set([...DEFAULT_LABELS, "type:conversation", `session:${session.sessionId}`]);
     if (session.agentId) labels.add(`${AGENT_LABEL_PREFIX}${session.agentId}`);
-    labels.add(closed ? LABEL_CLOSED : LABEL_ACTIVE);
     return [...labels].filter((l) => l.trim().length > 0);
   }
 
-  private renderBody(session: SessionMirrorState, snapshot: TranscriptSnapshot, summary: string, closed: boolean): string {
+  private renderBody(session: SessionMirrorState, snapshot: TranscriptSnapshot, summary: string, _closed: boolean): string {
     const dates = this.resolveDates(session, snapshot.messages);
     return stringifyFlatYaml([
       ["type", "conversation"], ["session_id", session.sessionId], ["date", dates.date],
       ["start_at", dates.startAt], ["end_at", dates.endAt],
-      ["status", closed ? "closed" : "active"], ["summary", summary],
+      ["summary", summary],
     ]);
   }
 

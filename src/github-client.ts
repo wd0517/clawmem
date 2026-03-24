@@ -3,11 +3,17 @@ import { resolveLabelColor, labelDescription, extractLabelNames, isManagedLabel 
 import type { AnonymousSessionResponse, ClawMemResolvedRoute } from "./types.js";
 
 type IssueResponse = { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> };
+type SearchIssuesResponse = { items?: IssueResponse[]; total_count?: number; incomplete_results?: boolean };
 type CommentResponse = { id?: number; body?: string; created_at?: string };
+type LabelResponse = { name?: string; color?: string; description?: string };
 type ReqOpts = { allowNotFound?: boolean; allowValidationError?: boolean; omitAuth?: boolean };
 
 export class GitHubIssueClient {
   constructor(private readonly config: ClawMemResolvedRoute, private readonly log: { warn?: (msg: string) => void }) {}
+
+  repo(): string | undefined {
+    return this.config.repo?.trim() || undefined;
+  }
 
   async createIssue(params: { title: string; body: string; labels: string[] }): Promise<IssueResponse> {
     return this.req<IssueResponse>(this.repoPath("issues"), { method: "POST", body: JSON.stringify(params) });
@@ -32,6 +38,20 @@ export class GitHubIssueClient {
     q.set("state", params.state ?? "open"); q.set("page", String(params.page ?? 1)); q.set("per_page", String(params.perPage ?? 100));
     if (params.labels?.length) q.set("labels", params.labels.join(","));
     return this.req<IssueResponse[]>(`${this.repoPath("issues")}?${q}`, { method: "GET" });
+  }
+  async searchIssues(query: string, params?: { page?: number; perPage?: number }): Promise<IssueResponse[]> {
+    const q = new URLSearchParams();
+    q.set("q", query);
+    q.set("page", String(params?.page ?? 1));
+    q.set("per_page", String(params?.perPage ?? 100));
+    const res = await this.req<SearchIssuesResponse>(`search/issues?${q}`, { method: "GET" });
+    return Array.isArray(res?.items) ? res.items : [];
+  }
+  async listLabels(params?: { page?: number; perPage?: number }): Promise<LabelResponse[]> {
+    const q = new URLSearchParams();
+    q.set("page", String(params?.page ?? 1));
+    q.set("per_page", String(params?.perPage ?? 100));
+    return this.req<LabelResponse[]>(`${this.repoPath("labels")}?${q}`, { method: "GET" });
   }
   async ensureLabels(labels: string[]): Promise<void> {
     for (const label of labels) {
