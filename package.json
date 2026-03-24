@@ -1,6 +1,6 @@
 {
   "name": "@clawmem-ai/clawmem",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Mirror OpenClaw sessions into GitHub-compatible issues and comments.",
   "type": "module",
   "license": "MIT",
