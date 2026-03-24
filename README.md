@@ -6,7 +6,6 @@
 - Creates one `type:conversation` issue per session, mirrors the full transcript as comments.
 - During request-scoped hooks: best-effort extracts durable memories and stores each as a `type:memory` issue.
 - On session start: searches active memories by relevance and injects them into context.
-- Optionally uses hybrid lexical + vector search for stronger `memory_recall` when an OpenAI-compatible embeddings endpoint is configured.
 - Lets agents inspect memory indexes and schema, fetch exact memories, update canonical facts in place, and write structured memories with `kind:*` and `topic:*` labels through plugin tools.
 
 ---
@@ -292,14 +291,7 @@ Full config with all options:
           closeIssueOnReset: true,
           turnCommentDelayMs: 1000,
           summaryWaitTimeoutMs: 120000,
-          memoryRecallLimit: 5,
-          embeddingsBaseUrl: "https://api.openai.com/v1",
-          embeddingsApiKey: "<optional-api-key>",
-          embeddingsModel: "text-embedding-3-small",
-          embeddingsAuthScheme: "bearer",
-          semanticSearchWeight: 0.65,
-          semanticSearchMaxCandidates: 200,
-          semanticSearchBatchSize: 64
+          memoryRecallLimit: 5
         }
       }
     }
@@ -314,7 +306,6 @@ Full config with all options:
 - Conversation comments exclude tool calls, tool results, system messages, and heartbeat noise.
 - Summary failures do not block finalization; the `summary` field is written as `failed: ...`.
 - Memory search and auto-injection only return open `type:memory` issues. Closed memory issues are treated as stale.
-- If `embeddingsApiKey` and `embeddingsModel` are configured, `memory_recall` uses hybrid lexical + vector ranking against an OpenAI-compatible embeddings endpoint. Without them it stays lexical-only.
 - Durable memories are extracted best-effort during later request-scoped maintenance, not by background subagent work after a request has already ended.
 - The plugin exposes `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
 - `memory_store` accepts optional schema hints such as kind and topics; the plugin normalizes them into managed `kind:*` and `topic:*` labels.

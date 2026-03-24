@@ -100,46 +100,6 @@
         "minimum": 1,
         "maximum": 20
       },
-      "embeddingsBaseUrl": {
-        "type": "string",
-        "minLength": 1,
-        "default": "https://api.openai.com/v1"
-      },
-      "embeddingsApiKey": {
-        "type": "string",
-        "minLength": 1
-      },
-      "embeddingsModel": {
-        "type": "string",
-        "minLength": 1
-      },
-      "embeddingsAuthScheme": {
-        "type": "string",
-        "enum": ["token", "bearer"],
-        "default": "bearer"
-      },
-      "embeddingsDimensions": {
-        "type": "integer",
-        "minimum": 1
-      },
-      "semanticSearchWeight": {
-        "type": "number",
-        "minimum": 0,
-        "maximum": 1,
-        "default": 0.65
-      },
-      "semanticSearchMaxCandidates": {
-        "type": "integer",
-        "minimum": 20,
-        "maximum": 1000,
-        "default": 200
-      },
-      "semanticSearchBatchSize": {
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 256,
-        "default": 64
-      },
       "labelColor": {
         "type": "string",
         "pattern": "^#?[0-9a-fA-F]{6}$"
@@ -220,41 +180,6 @@
     "memoryRecallLimit": {
       "label": "Memory Recall Limit",
       "help": "Maximum number of active memories injected into context before an agent starts."
-    },
-    "embeddingsBaseUrl": {
-      "label": "Embeddings Base URL",
-      "placeholder": "https://api.openai.com/v1",
-      "help": "Optional OpenAI-compatible embeddings endpoint for hybrid semantic recall."
-    },
-    "embeddingsApiKey": {
-      "label": "Embeddings API Key",
-      "sensitive": true,
-      "help": "Optional API key used for hybrid semantic recall."
-    },
-    "embeddingsModel": {
-      "label": "Embeddings Model",
-      "placeholder": "text-embedding-3-small",
-      "help": "Optional embeddings model name. When set with an API key, memory_recall uses hybrid lexical + vector ranking."
-    },
-    "embeddingsAuthScheme": {
-      "label": "Embeddings Auth Scheme",
-      "help": "Authorization scheme for the embeddings endpoint."
-    },
-    "embeddingsDimensions": {
-      "label": "Embeddings Dimensions",
-      "help": "Optional dimensions override for providers that support dimension down-projection."
-    },
-    "semanticSearchWeight": {
-      "label": "Semantic Search Weight",
-      "help": "Blend ratio for hybrid recall. 0 = lexical only, 1 = semantic only."
-    },
-    "semanticSearchMaxCandidates": {
-      "label": "Semantic Search Max Candidates",
-      "help": "Maximum number of active memories to score semantically during one recall."
-    },
-    "semanticSearchBatchSize": {
-      "label": "Semantic Search Batch Size",
-      "help": "Batch size used when requesting memory embeddings from the configured embeddings provider."
     },
     "labelColor": {
       "label": "Fallback Label Color",
