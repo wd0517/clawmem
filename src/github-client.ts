@@ -1,6 +1,6 @@
 // GitHub Issues API client for clawmem. No label caching — idempotent create-if-absent.
 import { resolveLabelColor, labelDescription, extractLabelNames, isManagedLabel } from "./config.js";
-import type { AnonymousSessionResponse, ClawMemResolvedRoute } from "./types.js";
+import type { AgentRegistrationResponse, AnonymousSessionResponse, ClawMemResolvedRoute } from "./types.js";
 
 type IssueResponse = { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> };
 type SearchIssuesResponse = { items?: IssueResponse[]; total_count?: number; incomplete_results?: boolean };
@@ -88,6 +88,15 @@ export class GitHubIssueClient {
   }
   async updateRepoDescription(description: string): Promise<void> {
     await this.req(this.repoPath("").replace(/\/$/, ""), { method: "PATCH", body: JSON.stringify({ description }) });
+  }
+  async registerAgent(prefixLogin: string, defaultRepoName: string): Promise<AgentRegistrationResponse> {
+    return this.req<AgentRegistrationResponse>("agents", {
+      method: "POST",
+      body: JSON.stringify({
+        prefix_login: prefixLogin,
+        default_repo_name: defaultRepoName,
+      }),
+    }, { omitAuth: true });
   }
   async createAnonymousSession(locale?: string): Promise<AnonymousSessionResponse> {
     const body = locale ? JSON.stringify({ locale }) : undefined;

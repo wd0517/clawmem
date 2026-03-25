@@ -7,8 +7,8 @@ import { KeyedAsyncQueue } from "./keyed-async-queue.js";
 import { MemoryStore } from "./memory.js";
 import { loadState, resolveStatePath, saveState } from "./state.js";
 import { readTranscriptSnapshot } from "./transcript.js";
-import type { ClawMemPluginConfig, ClawMemResolvedRoute, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
-import { inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
+import type { BootstrapIdentityResponse, ClawMemPluginConfig, ClawMemResolvedRoute, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import { buildAgentBootstrapRegistration, inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
 
 type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; messages: unknown[] };
 type FinalizePayload = { sessionId?: string; sessionKey?: string; sessionFile?: string; agentId?: string; reason?: string; messages?: unknown[] };
@@ -561,19 +561,39 @@ class ClawMemService {
     if (!route.baseUrl) { this.api.logger.warn(`clawmem: cannot provision Git credentials for ${agentId} without a baseUrl`); return false; }
     try {
       const client = new GitHubIssueClient(route, this.api.logger);
-      const locale = Intl?.DateTimeFormat?.()?.resolvedOptions?.()?.locale ?? "";
-      const sess = await client.createAnonymousSession(locale);
-      await this.persistAgentConfig(agentId, { baseUrl: route.baseUrl, authScheme: "token", token: sess.token, defaultRepo: sess.repo_full_name });
+      const bootstrap = await this.provisionAgentIdentity(client, agentId);
+      await this.persistAgentConfig(agentId, {
+        baseUrl: route.baseUrl,
+        authScheme: "token",
+        token: bootstrap.identity.token,
+        defaultRepo: bootstrap.identity.repo_full_name,
+      });
       this.config.agents[agentId] = {
         ...(this.config.agents[agentId] ?? {}),
         baseUrl: route.baseUrl,
         authScheme: "token",
-        token: sess.token,
-        defaultRepo: sess.repo_full_name,
+        token: bootstrap.identity.token,
+        defaultRepo: bootstrap.identity.repo_full_name,
       };
-      this.api.logger.info?.(`clawmem: provisioned Git credentials for agent ${agentId} with default repo ${sess.repo_full_name} via ${route.baseUrl}`);
+      this.api.logger.info?.(
+        `clawmem: provisioned Git credentials for agent ${agentId} with default repo ${bootstrap.identity.repo_full_name} via ${route.baseUrl} (${bootstrap.method})`,
+      );
       return true;
     } catch (error) { this.api.logger.warn(`clawmem: failed to provision Git credentials for agent ${agentId} via ${route.baseUrl}: ${String(error)}`); return false; }
+  }
+  private async provisionAgentIdentity(client: GitHubIssueClient, agentId: string): Promise<{ identity: BootstrapIdentityResponse; method: string }> {
+    const registration = buildAgentBootstrapRegistration(agentId);
+    try {
+      const identity = await client.registerAgent(registration.prefixLogin, registration.defaultRepoName);
+      return { identity, method: "/api/v3/agents" };
+    } catch (error) {
+      if (!shouldFallbackToAnonymousBootstrap(error)) throw error;
+      this.api.logger.warn?.(`clawmem: /api/v3/agents is unavailable for agent ${agentId}; falling back to deprecated anonymous bootstrap`);
+    }
+
+    const locale = Intl?.DateTimeFormat?.()?.resolvedOptions?.()?.locale ?? "";
+    const identity = await client.createAnonymousSession(locale);
+    return { identity, method: "/api/v3/anonymous/session" };
   }
   private warnIfInactiveMemorySlot(): void {
     try {
@@ -741,6 +761,10 @@ class ClawMemService {
 }
 
 function asRecord(v: unknown): Record<string, unknown> { return v && typeof v === "object" ? (v as Record<string, unknown>) : {}; }
+function shouldFallbackToAnonymousBootstrap(error: unknown): boolean {
+  const msg = String(error);
+  return /^Error:\s*HTTP (404|405|501):/i.test(msg) || /^HTTP (404|405|501):/i.test(msg);
+}
 function toolText(text: string): { content: Array<{ type: "text"; text: string }> } {
   return { content: [{ type: "text", text }] };
 }

@@ -4,6 +4,9 @@ import path from "node:path";
 import type { NormalizedMessage } from "./types.js";
 
 export const DEFAULT_AGENT_ID = "main";
+export const DEFAULT_BOOTSTRAP_REPO_NAME = "memory";
+
+const MAX_AGENT_LOGIN_PREFIX_LEN = 32;
 
 export function sha256(v: string): string { return crypto.createHash("sha256").update(v).digest("hex"); }
 
@@ -11,6 +14,16 @@ export function normalizeAgentId(value: string | undefined | null): string {
   const trimmed = (value ?? "").trim().toLowerCase();
   if (!trimmed) return DEFAULT_AGENT_ID;
   return trimmed.replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64) || DEFAULT_AGENT_ID;
+}
+
+export function buildAgentBootstrapRegistration(agentId: string): { prefixLogin: string; defaultRepoName: string } {
+  const prefixLogin = normalizeAgentId(agentId)
+    .replace(/_/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, MAX_AGENT_LOGIN_PREFIX_LEN)
+    .replace(/-+$/g, "") || DEFAULT_AGENT_ID;
+  return { prefixLogin, defaultRepoName: DEFAULT_BOOTSTRAP_REPO_NAME };
 }
 
 export function sessionScopeKey(sessionId: string, agentId?: string): string {
