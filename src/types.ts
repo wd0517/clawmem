@@ -28,7 +28,9 @@ export type ClawMemResolvedRoute = {
   authScheme: "token" | "bearer";
 };
 
-export type AnonymousSessionResponse = { token: string; owner_login: string; repo_name: string; repo_full_name: string };
+export type BootstrapIdentityResponse = { token: string; repo_full_name: string };
+export type AgentRegistrationResponse = BootstrapIdentityResponse & { login: string };
+export type AnonymousSessionResponse = BootstrapIdentityResponse & { owner_login: string; repo_name: string };
 export type SessionMirrorState = {
   sessionId: string; sessionKey?: string; sessionFile?: string; agentId?: string;
   issueNumber?: number; issueTitle?: string; titleSource?: "placeholder" | "llm";

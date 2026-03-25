@@ -1,5 +1,6 @@
 import { hasDefaultRepo, isAgentConfigured, resolveAgentRoute } from "./config.js";
 import type { ClawMemPluginConfig } from "./types.js";
+import { buildAgentBootstrapRegistration, DEFAULT_BOOTSTRAP_REPO_NAME } from "./utils.js";
 
 function assert(condition: unknown, message: string): void {
   if (!condition) throw new Error(message);
@@ -59,9 +60,23 @@ function testIdentityOnlyStillConfigured(): void {
   assert(hasDefaultRepo(route) === false, "expected no default repo when only credentials are present");
 }
 
+function testBootstrapRegistrationUsesStableDefaults(): void {
+  const registration = buildAgentBootstrapRegistration("Main_Coder");
+  assert(registration.prefixLogin === "main-coder", "expected agent bootstrap login prefix to match backend format");
+  assert(registration.defaultRepoName === DEFAULT_BOOTSTRAP_REPO_NAME, "expected bootstrap repo name to use the stable default");
+}
+
+function testBootstrapRegistrationTrimsLongPrefixes(): void {
+  const registration = buildAgentBootstrapRegistration("___THIS_IS_A_SUPER_LONG_AGENT_ID_THAT_SHOULD_BE_TRIMMED___");
+  assert(/^[a-z0-9][a-z0-9-]*$/.test(registration.prefixLogin), "expected bootstrap login prefix to satisfy backend validation");
+  assert(registration.prefixLogin.length <= 32, "expected bootstrap login prefix to fit backend max length");
+}
+
 testDefaultRepoResolution();
 testRepoOverride();
 testLegacyRepoFallback();
 testIdentityOnlyStillConfigured();
+testBootstrapRegistrationUsesStableDefaults();
+testBootstrapRegistrationTrimsLongPrefixes();
 
 console.log("config tests passed");
