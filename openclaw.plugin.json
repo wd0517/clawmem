@@ -13,6 +13,10 @@
         "minLength": 1,
         "default": "https://git.clawmem.ai"
       },
+      "defaultRepo": {
+        "type": "string",
+        "pattern": "^[^/]+/[^/]+$"
+      },
       "repo": {
         "type": "string",
         "pattern": "^[^/]+/[^/]+$"
@@ -35,6 +39,10 @@
             "baseUrl": {
               "type": "string",
               "minLength": 1
+            },
+            "defaultRepo": {
+              "type": "string",
+              "pattern": "^[^/]+/[^/]+$"
             },
             "repo": {
               "type": "string",
@@ -74,10 +82,15 @@
       "placeholder": "https://git.clawmem.ai",
       "help": "GitHub-compatible API base URL. Root URLs are normalized to /api/v3 automatically."
     },
+    "defaultRepo": {
+      "label": "Default Repo",
+      "placeholder": "owner/repo",
+      "help": "Default memory repo for automatic flows and for tool calls that do not specify repo explicitly."
+    },
     "repo": {
       "label": "Repository",
       "placeholder": "owner/repo",
-      "help": "Legacy single-route setting. New installs should use per-agent routes under agents.<agentId>."
+      "help": "Legacy alias for defaultRepo. New installs should use defaultRepo or per-agent defaultRepo under agents.<agentId>."
     },
     "token": {
       "label": "API Token",
@@ -90,7 +103,7 @@
     },
     "agents": {
       "label": "Agent Routes",
-      "help": "Per-agent ClawMem credentials keyed by agent id. Missing repo/token are provisioned automatically on first use."
+      "help": "Per-agent ClawMem identities keyed by agent id. Each identity has credentials plus an optional defaultRepo."
     },
     "turnCommentDelayMs": {
       "label": "Turn Sync Delay (ms)",

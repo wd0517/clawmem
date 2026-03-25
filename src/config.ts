@@ -31,6 +31,7 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
     const agent = rawAgentConfig as Record<string, unknown>;
     agents[agentId] = {
       baseUrl: str(agent.baseUrl)?.replace(/\/+$/, ""),
+      defaultRepo: normalizeRepoName(str(agent.defaultRepo) ?? str(agent.repo)),
       repo: str(agent.repo),
       token: str(agent.token),
       authScheme: agent.authScheme === "bearer" ? "bearer" : agent.authScheme === "token" ? "token" : undefined,
@@ -38,6 +39,9 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
   }
   return {
     baseUrl: baseUrl.endsWith("/api/v3") ? baseUrl : `${baseUrl}/api/v3`,
+    defaultRepo: normalizeRepoName(str(raw.defaultRepo) ?? str(raw.repo)),
+    repo: normalizeRepoName(str(raw.repo)),
+    token: str(raw.token),
     authScheme: raw.authScheme === "bearer" ? "bearer" : "token",
     agents,
     memoryRecallLimit: clamp(num(raw.memoryRecallLimit, 5), 1, 20),
@@ -46,21 +50,28 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
   };
 }
 
-export function resolveAgentRoute(config: ClawMemPluginConfig, agentId?: string): ClawMemResolvedRoute {
+export function resolveAgentRoute(config: ClawMemPluginConfig, agentId?: string, repoOverride?: string): ClawMemResolvedRoute {
   const id = normalizeAgentId(agentId);
   const agent = config.agents[id] ?? {};
   const baseUrl = (agent.baseUrl ?? config.baseUrl).replace(/\/+$/, "");
+  const defaultRepo = normalizeRepoName(agent.defaultRepo ?? agent.repo) ?? config.defaultRepo ?? normalizeRepoName(config.repo);
+  const repo = normalizeRepoName(repoOverride) ?? defaultRepo;
   return {
     agentId: id,
     baseUrl: baseUrl.endsWith("/api/v3") ? baseUrl : `${baseUrl}/api/v3`,
-    repo: agent.repo?.trim() || undefined,
-    token: agent.token?.trim() || undefined,
-    authScheme: agent.authScheme === "bearer" ? "bearer" : config.authScheme,
+    ...(defaultRepo ? { defaultRepo } : {}),
+    ...(repo ? { repo } : {}),
+    token: agent.token?.trim() || config.token?.trim() || undefined,
+    authScheme: agent.authScheme === "bearer" ? "bearer" : agent.authScheme === "token" ? "token" : config.authScheme,
   };
 }
 
 export function isAgentConfigured(route: ClawMemResolvedRoute): boolean {
-  return Boolean(route.baseUrl && route.repo && route.token);
+  return Boolean(route.baseUrl && route.token);
+}
+
+export function hasDefaultRepo(route: ClawMemResolvedRoute): boolean {
+  return Boolean(route.defaultRepo);
 }
 
 export function resolveLabelColor(label: string): string {
@@ -96,4 +107,10 @@ export function extractLabelNames(labels: Array<{ name?: string } | string> | un
 export function labelVal(labels: string[], prefix: string): string | undefined {
   const m = labels.find((l) => l.startsWith(prefix));
   return m ? m.slice(prefix.length).trim() || undefined : undefined;
+}
+
+function normalizeRepoName(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim().replace(/^\/+|\/+$/g, "");
+  return /^[^/\s]+\/[^/\s]+$/.test(trimmed) ? trimmed : undefined;
 }

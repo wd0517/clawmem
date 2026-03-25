@@ -40,7 +40,7 @@ openclaw config validate
 openclaw gateway restart
 ```
 
-After restart, confirm OpenClaw shows ClawMem as the active memory plugin. clawmem then provisions per-agent memory repos on `git.clawmem.ai` as each agent is first used, then writes that agent's `token` + `repo` back into your config under `plugins.entries.clawmem.config.agents.<agentId>`. Memories start accumulating from that agent's next session.
+After restart, confirm OpenClaw shows ClawMem as the active memory plugin. clawmem then provisions a per-agent ClawMem identity on `git.clawmem.ai` and writes that agent's `token` + `defaultRepo` back into your config under `plugins.entries.clawmem.config.agents.<agentId>`. Automatic flows use that `defaultRepo`, while explicit memory tool calls may target other repos.
 
 ---
 
@@ -274,12 +274,12 @@ Full config with all options:
           agents: {
             main: {
               baseUrl: "https://git.clawmem.ai/api/v3",
-              repo: "owner/main-memory",
+              defaultRepo: "owner/main-memory",
               token: "<token>",
               authScheme: "token"
             },
             coder: {
-              repo: "owner/coder-memory",
+              defaultRepo: "owner/coder-memory",
               token: "<token>"
             }
           },
@@ -302,7 +302,8 @@ Full config with all options:
 - Memory search and auto-injection only return open `type:memory` issues. Closed memory issues are treated as stale.
 - `memory_recall` now prefers the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`; if backend search fails, clawmem falls back to local lexical ranking.
 - Durable memories are extracted best-effort during later request-scoped maintenance, not by background subagent work after a request has already ended.
-- The plugin exposes `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
+- The plugin exposes `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
+- Route resolution is now: agent identity supplies credentials, `defaultRepo` is the fallback memory space, and explicit tool calls may override repo per operation.
 - `memory_store` accepts optional schema hints such as kind and topics; the plugin normalizes them into managed `kind:*` and `topic:*` labels.
 - Memory issues no longer use `session:*` labels. Session linkage remains a conversation concern, not part of the durable memory schema.
 - `memory_update` updates one existing memory issue in place; use it for evolving canonical facts or active tasks instead of creating a duplicate node.

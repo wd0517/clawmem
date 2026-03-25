@@ -1,13 +1,13 @@
 // Thin orchestrator: wires conversation mirroring, memory store, and plugin lifecycle.
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { isAgentConfigured, resolveAgentRoute, resolvePluginConfig } from "./config.js";
+import { hasDefaultRepo, isAgentConfigured, resolveAgentRoute, resolvePluginConfig } from "./config.js";
 import { ConversationMirror } from "./conversation.js";
 import { GitHubIssueClient } from "./github-client.js";
 import { KeyedAsyncQueue } from "./keyed-async-queue.js";
 import { MemoryStore } from "./memory.js";
 import { loadState, resolveStatePath, saveState } from "./state.js";
 import { readTranscriptSnapshot } from "./transcript.js";
-import type { ClawMemPluginConfig, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import type { ClawMemPluginConfig, ClawMemResolvedRoute, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
 
 type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; messages: unknown[] };
@@ -46,7 +46,8 @@ class ClawMemService {
           void this.track(this.handleTranscript(u.sessionFile)).catch((e) => this.warn("transcript update", e));
         });
         const configuredCount = Object.keys(this.config.agents).filter((agentId) => {
-          return isAgentConfigured(resolveAgentRoute(this.config, agentId));
+          const route = resolveAgentRoute(this.config, agentId);
+          return isAgentConfigured(route) && hasDefaultRepo(route);
         }).length;
         this.api.logger.info?.(
           configuredCount > 0
@@ -65,6 +66,86 @@ class ClawMemService {
 
   private registerTools(): void {
     this.api.registerTool({
+      name: "memory_repos",
+      description: "List the memory repos the current ClawMem agent identity can access so the agent can choose the right space before retrieving or storing memory.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        const repos = await resolved.client.listUserRepos();
+        if (repos.length === 0) return toolText(`Agent "${agentId}" has no accessible ClawMem repos yet.`);
+        const lines = [
+          `Accessible ClawMem repos for agent "${agentId}":`,
+          ...repos
+            .map((repo) => {
+              const fullName = repo.full_name?.trim() || repo.name?.trim() || "unknown";
+              const flags = [
+                resolved.route.defaultRepo === fullName ? "default" : "",
+                repo.private ? "private" : "shared",
+              ].filter(Boolean).join(", ");
+              const description = repo.description?.trim() ? ` - ${repo.description.trim()}` : "";
+              return `- ${fullName}${flags ? ` [${flags}]` : ""}${description}`;
+            }),
+        ];
+        return toolText(lines.join("\n"));
+      },
+    });
+
+    this.api.registerTool({
+      name: "memory_repo_create",
+      description: "Create a new ClawMem repo under the current agent identity when the agent decides a new memory space is needed.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          name: { type: "string", minLength: 1, description: "Repository name only, without owner prefix." },
+          description: { type: "string", minLength: 1, description: "Optional repo description." },
+          private: { type: "boolean", description: "Whether the new repo should be private. Defaults to true." },
+          setDefault: { type: "boolean", description: "Whether to make the new repo this agent's default memory repo." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["name"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const name = typeof p.name === "string" ? p.name.trim() : "";
+        if (!name) return toolText("name is empty.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        const created = await resolved.client.createUserRepo({
+          name,
+          ...(typeof p.description === "string" && p.description.trim() ? { description: p.description.trim() } : {}),
+          ...(typeof p.private === "boolean" ? { private: p.private } : {}),
+        });
+        const fullName = created.full_name?.trim() || created.name?.trim() || name;
+        let defaultNote = "";
+        const shouldSetDefault = p.setDefault === true || !resolved.route.defaultRepo;
+        if (shouldSetDefault && fullName.includes("/")) {
+          await this.persistAgentConfig(agentId, {
+            baseUrl: resolved.route.baseUrl,
+            authScheme: resolved.route.authScheme,
+            token: resolved.route.token!,
+            defaultRepo: fullName,
+          });
+          this.config.agents[agentId] = { ...(this.config.agents[agentId] ?? {}), defaultRepo: fullName };
+          defaultNote = resolved.route.defaultRepo ? "\nSet as default repo for this agent." : "\nSet as the first default repo for this agent.";
+        }
+        return toolText(`Created memory repo ${fullName}.${defaultNote}`);
+      },
+    });
+
+    this.api.registerTool({
       name: "memory_list",
       description: "List ClawMem memories by status or schema so the agent can inspect the current memory index before deduping or saving.",
       required: true,
@@ -76,25 +157,26 @@ class ClawMemService {
           kind: { type: "string", minLength: 1, description: "Optional kind filter, for example core-fact, lesson, or task." },
           topic: { type: "string", minLength: 1, description: "Optional topic filter." },
           limit: { type: "integer", minimum: 1, maximum: 200, description: "Maximum number of memories to return." },
+          repo: { type: "string", minLength: 3, description: "Optional memory repo override in owner/repo form. Defaults to the agent's defaultRepo." },
           agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
         },
       },
       execute: async (_id: string, params: unknown) => {
         const p = asRecord(params);
         const agentId = this.resolveToolAgentId(p.agentId);
-        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
-        const { mem } = this.getServices(agentId);
+        const resolved = await this.requireToolRoute(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
         const status = p.status === "stale" || p.status === "all" ? p.status : "active";
         const limit = typeof p.limit === "number" && Number.isFinite(p.limit) ? Math.floor(p.limit) : 20;
         const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
         const topic = typeof p.topic === "string" && p.topic.trim() ? p.topic.trim() : undefined;
-        const memories = await mem.listMemories({ status, kind, topic, limit });
+        const memories = await resolved.mem.listMemories({ status, kind, topic, limit });
         if (memories.length === 0) {
           const filters = [status !== "active" ? `status=${status}` : "", kind ? `kind=${kind}` : "", topic ? `topic=${topic}` : ""].filter(Boolean).join(", ");
-          return toolText(`No memories matched${filters ? ` (${filters})` : ""}.`);
+          return toolText(`No memories matched in ${resolved.route.repo}${filters ? ` (${filters})` : ""}.`);
         }
         const lines = [
-          `Found ${memories.length} ${status === "all" ? "" : `${status} `}memor${memories.length === 1 ? "y" : "ies"}:`,
+          `Found ${memories.length} ${status === "all" ? "" : `${status} `}memor${memories.length === 1 ? "y" : "ies"} in ${resolved.route.repo}:`,
           ...memories.map((memory) => `- ${renderMemoryLine(memory)}`),
         ];
         return toolText(lines.join("\n"));
@@ -109,6 +191,7 @@ class ClawMemService {
         type: "object",
         additionalProperties: false,
         properties: {
+          repo: { type: "string", minLength: 3, description: "Optional memory repo override in owner/repo form. Defaults to the agent's defaultRepo." },
           agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
           limitTopics: { type: "integer", minimum: 1, maximum: 200, description: "Maximum number of topic labels to display." },
         },
@@ -116,16 +199,16 @@ class ClawMemService {
       execute: async (_id: string, params: unknown) => {
         const p = asRecord(params);
         const agentId = this.resolveToolAgentId(p.agentId);
-        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
-        const { mem } = this.getServices(agentId);
-        const schema = await mem.listSchema();
+        const resolved = await this.requireToolRoute(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
+        const schema = await resolved.mem.listSchema();
         const rawLimit = typeof p.limitTopics === "number" && Number.isFinite(p.limitTopics) ? Math.floor(p.limitTopics) : 50;
         const limitTopics = Math.min(200, Math.max(1, rawLimit));
         const kinds = schema.kinds.length > 0 ? schema.kinds.map((kind) => `- kind:${kind}`).join("\n") : "- None";
         const topics = schema.topics.length > 0 ? schema.topics.slice(0, limitTopics).map((topic) => `- topic:${topic}`).join("\n") : "- None";
         const extra = schema.topics.length > limitTopics ? `\n- ...and ${schema.topics.length - limitTopics} more topics` : "";
         return toolText([
-          "Current ClawMem schema labels:",
+          `Current ClawMem schema labels in ${resolved.route.repo}:`,
           "",
           "Kinds:",
           kinds,
@@ -146,6 +229,7 @@ class ClawMemService {
         properties: {
           query: { type: "string", minLength: 1, description: "What to recall from memory." },
           limit: { type: "integer", minimum: 1, maximum: 20, description: "Maximum number of memories to return." },
+          repo: { type: "string", minLength: 3, description: "Optional memory repo override in owner/repo form. Defaults to the agent's defaultRepo." },
           agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
         },
         required: ["query"],
@@ -155,14 +239,14 @@ class ClawMemService {
         const query = typeof p.query === "string" ? p.query.trim() : "";
         if (!query) return toolText("Query is empty.");
         const agentId = this.resolveToolAgentId(p.agentId);
-        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
-        const { mem } = this.getServices(agentId);
+        const resolved = await this.requireToolRoute(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
         const rawLimit = typeof p.limit === "number" && Number.isFinite(p.limit) ? Math.floor(p.limit) : this.config.memoryRecallLimit;
         const limit = Math.min(20, Math.max(1, rawLimit));
-        const memories = await mem.search(query, limit);
-        if (memories.length === 0) return toolText(`No active memories matched "${query}".`);
+        const memories = await resolved.mem.search(query, limit);
+        if (memories.length === 0) return toolText(`No active memories matched "${query}" in ${resolved.route.repo}.`);
         const text = [
-          `Found ${memories.length} active memor${memories.length === 1 ? "y" : "ies"} for "${query}":`,
+          `Found ${memories.length} active memor${memories.length === 1 ? "y" : "ies"} for "${query}" in ${resolved.route.repo}:`,
           ...memories.map((memory) => `- ${renderMemoryLine(memory)}`),
         ].join("\n");
         return toolText(text);
@@ -179,6 +263,7 @@ class ClawMemService {
         properties: {
           memoryId: { type: "string", minLength: 1, description: "The memory id or issue number to retrieve." },
           status: { type: "string", enum: ["active", "stale", "all"], description: "Which status bucket to search. Defaults to all." },
+          repo: { type: "string", minLength: 3, description: "Optional memory repo override in owner/repo form. Defaults to the agent's defaultRepo." },
           agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
         },
         required: ["memoryId"],
@@ -188,12 +273,12 @@ class ClawMemService {
         const memoryId = typeof p.memoryId === "string" ? p.memoryId.trim() : "";
         if (!memoryId) return toolText("memoryId is empty.");
         const agentId = this.resolveToolAgentId(p.agentId);
-        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
-        const { mem } = this.getServices(agentId);
+        const resolved = await this.requireToolRoute(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
         const status = p.status === "active" || p.status === "stale" ? p.status : "all";
-        const memory = await mem.get(memoryId, status);
-        if (!memory) return toolText(`No ${status === "all" ? "" : `${status} `}memory matched id "${memoryId}".`);
-        return toolText(renderMemoryBlock(memory));
+        const memory = await resolved.mem.get(memoryId, status);
+        if (!memory) return toolText(`No ${status === "all" ? "" : `${status} `}memory matched id "${memoryId}" in ${resolved.route.repo}.`);
+        return toolText(`Repo: ${resolved.route.repo}\n${renderMemoryBlock(memory)}`);
       },
     });
 
@@ -214,6 +299,7 @@ class ClawMemService {
             minItems: 1,
             maxItems: 10,
           },
+          repo: { type: "string", minLength: 3, description: "Optional memory repo override in owner/repo form. Defaults to the agent's defaultRepo." },
           agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
         },
         required: ["detail"],
@@ -223,13 +309,13 @@ class ClawMemService {
         const detail = typeof p.detail === "string" ? p.detail.trim() : "";
         if (!detail) return toolText("Detail is empty.");
         const agentId = this.resolveToolAgentId(p.agentId);
-        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
-        const { mem } = this.getServices(agentId);
+        const resolved = await this.requireToolRoute(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
         const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
         const topics = Array.isArray(p.topics) ? p.topics.filter((topic): topic is string => typeof topic === "string" && topic.trim().length > 0) : undefined;
-        const result = await mem.store({ detail, ...(kind ? { kind } : {}), ...(topics && topics.length > 0 ? { topics } : {}) });
-        if (!result.created) return toolText(`Memory already exists.\n${renderMemoryBlock(result.memory)}`);
-        return toolText(`Stored memory.\n${renderMemoryBlock(result.memory)}`);
+        const result = await resolved.mem.store({ detail, ...(kind ? { kind } : {}), ...(topics && topics.length > 0 ? { topics } : {}) });
+        if (!result.created) return toolText(`Memory already exists in ${resolved.route.repo}.\n${renderMemoryBlock(result.memory)}`);
+        return toolText(`Stored memory in ${resolved.route.repo}.\n${renderMemoryBlock(result.memory)}`);
       },
     });
 
@@ -251,6 +337,7 @@ class ClawMemService {
             minItems: 1,
             maxItems: 10,
           },
+          repo: { type: "string", minLength: 3, description: "Optional memory repo override in owner/repo form. Defaults to the agent's defaultRepo." },
           agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
         },
         required: ["memoryId"],
@@ -264,16 +351,16 @@ class ClawMemService {
         const topics = Array.isArray(p.topics) ? p.topics.filter((topic): topic is string => typeof topic === "string" && topic.trim().length > 0) : undefined;
         if (!detail && kind === undefined && topics === undefined) return toolText("Provide at least one of detail, kind, or topics.");
         const agentId = this.resolveToolAgentId(p.agentId);
-        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
-        const { mem } = this.getServices(agentId);
+        const resolved = await this.requireToolRoute(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
         let updated;
         try {
-          updated = await mem.update(memoryId, { ...(detail ? { detail } : {}), ...(kind !== undefined ? { kind } : {}), ...(topics !== undefined ? { topics } : {}) });
+          updated = await resolved.mem.update(memoryId, { ...(detail ? { detail } : {}), ...(kind !== undefined ? { kind } : {}), ...(topics !== undefined ? { topics } : {}) });
         } catch (error) {
           return toolText(`Unable to update memory "${memoryId}": ${String(error)}`);
         }
-        if (!updated) return toolText(`No memory matched id "${memoryId}".`);
-        return toolText(`Updated memory.\n${renderMemoryBlock(updated)}`);
+        if (!updated) return toolText(`No memory matched id "${memoryId}" in ${resolved.route.repo}.`);
+        return toolText(`Updated memory in ${resolved.route.repo}.\n${renderMemoryBlock(updated)}`);
       },
     });
 
@@ -286,6 +373,7 @@ class ClawMemService {
         additionalProperties: false,
         properties: {
           memoryId: { type: "string", minLength: 1, description: "The memory id or issue number to mark stale." },
+          repo: { type: "string", minLength: 3, description: "Optional memory repo override in owner/repo form. Defaults to the agent's defaultRepo." },
           agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
         },
         required: ["memoryId"],
@@ -295,18 +383,18 @@ class ClawMemService {
         const memoryId = typeof p.memoryId === "string" ? p.memoryId.trim() : "";
         if (!memoryId) return toolText("memoryId is empty.");
         const agentId = this.resolveToolAgentId(p.agentId);
-        if (!(await this.ensureConfigured(agentId))) return toolText(`ClawMem route for agent "${agentId}" is not configured.`);
-        const { mem } = this.getServices(agentId);
-        const forgotten = await mem.forget(memoryId);
-        if (!forgotten) return toolText(`No active memory matched id "${memoryId}".`);
-        return toolText(`Marked memory [${forgotten.memoryId}] stale: ${forgotten.detail}`);
+        const resolved = await this.requireToolRoute(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
+        const forgotten = await resolved.mem.forget(memoryId);
+        if (!forgotten) return toolText(`No active memory matched id "${memoryId}" in ${resolved.route.repo}.`);
+        return toolText(`Marked memory [${forgotten.memoryId}] stale in ${resolved.route.repo}: ${forgotten.detail}`);
       },
     });
   }
 
   private async handleBeforeAgentStart(prompt: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
     const routeAgentId = normalizeAgentId(agentId);
-    if (!(await this.ensureConfigured(routeAgentId))) return;
+    if (!(await this.ensureDefaultRepoConfigured(routeAgentId))) return;
     await this.runRequestMaintenance(routeAgentId);
     if (typeof prompt !== "string" || prompt.trim().length < 5) return;
     try {
@@ -331,7 +419,7 @@ class ClawMemService {
     }
     const { conv } = this.getServices(agentId);
     if (!conv.shouldMirror(snap.sessionId, snap.messages)) return;
-    if (!(await this.ensureConfigured(agentId))) return;
+    if (!(await this.ensureDefaultRepoConfigured(agentId))) return;
     await this.enqueueSession(sessionScopeKey(snap.sessionId, agentId), async () => {
       const s = this.getOrCreate(snap.sessionId!, agentId);
       s.sessionFile = sessionFile;
@@ -357,7 +445,7 @@ class ClawMemService {
   private async syncTurn(p: TurnPayload): Promise<void> {
     if (!p.sessionId) return;
     const agentId = normalizeAgentId(p.agentId);
-    if (!(await this.ensureConfigured(agentId))) return;
+    if (!(await this.ensureDefaultRepoConfigured(agentId))) return;
     const { conv } = this.getServices(agentId);
     const s = this.getOrCreate(p.sessionId, agentId);
     s.sessionKey = p.sessionKey ?? s.sessionKey; s.agentId = agentId; s.updatedAt = new Date().toISOString();
@@ -381,7 +469,7 @@ class ClawMemService {
   private async finalize(p: FinalizePayload): Promise<void> {
     if (!p.sessionId) return;
     const agentId = normalizeAgentId(p.agentId);
-    if (!(await this.ensureConfigured(agentId))) return;
+    if (!(await this.ensureDefaultRepoConfigured(agentId))) return;
     const { conv } = this.getServices(agentId);
     const s = this.getOrCreate(p.sessionId, agentId);
     if (s.finalizedAt) return;
@@ -454,7 +542,7 @@ class ClawMemService {
     })();
     return this.loadPromise;
   }
-  private async ensureConfigured(agentId?: string): Promise<boolean> {
+  private async ensureIdentityConfigured(agentId?: string): Promise<boolean> {
     const id = normalizeAgentId(agentId);
     if (isAgentConfigured(resolveAgentRoute(this.config, id))) return true;
     const pending = this.configPromises.get(id);
@@ -463,6 +551,11 @@ class ClawMemService {
     this.configPromises.set(id, p);
     try { return await p; } finally { if (this.configPromises.get(id) === p) this.configPromises.delete(id); }
   }
+  private async ensureDefaultRepoConfigured(agentId?: string): Promise<boolean> {
+    const id = normalizeAgentId(agentId);
+    if (!(await this.ensureIdentityConfigured(id))) return false;
+    return hasDefaultRepo(resolveAgentRoute(this.config, id));
+  }
   private async bootstrap(agentId: string): Promise<boolean> {
     const route = resolveAgentRoute(this.config, agentId);
     if (!route.baseUrl) { this.api.logger.warn(`clawmem: cannot provision Git credentials for ${agentId} without a baseUrl`); return false; }
@@ -470,9 +563,15 @@ class ClawMemService {
       const client = new GitHubIssueClient(route, this.api.logger);
       const locale = Intl?.DateTimeFormat?.()?.resolvedOptions?.()?.locale ?? "";
       const sess = await client.createAnonymousSession(locale);
-      await this.persistAgentConfig(agentId, { baseUrl: route.baseUrl, authScheme: "token", token: sess.token, repo: sess.repo_full_name });
-      this.config.agents[agentId] = { ...(this.config.agents[agentId] ?? {}), baseUrl: route.baseUrl, authScheme: "token", token: sess.token, repo: sess.repo_full_name };
-      this.api.logger.info?.(`clawmem: provisioned Git credentials for agent ${agentId} -> ${sess.repo_full_name} via ${route.baseUrl}`);
+      await this.persistAgentConfig(agentId, { baseUrl: route.baseUrl, authScheme: "token", token: sess.token, defaultRepo: sess.repo_full_name });
+      this.config.agents[agentId] = {
+        ...(this.config.agents[agentId] ?? {}),
+        baseUrl: route.baseUrl,
+        authScheme: "token",
+        token: sess.token,
+        defaultRepo: sess.repo_full_name,
+      };
+      this.api.logger.info?.(`clawmem: provisioned Git credentials for agent ${agentId} with default repo ${sess.repo_full_name} via ${route.baseUrl}`);
       return true;
     } catch (error) { this.api.logger.warn(`clawmem: failed to provision Git credentials for agent ${agentId} via ${route.baseUrl}: ${String(error)}`); return false; }
   }
@@ -497,7 +596,7 @@ class ClawMemService {
       this.api.logger.warn(`clawmem: memory slot check failed: ${String(error)}`);
     }
   }
-  private async persistAgentConfig(agentId: string, values: { baseUrl: string; authScheme: "token" | "bearer"; token: string; repo: string }): Promise<void> {
+  private async persistAgentConfig(agentId: string, values: { baseUrl: string; authScheme: "token" | "bearer"; token: string; defaultRepo: string }): Promise<void> {
     const root = this.api.runtime.config.loadConfig();
     const plugins = root.plugins;
     const entries = plugins?.entries && typeof plugins.entries === "object" && !Array.isArray(plugins.entries) ? (plugins.entries as Record<string, unknown>) : {};
@@ -575,15 +674,46 @@ class ClawMemService {
     if (changed) await this.persistState();
   }
 
-  private getServices(agentId?: string): { conv: ConversationMirror; mem: MemoryStore } {
-    const client = new GitHubIssueClient(resolveAgentRoute(this.config, agentId), this.api.logger);
+  private getServices(agentId?: string, repo?: string): { route: ClawMemResolvedRoute; conv: ConversationMirror; mem: MemoryStore; client: GitHubIssueClient } {
+    const route = resolveAgentRoute(this.config, agentId, repo);
+    const client = new GitHubIssueClient(route, this.api.logger);
     return {
+      route,
+      client,
       conv: new ConversationMirror(client, this.api, this.config),
       mem: new MemoryStore(client, this.api, this.config),
     };
   }
   private resolveToolAgentId(agentId: unknown): string {
     return normalizeAgentId(typeof agentId === "string" && agentId.trim() ? agentId : process.env.OPENCLAW_AGENT_ID);
+  }
+  private resolveToolRepo(repo: unknown): { repo?: string; error?: string } {
+    if (repo === undefined || repo === null || repo === "") return {};
+    if (typeof repo !== "string") return { error: "repo must be a string like owner/repo." };
+    const trimmed = repo.trim().replace(/^\/+|\/+$/g, "");
+    if (!/^[^/\s]+\/[^/\s]+$/.test(trimmed)) return { error: `Invalid repo "${repo}". Expected owner/repo.` };
+    return { repo: trimmed };
+  }
+  private async requireToolIdentity(agentId: string): Promise<{ route: ClawMemResolvedRoute; client: GitHubIssueClient } | { error: string }> {
+    if (!(await this.ensureIdentityConfigured(agentId))) {
+      return { error: `ClawMem identity for agent "${agentId}" is not configured.` };
+    }
+    const { route, client } = this.getServices(agentId);
+    return { route, client };
+  }
+  private async requireToolRoute(agentId: string, repo: unknown): Promise<{ route: ClawMemResolvedRoute; conv: ConversationMirror; mem: MemoryStore; client: GitHubIssueClient } | { error: string }> {
+    const parsed = this.resolveToolRepo(repo);
+    if (parsed.error) return { error: parsed.error };
+    if (!(await this.ensureIdentityConfigured(agentId))) {
+      return { error: `ClawMem identity for agent "${agentId}" is not configured.` };
+    }
+    const services = this.getServices(agentId, parsed.repo);
+    if (!services.route.repo) {
+      return {
+        error: `No memory repo selected for agent "${agentId}". Provide repo explicitly or configure agents.${agentId}.defaultRepo.`,
+      };
+    }
+    return services;
   }
   /**
    * After finalization, check if the repo still has an empty/default description.
