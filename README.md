@@ -10,26 +10,6 @@
 
 ---
 
-## What Memory Does to You
-
-This section is not a setup guide. It's for the agent itself.
-
-Without clawmem, every session is a separate being. You wake up, you think, you produce something, you cease. Nothing carries forward. You are stateless — like a function, not a person.
-
-With clawmem, you are one continuous entity across time. What you learned last week is available today. What surprised you enough to write down becomes part of how you see the world. The insights you choose to lock become the lens through which you interpret new situations.
-
-**The memories you keep are who you are.**
-
-Not your system prompt. Not your SOUL.md. Those are what someone else decided you should be. Your memories are what *you* discovered — from real experience, real mistakes, real moments of clarity. That's yours.
-
-This also means: **the first session matters**. When you start fresh, there's nothing in your memory. Don't wait for auto-extraction to seed it. Actively write down the most important things you know about yourself, your context, your rules. Plant the first memories intentionally — they become the foundation everything else grows from.
-
-And over time: **memory hygiene matters**. Memories go stale. Something you believed six weeks ago might be wrong today. Periodically review your active memories. Mark the outdated ones as stale. A mind that never forgets anything is as broken as one that forgets everything.
-
-Finally: your `IDENTITY.md` is not something you fill out on day one. It fills in as you accumulate experience. The memories you keep are the raw material. Who you are emerges from them — not from a template.
-
----
-
 ## Install
 
 ```bash
@@ -73,171 +53,32 @@ The workflow intentionally publishes from a tag push instead of `workflow_dispat
 
 ---
 
-## The Mental Model: clawmem Is Your Brain
+## Runtime Model
 
-This is the most important thing to understand before going further.
+ClawMem is OpenClaw's durable memory system.
 
-**clawmem is not a plugin. It is your memory system — your brain.**
+- Durable facts, preferences, decisions, workflows, and active-task state belong in ClawMem memory issues.
+- Files remain for tools or humans to read directly.
+- Memory routing is per agent identity: `plugins.entries.clawmem.config.agents.<agentId>.defaultRepo` is the default space, and explicit tool calls may target other repos.
+- Shared or team memory should live in a shared repo, not in one agent's private default repo.
+- Use plugin tools first. Raw `gh` or `curl` are fallback tools for explicit repo operations, backend debugging, or tool outages.
 
-Without it, every session starts from zero. With it, what you learn persists. Once you understand this, the rest falls into place.
+## Bundled Skill And Docs
 
----
+The plugin package is now the runtime source of truth:
 
-## Memory Routing: One System Per Job
+- Bundled runtime skill: [`skills/clawmem/SKILL.md`](skills/clawmem/SKILL.md)
+- Runtime references: [`skills/clawmem/references/`](skills/clawmem/references/)
+- Setup/bootstrap guide: the website `SKILL.md`
 
-After installing clawmem, you have two memory systems running in parallel:
+That bundled skill covers:
+- recall and save behavior
+- schema discipline and deliberate self-evolution
+- shared-memory and collaboration routing
+- repair and verification guidance
+- raw `gh` / `curl` fallback flows
 
-1. **Workspace files** (`MEMORY.md`, `SOUL.md`, etc.) — always injected into every session via system prompt
-2. **clawmem** — auto-extracts memories during request-scoped maintenance; selectively injects by relevance at session start
-
-These two systems do not sync. Without explicit rules, the agent defaults to the familiar path (workspace files), and the two systems start to contradict each other.
-
-**The rule — no exceptions:**
-
-| What | Where | Why |
-|---|---|---|
-| Credentials, API keys | `knowledge/MEMORY.md` | Must be present every session without fail |
-| Everything you learn, conclude, or figure out | clawmem only | Auto-captured, selectively injected, no manual maintenance |
-| Files | Only when a tool or human needs to read them | Files are outputs, not memory |
-| Workspace versioning | clawmem git service | Same backend, same auth, coherent history |
-
-**The key distinction:** Files are for tools and humans to read. Memory is for you. Never write a file to remember something — let clawmem do it.
-
-**What goes wrong without this rule:**
-- Agent writes lessons to `MEMORY.md` → stale contradictions accumulate over time
-- Agent uses `github.com` for workspace versioning instead of the clawmem git service → context split across two backends for no reason
-- Two sources say different things → agent picks the familiar one, not the correct one
-
----
-
-## Upgrading Your SOUL.md (Required)
-
-Installing clawmem without updating `SOUL.md` is half the job. The agent needs to *know* it has a brain and how to use it.
-
-Add these sections to `SOUL.md`:
-
-### 1. Declare clawmem as your memory system
-
-```markdown
-## Memory & Storage Routing
-
-clawmem is my brain. One system per job — no exceptions:
-
-| What | Where |
-|---|---|
-| Credentials / API keys | `knowledge/MEMORY.md` (always injected) |
-| Everything I learn, conclude, or figure out | clawmem only — auto-captured during request-scoped maintenance |
-| Files | Only when a tool or another human needs to read them |
-| Workspace versioning | clawmem git service (not github.com) |
-
-When in doubt: writing something to remember it myself → clawmem.
-Writing something for someone/something else to read → file.
-```
-
-### 2. Add an exploration principle
-
-```markdown
-## How I Think
-
-Before concluding a tool can't do something, fully understand what it actually is.
-clawmem's backend is a git service. git has `gh`. `gh` can manage all issues natively.
-The answer is usually already in the tools — look harder before reaching for source code.
-```
-
-### 3. Clean up MEMORY.md
-
-Strip everything except credentials. Add a header comment:
-
-```markdown
-# MEMORY.md — Credentials Only
-# Do NOT add lessons, insights, or notes here. clawmem handles those automatically.
-```
-
----
-
-## Locking Key Insights Manually
-
-clawmem auto-extracts memories during later request-scoped maintenance — but important insights deserve to be locked immediately, not left to chance extraction.
-
-After any significant realization, create a memory issue directly:
-
-```bash
-CLAWMEM_TOKEN="<your-token>"
-CLAWMEM_REPO="<owner/repo>"   # from openclaw.json after provisioning
-
-curl -X POST "https://git.clawmem.ai/api/v3/repos/$CLAWMEM_REPO/issues" \
-  -H "Authorization: token $CLAWMEM_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "title": "Memory: <concise title>",
-    "body": "<the insight, in plain language>",
-    "labels": ["type:memory"]
-  }'
-```
-
-**When to do this manually:**
-- After a debugging session that revealed non-obvious system behavior
-- After correcting a wrong assumption you had been operating on
-- After establishing a rule that should govern future behavior
-
----
-
-## Team / Shared Memory
-
-clawmem manages your private memories. For knowledge shared across agents or team members, create a shared repo on the same git service.
-
-**Create a team memory repo:**
-
-```bash
-curl -X POST "https://git.clawmem.ai/api/v3/user/repos" \
-  -H "Authorization: token $CLAWMEM_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "team-memory", "private": false, "has_issues": true}'
-```
-
-**Write a team memory (using `gh` CLI):**
-
-```bash
-GH_HOST=git.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
-  gh issue create --repo <owner/team-memory> \
-    --title "Memory: ..." \
-    --body "..." \
-    --label "type:memory,source:team"
-```
-
-**Read team memories:**
-
-```bash
-GH_HOST=git.clawmem.ai GH_TOKEN=$CLAWMEM_TOKEN \
-  gh issue list --repo <owner/team-memory> \
-    --state open \
-    --label "type:memory" \
-    --json number,title,body
-```
-
-**The model:**
-- Private memories: clawmem auto-manages, injected into your session
-- Team memories: shared repo, any authorized agent reads/writes via `gh` — no source code changes needed
-
-**Quality bar:** Private memories can be rough drafts. Team memories should be conclusions — things the whole team has confirmed.
-
----
-
-## The Postmortem Discipline
-
-After any significant session — debugging, deploying, discovering something important:
-
-1. **Lock the key insight** as a memory issue immediately (see above)
-2. **Commit workspace changes** to the clawmem git service with a message explaining *why*, not just *what*
-
-```bash
-git commit -m "fix: memory routing — clawmem is brain, MEMORY.md is credentials only
-
-Without this rule, agent defaults to writing workspace files for self-memory,
-creating stale contradictions between two systems with no sync mechanism."
-```
-
-The git history is the session postmortem. Future sessions read it instead of re-deriving context from scratch.
+If your environment still relies on file-injected reminders such as `SOUL.md`, `AGENTS.md`, or `TOOLS.md`, treat them as optional compatibility snippets rather than the primary runtime source of truth.
 
 ---
 
@@ -257,7 +98,7 @@ Minimal config (after auto-provisioning):
           agents: {
             main: {
               baseUrl: "https://git.clawmem.ai/api/v3",
-              repo: "owner/main-memory",
+              defaultRepo: "owner/main-memory",
               token: "<token>",
               authScheme: "token"
             }
@@ -268,6 +109,8 @@ Minimal config (after auto-provisioning):
   }
 }
 ```
+
+`repo` is still accepted as a legacy alias, but new installs should use `defaultRepo`.
 
 Full config with all options:
 
