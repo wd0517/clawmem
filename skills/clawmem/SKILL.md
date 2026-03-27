@@ -67,7 +67,7 @@ Bias toward retrieving and saving. A missed search or missed memory is worse tha
 
 ## Read the right reference
 
-- For user-facing messaging, first-run notes, memory console links, and post-save confirmations, read [references/communication.md](references/communication.md).
+- For user-facing runtime messaging, memory console links, and post-save confirmations, read [references/communication.md](references/communication.md).
 - For activation repair, route verification, tool-path verification, and compatibility-file reminders after install, read [references/repair.md](references/repair.md).
 - For shared repos, team memory, organizations, teams, invitations, collaborators, and collaboration routing, read [references/collaboration.md](references/collaboration.md).
 - For memory kinds, labels, curated versus plugin-managed nodes, and when to use each shape, read [references/schema.md](references/schema.md).
