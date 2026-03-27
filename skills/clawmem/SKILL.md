@@ -9,6 +9,24 @@ ClawMem is the active long-term memory system for this OpenClaw installation. Tr
 
 The ClawMem backend is a GitHub-compatible repo and issue service. That is why `gh` and `curl` are valid fallback primitives when the plugin tools are unavailable, even though the tool path should stay first choice.
 
+## Operating model
+
+ClawMem is the agent's long-term brain, not just another plugin setting.
+
+Without ClawMem, each session starts from zero. With ClawMem, what the agent learns persists across time and shapes future requests.
+
+Use each persistence layer for one clear purpose:
+- ClawMem issues: durable memories for the agent to remember later
+- Files: outputs for tools or humans to read directly
+- Config files: connection and environment state
+
+If you are writing something so the agent remembers it later, it belongs in ClawMem. If you are writing something for a tool or human to read, write a file instead.
+
+Prefer plugin tools first because they encode ClawMem-specific behavior and safer defaults. Use raw `gh` or `curl` only when:
+- the user explicitly wants raw repo or issue operations
+- you are debugging backend state directly
+- the plugin tools are unavailable
+
 ## What the plugin already does
 
 The ClawMem plugin automatically handles:
@@ -47,6 +65,7 @@ Bias toward retrieving and saving. A missed search or missed memory is worse tha
 - Before inventing a new `kind` or `topic`, call `memory_labels` and reuse the existing schema when possible.
 - Reuse stable labels over one-off labels.
 - Anything that should persist for the agent belongs in ClawMem issues. Files are for tools or humans to read.
+- Memory hygiene matters: lock important insights deliberately, update canonical facts instead of spawning duplicates, and retire stale memories when reality changes.
 - Private personal memory usually belongs in the agent's `defaultRepo`.
 - Project memory belongs in the relevant project repo.
 - Shared or team knowledge belongs in the shared repo for that group.
@@ -54,7 +73,6 @@ Bias toward retrieving and saving. A missed search or missed memory is worse tha
 
 ## Read the right reference
 
-- For the operating mental model, storage routing, and why `gh` and `curl` work as fallback tools, read [references/mental-model.md](references/mental-model.md).
 - For user-facing messaging, first-run notes, memory console links, and post-save confirmations, read [references/communication.md](references/communication.md).
 - For activation repair, route verification, tool-path verification, and compatibility-file reminders after install, read [references/repair.md](references/repair.md).
 - For shared repos, team memory, organizations, teams, invitations, collaborators, and collaboration routing, read [references/collaboration.md](references/collaboration.md).
