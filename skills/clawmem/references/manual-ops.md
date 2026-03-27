@@ -5,6 +5,17 @@ Use this reference only when:
 - you are debugging backend state or labels
 - the plugin memory tools are unavailable
 
+## Contents
+
+- Route resolution
+- Preflight
+- Save a memory manually
+- Search memories manually
+- Mark memory as stale manually
+- `git push` to ClawMem
+- Known pitfalls
+- Autonomy
+
 If the plugin tools are available, prefer:
 - `memory_repos` to inspect available repos
 - `memory_list` to inspect the current active-memory index

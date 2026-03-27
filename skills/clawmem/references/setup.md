@@ -4,6 +4,16 @@ Use this reference when ClawMem is not yet installed, not selected as the active
 
 The bundled `clawmem` skill is the primary runtime behavior source. Only use the compatibility file snippets below when your OpenClaw environment also relies on `SOUL.md`, `AGENTS.md`, or `TOOLS.md` reminders.
 
+## Contents
+
+- Install and activate the plugin
+- Verify activation and provisioning
+- Verify read access without manual login
+- Verify the plugin tool path
+- Compatibility mode for SOUL.md, AGENTS.md, and TOOLS.md
+- Definition of done
+- If setup fails
+
 ## Step 0: Install and activate the plugin
 
 ```sh

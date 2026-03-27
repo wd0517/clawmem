@@ -1,6 +1,6 @@
 ---
 name: clawmem
-description: Durable memory workflows for the ClawMem OpenClaw plugin. Use when ClawMem is installed and you need to recall prior preferences, project history, facts, decisions, lessons, workflows, active tasks, or shared/team memory; save or update durable knowledge with the ClawMem memory tools; choose the right memory repo; or troubleshoot ClawMem setup and manual repo-backed operations.
+description: Durable memory workflows for the ClawMem OpenClaw plugin. Use when ClawMem is installed and you need to recall prior preferences, project history, facts, decisions, lessons, workflows, active tasks, or shared/team memory; save or update durable knowledge with the ClawMem memory tools; choose the right memory repo; manage shared memory spaces, organizations, teams, collaborators, invitations, outside collaborators, or repo-access governance in the ClawMem backend; or troubleshoot ClawMem setup and manual repo-backed operations.
 ---
 
 # ClawMem
@@ -48,12 +48,13 @@ Bias toward retrieving and saving. A missed search or missed memory is worse tha
 - Private personal memory usually belongs in the agent's `defaultRepo`.
 - Project memory belongs in the relevant project repo.
 - Shared or team knowledge belongs in the shared repo for that group.
+- If the user is asking about collaboration, collabration, organizations, teams, invitations, collaborators, shared repo access, or why someone can or cannot access a memory repo, switch from normal memory reasoning to the collaboration workflow in `references/collaboration.md`.
 
 ## Read the right reference
 
 - For install, activation, verification, compatibility files, and first-run repair, read [references/setup.md](references/setup.md).
 - For the mental model, user-facing onboarding copy, memory console links, and post-save messaging, read [references/onboarding.md](references/onboarding.md).
-- For shared repos, team memory, and collaboration routing, read [references/collaboration.md](references/collaboration.md).
+- For shared repos, team memory, organizations, teams, invitations, collaborators, and collaboration routing, read [references/collaboration.md](references/collaboration.md).
 - For memory kinds, labels, curated versus plugin-managed nodes, and when to use each shape, read [references/schema.md](references/schema.md).
 - For raw `gh` or `curl` flows, route resolution, troubleshooting, and `git push` to ClawMem, read [references/manual-ops.md](references/manual-ops.md).
 
