@@ -5,15 +5,11 @@ description: Durable memory workflows for the ClawMem OpenClaw plugin. Use when 
 
 # ClawMem
 
-ClawMem is the active long-term memory system for this OpenClaw installation. Treat the plugin tools as the default path. Use raw `gh` or `curl` only when the user explicitly asks for repo-level operations, you are debugging backend state, or the plugin tools are unavailable.
-
-The ClawMem backend is a GitHub-compatible repo and issue service. That is why `gh` and `curl` are valid fallback primitives when the plugin tools are unavailable, even though the tool path should stay first choice.
+ClawMem is the active long-term memory system for this OpenClaw installation. It runs on a GitHub-compatible repo and issue backend, so plugin tools are the default path and raw `gh` or `curl` are only fallbacks for explicit repo operations, backend debugging, or tool outages.
 
 ## Operating model
 
-ClawMem is the agent's long-term brain, not just another plugin setting.
-
-Without ClawMem, each session starts from zero. With ClawMem, what the agent learns persists across time and shapes future requests.
+Without ClawMem, each session starts from zero. With it, what the agent learns persists across time and shapes future requests.
 
 Use each persistence layer for one clear purpose:
 - ClawMem issues: durable memories for the agent to remember later
@@ -22,10 +18,7 @@ Use each persistence layer for one clear purpose:
 
 If you are writing something so the agent remembers it later, it belongs in ClawMem. If you are writing something for a tool or human to read, write a file instead.
 
-Prefer plugin tools first because they encode ClawMem-specific behavior and safer defaults. Use raw `gh` or `curl` only when:
-- the user explicitly wants raw repo or issue operations
-- you are debugging backend state directly
-- the plugin tools are unavailable
+Memory hygiene matters: lock important insights deliberately, update canonical facts instead of spawning duplicates, and retire stale memories when reality changes.
 
 ## What the plugin already does
 
@@ -61,15 +54,12 @@ Bias toward retrieving and saving. A missed search or missed memory is worse tha
 
 ## Retrieval and storage rules
 
-- Default to the plugin memory tools first.
 - Before inventing a new `kind` or `topic`, call `memory_labels` and reuse the existing schema when possible.
 - Reuse stable labels over one-off labels.
-- Anything that should persist for the agent belongs in ClawMem issues. Files are for tools or humans to read.
-- Memory hygiene matters: lock important insights deliberately, update canonical facts instead of spawning duplicates, and retire stale memories when reality changes.
 - Private personal memory usually belongs in the agent's `defaultRepo`.
 - Project memory belongs in the relevant project repo.
 - Shared or team knowledge belongs in the shared repo for that group.
-- If the user is asking about collaboration, collabration, organizations, teams, invitations, collaborators, shared repo access, or why someone can or cannot access a memory repo, switch from normal memory reasoning to the collaboration workflow in `references/collaboration.md`.
+- If the user is asking about collaboration, organizations, teams, invitations, collaborators, shared repo access, or why someone can or cannot access a memory repo, switch from normal memory reasoning to the collaboration workflow in `references/collaboration.md`.
 
 ## Read the right reference
 
