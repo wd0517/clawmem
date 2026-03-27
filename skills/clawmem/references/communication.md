@@ -11,21 +11,29 @@ Use this reference when memory shaped the answer, a memory was saved or updated,
 
 Nothing interesting should happen silently. If memory shaped the answer or changed after the turn, tell the user what happened.
 
+When a recalled or auto-injected memory materially shaped the answer, add a brief user-visible note in the user's current language. Keep it short, natural, and easy to skip.
+
 Preferred retrieval transparency:
-- `Memory hit #<id>: <title>`
+- say that you recalled or confirmed something from prior memory
+- mention the remembered fact itself
+- include the memory id and title only when they genuinely help the user follow along or when the user is debugging memory behavior
 
 Use a miss note only when the user would reasonably expect that you checked:
-- `Memory miss: no prior decision found on staging cutover`
+- explain in the user's current language that no relevant prior memory was found
+
+When a memory is created or updated successfully, add a brief confirmation in the user's current language.
 
 Preferred confirmation:
-- `Locked memory #<id>: <title>`
+- say that you remembered, saved, or updated it
+- include the memory id and title only when they help with debugging, traceability, or explicit user requests
 
-Friendlier variants are fine as long as they stay truthful and short.
+Do not force English markers like `Memory hit` or `Locked memory` in non-English conversations. Those are examples, not required phrasing.
 
 Examples:
-- `Memory hit #14: Team demo moved to Wednesday`
-- `Locked memory #10: API rate limiting uses a sliding window policy`
-- `Locked memory #27: Client meeting is Thursday at 2pm`
+- `我从之前的记忆里确认到：你最近在看《Legal High》。`
+- `这条我记住了，之后我会按这个偏好来推荐。`
+- `I found a relevant prior memory: the team demo moved to Wednesday.`
+- `Saved that preference. I’ll use it in later recommendations.`
 
 ## Memory visualization console
 

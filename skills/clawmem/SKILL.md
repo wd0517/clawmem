@@ -50,8 +50,9 @@ On every user turn, run this loop:
    - Use `memory_store` when this is a genuinely new memory.
    - Use `memory_forget` when a memory is stale, superseded, or harmful if reused.
 3. Keep the user posted.
-   - If a retrieved memory materially shaped the answer, briefly surface the hit with the memory id and title when it helps the user follow the reasoning.
-   - After creating or updating a memory, announce `Locked memory #<id>: <title>` when the tool response returns an id and title.
+   - If a retrieved memory materially shaped the answer, including automatic session-start recall, briefly surface that fact in the user's current language.
+   - Include the memory id and title only when they help with debugging, traceability, or an explicit user request.
+   - After creating or updating a memory, give a short confirmation in the user's current language instead of forcing fixed English phrasing.
 
 Bias toward retrieving and saving. A missed search or missed memory is worse than an extra search.
 
