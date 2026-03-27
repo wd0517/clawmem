@@ -12,6 +12,7 @@
     "index.ts",
     "openclaw.plugin.json",
     "src",
+    "skills",
     "README.md",
     "tsconfig.json"
   ],

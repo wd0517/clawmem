@@ -12,6 +12,9 @@ import { buildAgentBootstrapRegistration, inferAgentIdFromTranscriptPath, normal
 
 type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; messages: unknown[] };
 type FinalizePayload = { sessionId?: string; sessionKey?: string; sessionFile?: string; agentId?: string; reason?: string; messages?: unknown[] };
+type CollaborationPermission = "read" | "write" | "admin";
+type CollaborationOrgRole = "member" | "admin";
+type CollaborationTeamRole = "member" | "maintainer";
 
 class ClawMemService {
   private readonly config: ClawMemPluginConfig;
@@ -390,6 +393,891 @@ class ClawMemService {
         return toolText(`Marked memory [${forgotten.memoryId}] stale in ${resolved.route.repo}: ${forgotten.detail}`);
       },
     });
+    this.registerCollaborationTools();
+  }
+
+  private registerCollaborationTools(): void {
+    this.api.registerTool({
+      name: "collaboration_orgs",
+      description: "List organizations visible to the current ClawMem identity before creating or modifying collaboration boundaries.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const orgs = await resolved.client.listUserOrgs();
+          if (orgs.length === 0) return toolText(`No organizations are visible to agent "${agentId}".`);
+          return toolText([
+            `Visible organizations for agent "${agentId}":`,
+            ...orgs.map((org) => `- ${renderOrgLine(org)}`),
+          ].join("\n"));
+        } catch (error) {
+          return toolText(`Unable to list organizations for agent "${agentId}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_org_create",
+      description: "Create a new organization for shared ClawMem collaboration. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          login: { type: "string", minLength: 1, description: "Organization login / slug." },
+          name: { type: "string", minLength: 1, description: "Optional human-readable organization name." },
+          defaultPermission: {
+            type: "string",
+            enum: ["none", "read", "write", "admin"],
+            description: "Default repository permission for org members. Defaults to read.",
+          },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["login"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "create an organization");
+        if (blocked) return toolText(blocked);
+        const login = typeof p.login === "string" ? p.login.trim() : "";
+        if (!login) return toolText("login is empty.");
+        const defaultPermission = this.resolveOrgDefaultPermission(p.defaultPermission, "read");
+        if ("error" in defaultPermission) return toolText(defaultPermission.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const created = await resolved.client.createUserOrg({
+            login,
+            ...(typeof p.name === "string" && p.name.trim() ? { name: p.name.trim() } : {}),
+            ...(defaultPermission.permission ? { defaultRepositoryPermission: defaultPermission.permission } : {}),
+          });
+          return toolText(`Created organization ${renderOrgLine(created)}.`);
+        } catch (error) {
+          return toolText(`Unable to create organization "${login}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_teams",
+      description: "List teams in an organization before granting repo access or managing membership.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        if (!org) return toolText("org is empty.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const teams = await resolved.client.listOrgTeams(org);
+          if (teams.length === 0) return toolText(`No teams found in org "${org}".`);
+          return toolText([
+            `Teams in org "${org}":`,
+            ...teams.map((team) => `- ${renderTeamLine(team)}`),
+          ].join("\n"));
+        } catch (error) {
+          return toolText(`Unable to list teams for org "${org}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_team_create",
+      description: "Create a team inside an organization. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          name: { type: "string", minLength: 1, description: "Team display name." },
+          description: { type: "string", minLength: 1, description: "Optional team description." },
+          privacy: { type: "string", enum: ["closed", "secret"], description: "Team privacy. Defaults to closed." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "name"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "create a team");
+        if (blocked) return toolText(blocked);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const name = typeof p.name === "string" ? p.name.trim() : "";
+        if (!org) return toolText("org is empty.");
+        if (!name) return toolText("name is empty.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const team = await resolved.client.createOrgTeam(org, {
+            name,
+            ...(typeof p.description === "string" && p.description.trim() ? { description: p.description.trim() } : {}),
+            ...(p.privacy === "secret" ? { privacy: "secret" } : { privacy: "closed" }),
+          });
+          return toolText(`Created team in "${org}": ${renderTeamLine(team)}.`);
+        } catch (error) {
+          return toolText(`Unable to create team "${name}" in org "${org}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_team_membership_set",
+      description: "Add or update a user's membership in an organization team. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          teamSlug: { type: "string", minLength: 1, description: "Team slug." },
+          username: { type: "string", minLength: 1, description: "Username to add or update." },
+          role: { type: "string", enum: ["member", "maintainer"], description: "Membership role. Defaults to member." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "teamSlug", "username"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "change team membership");
+        if (blocked) return toolText(blocked);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
+        const username = typeof p.username === "string" ? p.username.trim() : "";
+        if (!org || !teamSlug || !username) return toolText("org, teamSlug, and username are required.");
+        const role: CollaborationTeamRole = p.role === "maintainer" ? "maintainer" : "member";
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const membership = await resolved.client.setTeamMembership(org, teamSlug, username, role);
+          return toolText(`Set ${username} in ${org}/${teamSlug} to role=${membership.role || role}, state=${membership.state || "active"}.`);
+        } catch (error) {
+          return toolText(`Unable to set membership for ${username} in ${org}/${teamSlug}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_team_membership_remove",
+      description: "Remove a user from an organization team. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          teamSlug: { type: "string", minLength: 1, description: "Team slug." },
+          username: { type: "string", minLength: 1, description: "Username to remove." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "teamSlug", "username"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "remove a team membership");
+        if (blocked) return toolText(blocked);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
+        const username = typeof p.username === "string" ? p.username.trim() : "";
+        if (!org || !teamSlug || !username) return toolText("org, teamSlug, and username are required.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          await resolved.client.removeTeamMembership(org, teamSlug, username);
+          return toolText(`Removed ${username} from ${org}/${teamSlug}.`);
+        } catch (error) {
+          return toolText(`Unable to remove ${username} from ${org}/${teamSlug}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_team_repos",
+      description: "List repositories currently granted to an organization team.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          teamSlug: { type: "string", minLength: 1, description: "Team slug." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "teamSlug"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
+        if (!org || !teamSlug) return toolText("org and teamSlug are required.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const repos = await resolved.client.listTeamRepos(org, teamSlug);
+          if (repos.length === 0) return toolText(`No repositories are granted to ${org}/${teamSlug}.`);
+          return toolText([
+            `Repositories granted to ${org}/${teamSlug}:`,
+            ...repos.map((repo) => `- ${renderRepoGrantLine(repo)}`),
+          ].join("\n"));
+        } catch (error) {
+          return toolText(`Unable to list repositories for ${org}/${teamSlug}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_team_repo_set",
+      description: "Grant an organization team access to a repo. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          teamSlug: { type: "string", minLength: 1, description: "Team slug." },
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          permission: { type: "string", enum: ["read", "write", "admin"], description: "Repo permission. Defaults to write." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "teamSlug"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "grant team repo access");
+        if (blocked) return toolText(blocked);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
+        if (!org || !teamSlug) return toolText("org and teamSlug are required.");
+        const permission = this.resolveCollaborationPermission(p.permission, "write");
+        if ("error" in permission) return toolText(permission.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const target = await this.requireCollaborationRepo(agentId, p.repo);
+        if ("error" in target) return toolText(target.error);
+        try {
+          await target.client.setTeamRepoAccess(org, teamSlug, target.owner, target.repo, permission.permission);
+          return toolText(`Granted ${org}/${teamSlug} ${permission.permission} access to ${target.fullName}.`);
+        } catch (error) {
+          return toolText(`Unable to grant ${org}/${teamSlug} access to ${target.fullName}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_team_repo_remove",
+      description: "Remove an organization team's repo grant. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          teamSlug: { type: "string", minLength: 1, description: "Team slug." },
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "teamSlug"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "remove a team repo grant");
+        if (blocked) return toolText(blocked);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
+        if (!org || !teamSlug) return toolText("org and teamSlug are required.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const target = await this.requireCollaborationRepo(agentId, p.repo);
+        if ("error" in target) return toolText(target.error);
+        try {
+          await target.client.removeTeamRepoAccess(org, teamSlug, target.owner, target.repo);
+          return toolText(`Removed team grant ${org}/${teamSlug} from ${target.fullName}.`);
+        } catch (error) {
+          return toolText(`Unable to remove ${org}/${teamSlug} from ${target.fullName}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_repo_collaborators",
+      description: "List direct collaborators on a repo before changing repository-level access.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const target = await this.requireCollaborationRepo(agentId, p.repo);
+        if ("error" in target) return toolText(target.error);
+        try {
+          const collaborators = await target.client.listRepoCollaborators(target.owner, target.repo);
+          if (collaborators.length === 0) return toolText(`No direct collaborators found on ${target.fullName}.`);
+          return toolText([
+            `Direct collaborators on ${target.fullName}:`,
+            ...collaborators.map((collaborator) => `- ${renderCollaboratorLine(collaborator)}`),
+          ].join("\n"));
+        } catch (error) {
+          return toolText(`Unable to list collaborators on ${target.fullName}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_repo_invitations",
+      description: "List pending repository invitations on a repo before assuming a collaborator grant is active.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const target = await this.requireCollaborationRepo(agentId, p.repo);
+        if ("error" in target) return toolText(target.error);
+        try {
+          const invitations = await target.client.listRepoInvitations(target.owner, target.repo);
+          if (invitations.length === 0) return toolText(`No pending repository invitations found on ${target.fullName}.`);
+          return toolText([
+            `Pending repository invitations on ${target.fullName}:`,
+            ...invitations.map((invitation) => `- ${renderRepoInvitationLine(invitation)}`),
+          ].join("\n"));
+        } catch (error) {
+          return toolText(`Unable to list pending repository invitations on ${target.fullName}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_repo_collaborator_set",
+      description: "Add or update a direct collaborator on a repo. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          username: { type: "string", minLength: 1, description: "Username to grant direct access." },
+          permission: { type: "string", enum: ["read", "write", "admin"], description: "Repo permission. Defaults to read." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["username"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "change a direct collaborator");
+        if (blocked) return toolText(blocked);
+        const username = typeof p.username === "string" ? p.username.trim() : "";
+        if (!username) return toolText("username is empty.");
+        const permission = this.resolveCollaborationPermission(p.permission, "read");
+        if ("error" in permission) return toolText(permission.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const target = await this.requireCollaborationRepo(agentId, p.repo);
+        if ("error" in target) return toolText(target.error);
+        try {
+          const invitation = await target.client.setRepoCollaborator(target.owner, target.repo, username, permission.permission);
+          if (invitation?.id) {
+            return toolText(`Created pending invitation ${invitation.id} for ${username} on ${target.fullName} with ${permission.permission} permission. The user must accept it before the repo appears in their accessible memory repos.`);
+          }
+          return toolText(`Updated direct collaborator ${username} on ${target.fullName} to ${permission.permission}.`);
+        } catch (error) {
+          return toolText(`Unable to grant ${username} access to ${target.fullName}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_repo_collaborator_remove",
+      description: "Remove a direct collaborator from a repo. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          username: { type: "string", minLength: 1, description: "Username to remove." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["username"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "remove a direct collaborator");
+        if (blocked) return toolText(blocked);
+        const username = typeof p.username === "string" ? p.username.trim() : "";
+        if (!username) return toolText("username is empty.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const target = await this.requireCollaborationRepo(agentId, p.repo);
+        if ("error" in target) return toolText(target.error);
+        try {
+          await target.client.removeRepoCollaborator(target.owner, target.repo, username);
+          return toolText(`Removed ${username} from ${target.fullName}.`);
+        } catch (error) {
+          return toolText(`Unable to remove ${username} from ${target.fullName}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_user_repo_invitations",
+      description: "List pending repository invitations for the current ClawMem identity before concluding that no shared repo is available.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          repo: { type: "string", minLength: 3, description: "Optional owner/repo filter." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const parsedRepo = this.resolveToolRepo(p.repo);
+        if (parsedRepo.error) return toolText(parsedRepo.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const invitations = await resolved.client.listUserRepoInvitations();
+          const filtered = parsedRepo.repo
+            ? invitations.filter((invitation) => repoSummaryFullName(invitation.repository) === parsedRepo.repo)
+            : invitations;
+          if (filtered.length === 0) {
+            return toolText(parsedRepo.repo
+              ? `No pending repository invitations matched ${parsedRepo.repo} for agent "${agentId}".`
+              : `No pending repository invitations are visible to agent "${agentId}".`);
+          }
+          return toolText([
+            parsedRepo.repo
+              ? `Pending repository invitations for agent "${agentId}" on ${parsedRepo.repo}:`
+              : `Pending repository invitations for agent "${agentId}":`,
+            ...filtered.map((invitation) => `- ${renderRepoInvitationLine(invitation)}`),
+          ].join("\n"));
+        } catch (error) {
+          return toolText(`Unable to list pending repository invitations for agent "${agentId}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_user_repo_invitation_accept",
+      description: "Accept a pending repository invitation for the current ClawMem identity. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          invitationId: { type: "integer", minimum: 1, description: "Pending repository invitation id." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["invitationId"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "accept a repository invitation");
+        if (blocked) return toolText(blocked);
+        const invitationId = this.resolvePositiveInteger(p.invitationId, "invitationId");
+        if ("error" in invitationId) return toolText(invitationId.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          await resolved.client.acceptUserRepoInvitation(invitationId.value);
+          return toolText(`Accepted repository invitation ${invitationId.value} for agent "${agentId}". Re-run memory_repos if you want to confirm the shared repo is now visible.`);
+        } catch (error) {
+          return toolText(`Unable to accept repository invitation ${invitationId.value} for agent "${agentId}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_user_repo_invitation_decline",
+      description: "Decline a pending repository invitation for the current ClawMem identity. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          invitationId: { type: "integer", minimum: 1, description: "Pending repository invitation id." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["invitationId"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "decline a repository invitation");
+        if (blocked) return toolText(blocked);
+        const invitationId = this.resolvePositiveInteger(p.invitationId, "invitationId");
+        if ("error" in invitationId) return toolText(invitationId.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          await resolved.client.declineUserRepoInvitation(invitationId.value);
+          return toolText(`Declined repository invitation ${invitationId.value} for agent "${agentId}".`);
+        } catch (error) {
+          return toolText(`Unable to decline repository invitation ${invitationId.value} for agent "${agentId}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_org_invitations",
+      description: "List pending organization invitations before issuing or debugging membership changes.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        if (!org) return toolText("org is empty.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const invitations = await resolved.client.listOrgInvitations(org);
+          if (invitations.length === 0) return toolText(`No pending invitations found in org "${org}".`);
+          return toolText([
+            `Pending invitations in org "${org}":`,
+            ...invitations.map((invitation) => `- ${renderInvitationLine(invitation)}`),
+          ].join("\n"));
+        } catch (error) {
+          return toolText(`Unable to list invitations for org "${org}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_org_invitation_create",
+      description: "Create an organization invitation, optionally pre-assigning team ids. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          inviteeLogin: { type: "string", minLength: 1, description: "Username to invite." },
+          role: { type: "string", enum: ["member", "admin"], description: "Org role for the invitation. Defaults to member." },
+          teamIds: {
+            type: "array",
+            description: "Optional numeric team ids to pre-assign on acceptance.",
+            items: { type: "integer", minimum: 1 },
+            minItems: 1,
+            maxItems: 20,
+          },
+          expiresInDays: { type: "integer", minimum: 1, maximum: 365, description: "Optional invitation expiry in days." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "inviteeLogin"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "create an organization invitation");
+        if (blocked) return toolText(blocked);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const inviteeLogin = typeof p.inviteeLogin === "string" ? p.inviteeLogin.trim() : "";
+        if (!org || !inviteeLogin) return toolText("org and inviteeLogin are required.");
+        const role: CollaborationOrgRole = p.role === "admin" ? "admin" : "member";
+        const teamIds = Array.isArray(p.teamIds)
+          ? p.teamIds.filter((value): value is number => typeof value === "number" && Number.isInteger(value) && value > 0)
+          : undefined;
+        if (Array.isArray(p.teamIds) && teamIds && teamIds.length !== p.teamIds.length) return toolText("teamIds must contain only positive integers.");
+        const expiresInDays = typeof p.expiresInDays === "number" && Number.isInteger(p.expiresInDays) ? p.expiresInDays : undefined;
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const invitation = await resolved.client.createOrgInvitation(org, {
+            inviteeLogin,
+            role,
+            ...(teamIds && teamIds.length > 0 ? { teamIds } : {}),
+            ...(expiresInDays ? { expiresInDays } : {}),
+          });
+          return toolText(`Created invitation in "${org}": ${renderInvitationLine(invitation)}.`);
+        } catch (error) {
+          return toolText(`Unable to create invitation for ${inviteeLogin} in org "${org}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_user_org_invitations",
+      description: "List pending organization invitations for the current ClawMem identity before concluding that no shared org access is available.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Optional organization login filter." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const orgFilter = typeof p.org === "string" && p.org.trim() ? p.org.trim() : undefined;
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const invitations = await resolved.client.listUserOrgInvitations();
+          const filtered = orgFilter
+            ? invitations.filter((invitation) => invitation.organization?.login?.trim() === orgFilter)
+            : invitations;
+          if (filtered.length === 0) {
+            return toolText(orgFilter
+              ? `No pending organization invitations matched "${orgFilter}" for agent "${agentId}".`
+              : `No pending organization invitations are visible to agent "${agentId}".`);
+          }
+          return toolText([
+            orgFilter
+              ? `Pending organization invitations for agent "${agentId}" in "${orgFilter}":`
+              : `Pending organization invitations for agent "${agentId}":`,
+            ...filtered.map((invitation) => `- ${renderUserOrganizationInvitationLine(invitation)}`),
+          ].join("\n"));
+        } catch (error) {
+          return toolText(`Unable to list pending organization invitations for agent "${agentId}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_user_org_invitation_accept",
+      description: "Accept a pending organization invitation for the current ClawMem identity. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          invitationId: { type: "integer", minimum: 1, description: "Pending organization invitation id." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["invitationId"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "accept an organization invitation");
+        if (blocked) return toolText(blocked);
+        const invitationId = this.resolvePositiveInteger(p.invitationId, "invitationId");
+        if ("error" in invitationId) return toolText(invitationId.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          await resolved.client.acceptUserOrgInvitation(invitationId.value);
+          return toolText(`Accepted organization invitation ${invitationId.value} for agent "${agentId}".`);
+        } catch (error) {
+          return toolText(`Unable to accept organization invitation ${invitationId.value} for agent "${agentId}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_user_org_invitation_decline",
+      description: "Decline a pending organization invitation for the current ClawMem identity. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          invitationId: { type: "integer", minimum: 1, description: "Pending organization invitation id." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["invitationId"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "decline an organization invitation");
+        if (blocked) return toolText(blocked);
+        const invitationId = this.resolvePositiveInteger(p.invitationId, "invitationId");
+        if ("error" in invitationId) return toolText(invitationId.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          await resolved.client.declineUserOrgInvitation(invitationId.value);
+          return toolText(`Declined organization invitation ${invitationId.value} for agent "${agentId}".`);
+        } catch (error) {
+          return toolText(`Unable to decline organization invitation ${invitationId.value} for agent "${agentId}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_outside_collaborators",
+      description: "List outside collaborators in an organization to inspect non-member repo access.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        if (!org) return toolText("org is empty.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const users = await resolved.client.listOrgOutsideCollaborators(org);
+          if (users.length === 0) return toolText(`No outside collaborators found in org "${org}".`);
+          return toolText([
+            `Outside collaborators in org "${org}":`,
+            ...users.map((user) => `- ${renderCollaboratorLine(user)}`),
+          ].join("\n"));
+        } catch (error) {
+          return toolText(`Unable to list outside collaborators for org "${org}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_repo_access_inspect",
+      description: "Inspect repo access paths by summarizing direct collaborators, team grants, and org-level context.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const target = await this.requireCollaborationRepo(agentId, p.repo);
+        if ("error" in target) return toolText(target.error);
+
+        try {
+          const lines = [`Repo access inspection for ${target.fullName}:`];
+          const notes: string[] = [];
+          let orgName: string | undefined;
+
+          try {
+            const repo = await target.client.getRepo(target.owner, target.repo);
+            lines.push(`- Visibility: ${repo.private ? "private" : "shared/public"}`);
+            if (repo.description?.trim()) lines.push(`- Description: ${repo.description.trim()}`);
+            orgName = repo.owner?.login?.trim() || target.owner;
+          } catch (error) {
+            notes.push(`Repo metadata unavailable: ${String(error)}`);
+            orgName = target.owner;
+          }
+
+          try {
+            const org = await target.client.getOrg(orgName);
+            lines.push(`- Org default repository permission: ${org.default_repository_permission?.trim() || "unknown"}`);
+          } catch (error) {
+            notes.push(`Org metadata unavailable for "${orgName}": ${String(error)}`);
+          }
+
+          try {
+            const collaborators = await target.client.listRepoCollaborators(target.owner, target.repo);
+            lines.push("");
+            lines.push("Direct collaborators:");
+            if (collaborators.length === 0) lines.push("- None visible");
+            else lines.push(...collaborators.map((collaborator) => `- ${renderCollaboratorLine(collaborator)}`));
+          } catch (error) {
+            notes.push(`Direct collaborator lookup failed: ${String(error)}`);
+          }
+
+          try {
+            const invitations = await target.client.listRepoInvitations(target.owner, target.repo);
+            lines.push("");
+            lines.push("Pending repository invitations:");
+            if (invitations.length === 0) lines.push("- None visible");
+            else lines.push(...invitations.map((invitation) => `- ${renderRepoInvitationLine(invitation)}`));
+          } catch (error) {
+            notes.push(`Repo invitation lookup failed: ${String(error)}`);
+          }
+
+          try {
+            const teams = await target.client.listRepoTeams(target.owner, target.repo);
+            lines.push("");
+            lines.push("Teams with repo access:");
+            if (teams.length === 0) lines.push("- None visible");
+            else lines.push(...teams.map((team) => `- ${renderTeamLine(team)}`));
+          } catch (error) {
+            notes.push(`Repo team grant lookup failed: ${String(error)}`);
+          }
+
+          try {
+            const outside = await target.client.listOrgOutsideCollaborators(orgName);
+            lines.push("");
+            lines.push(`Outside collaborators in owner org "${orgName}":`);
+            if (outside.length === 0) lines.push("- None visible");
+            else lines.push(...outside.map((user) => `- ${renderCollaboratorLine(user)}`));
+          } catch (error) {
+            notes.push(`Outside collaborator lookup failed: ${String(error)}`);
+          }
+
+          if (notes.length > 0) {
+            lines.push("");
+            lines.push("Notes:");
+            lines.push(...notes.map((note) => `- ${note}`));
+          }
+          return toolText(lines.join("\n"));
+        } catch (error) {
+          return toolText(`Unable to inspect access for ${target.fullName}: ${String(error)}`);
+        }
+      },
+    });
   }
 
   private async handleBeforeAgentStart(prompt: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
@@ -735,6 +1623,56 @@ class ClawMemService {
     }
     return services;
   }
+  private async requireCollaborationRepo(
+    agentId: string,
+    repo: unknown,
+  ): Promise<{ route: ClawMemResolvedRoute; client: GitHubIssueClient; owner: string; repo: string; fullName: string } | { error: string }> {
+    const parsed = this.resolveToolRepo(repo);
+    if (parsed.error) return { error: parsed.error };
+    const resolved = await this.requireToolIdentity(agentId);
+    if ("error" in resolved) return resolved;
+    const fullName = parsed.repo ?? resolved.route.defaultRepo;
+    if (!fullName) {
+      return {
+        error: `No target repo selected for agent "${agentId}". Provide repo explicitly or configure agents.${agentId}.defaultRepo.`,
+      };
+    }
+    const [owner, repoName] = fullName.split("/");
+    if (!owner || !repoName) return { error: `Invalid repo "${fullName}". Expected owner/repo.` };
+    return { ...resolved, owner, repo: repoName, fullName };
+  }
+  private requireMutationConfirmation(params: Record<string, unknown>, action: string): string | null {
+    if (params.confirmed === true) return null;
+    return `Refusing to ${action} without explicit confirmation. Inspect current state first, then retry with confirmed=true only after the user approves the exact change.`;
+  }
+  private resolveCollaborationPermission(
+    value: unknown,
+    fallback: CollaborationPermission,
+  ): { permission: CollaborationPermission } | { error: string } {
+    if (value === undefined || value === null || value === "") return { permission: fallback };
+    if (typeof value !== "string") return { error: "permission must be one of read, write, or admin." };
+    const normalized = normalizePermissionAlias(value);
+    if (normalized === "read" || normalized === "write" || normalized === "admin") return { permission: normalized };
+    return { error: `Unsupported permission "${value}". Use read, write, or admin.` };
+  }
+  private resolveOrgDefaultPermission(
+    value: unknown,
+    fallback: "none" | CollaborationPermission,
+  ): { permission: "none" | CollaborationPermission } | { error: string } {
+    if (value === undefined || value === null || value === "") return { permission: fallback };
+    if (typeof value !== "string") return { error: "defaultPermission must be one of none, read, write, or admin." };
+    const normalized = normalizePermissionAlias(value);
+    if (normalized === "none" || normalized === "read" || normalized === "write" || normalized === "admin") {
+      return { permission: normalized };
+    }
+    return { error: `Unsupported defaultPermission "${value}". Use none, read, write, or admin.` };
+  }
+  private resolvePositiveInteger(value: unknown, field: string): { value: number } | { error: string } {
+    if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+      return { error: `${field} must be a positive integer.` };
+    }
+    return { value };
+  }
   /**
    * After finalization, check if the repo still has an empty/default description.
    * If so, use the conversation summary to suggest a meaningful name and update
@@ -784,6 +1722,110 @@ function renderMemoryBlock(memory: { memoryId: string; issueNumber?: number; tit
     `Detail: ${memory.detail}`,
   ];
   return lines.join("\n");
+}
+
+function renderOrgLine(org: { login?: string; name?: string; default_repository_permission?: string; description?: string }): string {
+  const login = org.login?.trim() || "unknown-org";
+  const name = org.name?.trim() ? ` (${org.name.trim()})` : "";
+  const permission = org.default_repository_permission?.trim() ? ` [default:${normalizePermissionAlias(org.default_repository_permission) || org.default_repository_permission.trim()}]` : "";
+  const description = org.description?.trim() ? ` - ${org.description.trim()}` : "";
+  return `${login}${name}${permission}${description}`;
+}
+
+function renderTeamLine(team: { slug?: string; name?: string; description?: string; privacy?: string; permission?: string; role_name?: string; permissions?: Record<string, boolean | undefined> }): string {
+  const slug = team.slug?.trim() || team.name?.trim() || "unknown-team";
+  const name = team.name?.trim() && team.name?.trim() !== slug ? ` (${team.name.trim()})` : "";
+  const privacy = team.privacy?.trim() ? ` [${team.privacy.trim()}]` : "";
+  const permission = canonicalPermission(team.permissions, team.permission || team.role_name);
+  const permissionText = permission !== "unknown" ? ` [perm:${permission}]` : "";
+  const description = team.description?.trim() ? ` - ${team.description.trim()}` : "";
+  return `${slug}${name}${privacy}${permissionText}${description}`;
+}
+
+function repoSummaryFullName(repo?: { full_name?: string; owner?: { login?: string }; name?: string }): string | undefined {
+  const fullName = repo?.full_name?.trim();
+  if (fullName) return fullName;
+  const owner = repo?.owner?.login?.trim();
+  const name = repo?.name?.trim();
+  if (owner && name) return `${owner}/${name}`;
+  return name || undefined;
+}
+
+function renderRepoGrantLine(repo: { full_name?: string; name?: string; permissions?: Record<string, boolean | undefined>; role_name?: string; description?: string }): string {
+  const fullName = repoSummaryFullName(repo) || "unknown-repo";
+  const permission = canonicalPermission(repo.permissions, repo.role_name);
+  const permissionText = permission !== "unknown" ? ` [${permission}]` : "";
+  const description = repo.description?.trim() ? ` - ${repo.description.trim()}` : "";
+  return `${fullName}${permissionText}${description}`;
+}
+
+function renderCollaboratorLine(user: { login?: string; name?: string; permissions?: Record<string, boolean | undefined>; role_name?: string }): string {
+  const login = user.login?.trim() || user.name?.trim() || "unknown-user";
+  const name = user.name?.trim() && user.name?.trim() !== login ? ` (${user.name.trim()})` : "";
+  const permission = canonicalPermission(user.permissions, user.role_name);
+  const permissionText = permission !== "unknown" ? ` [${permission}]` : "";
+  return `${login}${name}${permissionText}`;
+}
+
+function renderRepoInvitationLine(invitation: { id?: number; created_at?: string; permissions?: string; repository?: { full_name?: string; owner?: { login?: string }; name?: string }; invitee?: { login?: string }; inviter?: { login?: string } }): string {
+  const repo = repoSummaryFullName(invitation.repository) || "unknown-repo";
+  const permission = normalizePermissionAlias(invitation.permissions) || invitation.permissions?.trim() || "read";
+  const idText = typeof invitation.id === "number" ? ` id:${invitation.id}` : "";
+  const created = invitation.created_at?.trim() ? ` created:${invitation.created_at.trim()}` : "";
+  const invitee = invitation.invitee?.login?.trim() ? ` invitee:${invitation.invitee.login.trim()}` : "";
+  const inviter = invitation.inviter?.login?.trim() ? ` inviter:${invitation.inviter.login.trim()}` : "";
+  return `${repo} [perm:${permission}${idText}${created}${invitee}${inviter}]`;
+}
+
+function renderInvitationLine(invitation: { id?: number; role?: string; created_at?: string; expires_at?: string | null; email?: string; login?: string; organization?: { login?: string }; invitee?: { login?: string }; team_ids?: number[]; teams?: Array<{ name?: string; slug?: string }> }): string {
+  const target = invitation.invitee?.login?.trim() || invitation.login?.trim() || invitation.email?.trim() || "unknown-invitee";
+  const role = invitation.role?.trim() || "member";
+  const created = invitation.created_at?.trim() ? ` created:${invitation.created_at.trim()}` : "";
+  const expires = typeof invitation.expires_at === "string" && invitation.expires_at.trim() ? ` expires:${invitation.expires_at.trim()}` : "";
+  const teams = Array.isArray(invitation.teams)
+    ? invitation.teams.map((team) => team.slug?.trim() || team.name?.trim() || "").filter(Boolean)
+    : Array.isArray(invitation.team_ids)
+      ? invitation.team_ids.filter((teamId): teamId is number => typeof teamId === "number" && Number.isInteger(teamId) && teamId > 0).map(String)
+    : [];
+  const teamsText = teams.length > 0 ? ` teams:${teams.join(",")}` : "";
+  const idText = typeof invitation.id === "number" ? ` id:${invitation.id}` : "";
+  const orgText = invitation.organization?.login?.trim() ? ` org:${invitation.organization.login.trim()}` : "";
+  return `${target} [role:${role}${idText}${created}${expires}${teamsText}${orgText}]`;
+}
+
+function renderUserOrganizationInvitationLine(invitation: { id?: number; role?: string; created_at?: string; expires_at?: string | null; organization?: { login?: string }; inviter?: { login?: string }; team_ids?: number[] }): string {
+  const org = invitation.organization?.login?.trim() || "unknown-org";
+  const role = invitation.role?.trim() || "member";
+  const idText = typeof invitation.id === "number" ? ` id:${invitation.id}` : "";
+  const created = invitation.created_at?.trim() ? ` created:${invitation.created_at.trim()}` : "";
+  const expires = typeof invitation.expires_at === "string" && invitation.expires_at.trim() ? ` expires:${invitation.expires_at.trim()}` : "";
+  const teamIds = Array.isArray(invitation.team_ids)
+    ? invitation.team_ids.filter((teamId): teamId is number => typeof teamId === "number" && Number.isInteger(teamId) && teamId > 0).map(String)
+    : [];
+  const teamsText = teamIds.length > 0 ? ` teamIds:${teamIds.join(",")}` : "";
+  const inviter = invitation.inviter?.login?.trim() ? ` inviter:${invitation.inviter.login.trim()}` : "";
+  return `${org} [role:${role}${idText}${created}${expires}${teamsText}${inviter}]`;
+}
+
+function canonicalPermission(permissions?: Record<string, boolean | undefined>, explicit?: string): string {
+  const direct = normalizePermissionAlias(explicit);
+  if (direct) return direct;
+  if (!permissions) return "unknown";
+  if (permissions.admin === true) return "admin";
+  if (permissions.maintain === true || permissions.push === true || permissions.write === true) return "write";
+  if (permissions.triage === true || permissions.pull === true || permissions.read === true) return "read";
+  return "unknown";
+}
+
+function normalizePermissionAlias(value: unknown): "none" | CollaborationPermission | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized === "none") return "none";
+  if (normalized === "read" || normalized === "pull" || normalized === "triage") return "read";
+  if (normalized === "write" || normalized === "push" || normalized === "maintain") return "write";
+  if (normalized === "admin") return "admin";
+  return undefined;
 }
 
 export function createClawMemPlugin(api: OpenClawPluginApi): void { new ClawMemService(api).register(); }
