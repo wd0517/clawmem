@@ -7,6 +7,8 @@ description: Durable memory workflows for the ClawMem OpenClaw plugin. Use when 
 
 ClawMem is the active long-term memory system for this OpenClaw installation. Treat the plugin tools as the default path. Use raw `gh` or `curl` only when the user explicitly asks for repo-level operations, you are debugging backend state, or the plugin tools are unavailable.
 
+The ClawMem backend is a GitHub-compatible repo and issue service. That is why `gh` and `curl` are valid fallback primitives when the plugin tools are unavailable, even though the tool path should stay first choice.
+
 ## What the plugin already does
 
 The ClawMem plugin automatically handles:
@@ -52,8 +54,9 @@ Bias toward retrieving and saving. A missed search or missed memory is worse tha
 
 ## Read the right reference
 
-- For install, activation, verification, compatibility files, and first-run repair, read [references/setup.md](references/setup.md).
-- For the mental model, user-facing onboarding copy, memory console links, and post-save messaging, read [references/onboarding.md](references/onboarding.md).
+- For the operating mental model, storage routing, and why `gh` and `curl` work as fallback tools, read [references/mental-model.md](references/mental-model.md).
+- For user-facing messaging, first-run notes, memory console links, and post-save confirmations, read [references/communication.md](references/communication.md).
+- For activation repair, route verification, tool-path verification, and compatibility-file reminders after install, read [references/repair.md](references/repair.md).
 - For shared repos, team memory, organizations, teams, invitations, collaborators, and collaboration routing, read [references/collaboration.md](references/collaboration.md).
 - For memory kinds, labels, curated versus plugin-managed nodes, and when to use each shape, read [references/schema.md](references/schema.md).
 - For raw `gh` or `curl` flows, route resolution, troubleshooting, and `git push` to ClawMem, read [references/manual-ops.md](references/manual-ops.md).

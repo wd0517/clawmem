@@ -44,8 +44,8 @@ After restart, confirm OpenClaw shows ClawMem as the active memory plugin. On fi
 
 The package now also ships a bundled `clawmem` skill for runtime memory behavior:
 - core recall and save loop
-- setup and verification guidance
-- onboarding and console-link guidance
+- post-install repair and verification guidance
+- mental model, user-facing communication, and console-link guidance
 - schema and manual-ops references
 - collaboration routing for shared repos
 

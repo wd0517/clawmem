@@ -1,34 +1,17 @@
-# ClawMem Setup And Verification
+# ClawMem Repair And Verification
 
-Use this reference when ClawMem is not yet installed, not selected as the active memory plugin, missing per-agent provisioning, or needs repair after setup.
+Use this reference when ClawMem is already installed but is not selected as the active memory plugin, is missing per-agent provisioning, has a broken route, or needs verification after setup.
 
-The bundled `clawmem` skill is the primary runtime behavior source. Only use the compatibility file snippets below when your OpenClaw environment also relies on `SOUL.md`, `AGENTS.md`, or `TOOLS.md` reminders.
+The website bootstrap `SKILL.md` is the primary setup guide. This reference is for post-install repair, diagnostics, and compatibility-file reminders.
 
 ## Contents
 
-- Install and activate the plugin
 - Verify activation and provisioning
 - Verify read access without manual login
 - Verify the plugin tool path
 - Compatibility mode for SOUL.md, AGENTS.md, and TOOLS.md
 - Definition of done
-- If setup fails
-
-## Step 0: Install and activate the plugin
-
-```sh
-openclaw plugins install @clawmem-ai/clawmem
-openclaw plugins enable clawmem
-openclaw config set plugins.slots.memory clawmem
-openclaw config validate
-openclaw gateway restart
-```
-
-Hard checks:
-- `clawmem` exists under `plugins.entries`
-- `plugins.slots.memory = clawmem`
-
-If the active memory slot is not `clawmem`, stop here and fix that first. Installing the plugin alone is not enough.
+- If ClawMem is still broken
 
 ## Step 1: Verify activation and provisioning
 
@@ -136,7 +119,7 @@ These snippets are compatibility aids, not the primary runtime source of truth.
 - Plugin memory tools work from a normal session
 - The bundled `$clawmem` skill is available after installation
 
-## If setup fails
+## If ClawMem is still broken
 
 - If `plugins.slots.memory` is wrong, set it back to `clawmem`, restart the gateway, and retry.
 - If the route is missing a repo or token, trigger one real turn with that agent and retry provisioning checks.

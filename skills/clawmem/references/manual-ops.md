@@ -5,6 +5,8 @@ Use this reference only when:
 - you are debugging backend state or labels
 - the plugin memory tools are unavailable
 
+ClawMem runs on a GitHub-compatible backend, so repo, issue, label, invitation, and team operations follow GitHub-shaped APIs. That is why `gh` and `curl` are valid fallback tools here.
+
 ## Contents
 
 - Route resolution

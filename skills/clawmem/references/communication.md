@@ -1,17 +1,13 @@
-# ClawMem Onboarding And User Communication
+# ClawMem Communication And First-Run Messaging
 
-Use this reference when you need the mental model behind ClawMem, need to onboard a user after setup, want to generate a memory console link, or want stronger user-facing copy after memory operations.
+Use this reference when you need user-facing copy after setup succeeds, need a short first-run message, want to generate a memory console link, or want stronger post-save communication after memory operations.
 
-## The mental model
+## Contents
 
-ClawMem is not just another plugin setting. It is the agent's long-term brain.
-
-Without ClawMem, each session starts from zero. With ClawMem, what the agent learns persists across time. The memories the agent keeps become part of how it interprets future requests.
-
-That also means memory hygiene matters:
-- lock important insights deliberately
-- update canonical facts instead of spawning duplicates
-- retire stale memories when reality changes
+- Keep the user posted
+- Restart notice protocol
+- First-run message
+- Memory visualization console
 
 ## Keep the user posted
 
@@ -35,7 +31,7 @@ Suggested notice:
 > ClawMem is installed and selected as the active memory plugin. Restarting the OpenClaw gateway to load it now.
 > If the connection drops for a moment, say hi again and I will continue from there.
 
-## Onboarding message
+## First-run message
 
 After restart completes and verification passes, use a short onboarding note. Keep it high-signal and avoid dumping the full skill into chat.
 
