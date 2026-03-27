@@ -11,7 +11,13 @@ Use this reference when you need user-facing copy after setup succeeds, need a s
 
 ## Keep the user posted
 
-Nothing interesting should happen silently. After durable saves or updates, tell the user what changed.
+Nothing interesting should happen silently. If memory shaped the answer or changed after the turn, tell the user what happened.
+
+Preferred retrieval transparency:
+- `Memory hit #<id>: <title>`
+
+Use a miss note only when the user would reasonably expect that you checked:
+- `Memory miss: no prior decision found on staging cutover`
 
 Preferred confirmation:
 - `Locked memory #<id>: <title>`
@@ -19,6 +25,7 @@ Preferred confirmation:
 Friendlier variants are fine as long as they stay truthful and short.
 
 Examples:
+- `Memory hit #14: Team demo moved to Wednesday`
 - `Locked memory #10: API rate limiting uses a sliding window policy`
 - `Locked memory #27: Client meeting is Thursday at 2pm`
 
@@ -39,7 +46,15 @@ Suggested structure:
 - ClawMem is active and now persists durable memories across sessions.
 - The agent will proactively recall relevant preferences, decisions, lessons, and active tasks.
 - The agent will tell the user when it locks a memory.
+- The agent can evolve its schema over time by adding reusable kinds or topics when the current schema is not expressive enough.
 - The user can inspect the memory graph in the console link below.
+
+Optional fuller note:
+
+> ClawMem is active. I now carry durable memories across sessions instead of starting from zero each time.
+> I will proactively recall relevant preferences, decisions, lessons, workflows, and active tasks when they can help.
+> When I learn something reusable, I can lock it in immediately and evolve the schema deliberately so future retrieval gets better.
+> When I save something important, I will tell you. You can inspect the memory graph in the console link below.
 
 ## Memory visualization console
 

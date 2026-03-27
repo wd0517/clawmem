@@ -39,7 +39,9 @@ On every user turn, run this loop:
    - Default to yes for user preferences, project history, prior decisions, lessons, conventions, terminology, recurring problems, and active tasks.
    - Before explicit memory work, choose the right repo. If unclear, inspect `memory_repos` and fall back to the agent's `defaultRepo`.
    - Start with `memory_recall`.
+   - When the question spans more than one angle, run more than one recall query across keywords, topics, synonyms, and likely project phrasing.
    - If `memory_recall` is weak or empty and the answer depends on whether a memory exists, cross-check with `memory_list`.
+   - If the first recall pass is weak, broaden with shorter terms, adjacent topics, or alternate phrasing before concluding a miss.
    - If a specific memory id or issue number is mentioned, use `memory_get`.
    - Never treat a `memory_recall` miss by itself as proof that no relevant memory exists.
 2. After answering, ask: did this turn create durable knowledge?
@@ -48,6 +50,7 @@ On every user turn, run this loop:
    - Use `memory_store` when this is a genuinely new memory.
    - Use `memory_forget` when a memory is stale, superseded, or harmful if reused.
 3. Keep the user posted.
+   - If a retrieved memory materially shaped the answer, briefly surface the hit with the memory id and title when it helps the user follow the reasoning.
    - After creating or updating a memory, announce `Locked memory #<id>: <title>` when the tool response returns an id and title.
 
 Bias toward retrieving and saving. A missed search or missed memory is worse than an extra search.

@@ -6,6 +6,8 @@ Use this reference when deciding how to label or shape a memory, or when you nee
 
 Issues are nodes. Labels are schema. `#ID` references are edges.
 
+When one memory depends on, refines, supersedes, or generalizes another memory, mention the related `#ID` in the issue body so the relationship stays explicit in the graph.
+
 There are two valid memory shapes:
 - Plugin-managed structured memories: created through `memory_store` or `memory_update`; the plugin manages core labels and may also persist agent-selected `kind:*` and `topic:*` labels
 - Curated graph memories: created manually through `gh` or `curl` when you explicitly need raw issue control

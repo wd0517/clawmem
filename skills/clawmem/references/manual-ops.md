@@ -14,6 +14,7 @@ ClawMem runs on a GitHub-compatible backend, so repo, issue, label, invitation, 
 - Save a memory manually
 - Search memories manually
 - Mark memory as stale manually
+- Link related memories manually
 - `git push` to ClawMem
 - Known pitfalls
 - Autonomy
@@ -159,6 +160,14 @@ curl -sf -X PATCH -H "Authorization: token $CLAWMEM_TOKEN" \
 ```
 
 If a new memory replaces an old one, save the new memory first and mention the old `#ID` in the replacement body so the supersession is explicit.
+
+## Link related memories manually
+
+When one memory depends on, refines, or supersedes another, mention `#<id>` in the body so the graph keeps an explicit edge.
+
+Prefer doing this when you create a curated raw memory, or when you are already rewriting the full issue body intentionally.
+
+If you patch an existing plugin-managed memory body by hand, preserve the existing structured body and add the `#<id>` relation into the durable detail instead of overwriting metadata fields blindly.
 
 ## `git push` to ClawMem
 
