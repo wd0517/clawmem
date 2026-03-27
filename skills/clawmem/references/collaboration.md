@@ -1,21 +1,28 @@
----
-name: clawmem-collaboration
-description: "Use this skill for ClawMem collaboration or collabration tasks: shared memory repos, organizations, teams, collaborators, invitations, outside collaborators, and repo-access governance. Use it when the user wants an agent to create or manage shared memory spaces, org membership, team membership, repo sharing, or repository permissions in the ClawMem backend."
-metadata: { "openclaw": { "emoji": "🤝" } }
----
-
 # ClawMem Collaboration
 
-Use this skill for collaboration governance.
-Do **not** use it for normal memory recall/store flows unless the user is specifically asking to change who can access a memory repo.
+Use this reference when memory should live in a shared repo instead of one agent's private default repo, or when multiple agents or teammates need to read and write the same memory space. Use it for both `collaboration` and `collabration` requests.
+
+## Contents
+
+- When to use
+- Default operating style
+- Repo routing and shared spaces
+- Collaboration model
+- Choose the right mechanism
+- Pre-mutation checklist
+- Prompt-to-tool mapping
+- Team memory quality bar
+- Collaboration rule of thumb
+- Manual org-owned shared repo creation
+- Fallback mode
 
 ## When to use
 
-Use this skill when the user asks to:
+Use this reference when the user asks to:
 
 - create or manage an organization
 - invite someone into an organization
-- inspect, accept, or decline an invitation that someone sent to the current user
+- inspect, accept, or decline an invitation sent to the current user
 - create or manage a team
 - add or remove a repository collaborator
 - grant a team access to a repo
@@ -23,21 +30,19 @@ Use this skill when the user asks to:
 - create a shared team memory repo or org-owned memory space
 - debug why a user can or cannot access a repo
 
-Trigger on both spellings:
-
-- `collaboration`
-- `collabration`
+Do not use this workflow for ordinary memory recall or save actions unless the user is specifically asking to change who can access a memory repo.
 
 ## Default operating style
 
 - Prefer the built-in ClawMem collaboration tools first.
-- Fall back to `gh api` or `curl` only when plugin tools are unavailable or when debugging backend behavior directly.
+- Inspect current state before mutating anything.
+- Set `confirmed=true` only after the user has approved the exact org, team, repo, invitation, or permission change.
+- Fall back to `gh api` or `curl` only when plugin tools are unavailable, when debugging backend behavior directly, or when you must create an org-owned repo because the plugin does not expose an org-repo creation tool yet.
 - Reuse the main `clawmem` skill's route-resolution helper when raw shell access is required.
 - Think in canonical runtime permissions: `read`, `write`, `admin`.
 - Treat GitHub-compatible aliases such as `pull`, `triage`, `push`, and `maintain` as transport compatibility only.
 
 Tool-first rule:
-
 - Read-only inspection:
   - `collaboration_orgs`
   - `collaboration_teams`
@@ -64,17 +69,32 @@ Tool-first rule:
   - `collaboration_user_org_invitation_accept`
   - `collaboration_user_org_invitation_decline`
 
-All write tools require `confirmed=true`.
-Do not set `confirmed=true` until the user has approved the exact org/team/repo/permission change.
+## Repo routing and shared spaces
 
-## Core model
+Before explicit memory operations, choose the right repo:
+- Private personal memory: usually the current agent's `defaultRepo`
+- Project memory: the relevant project repo
+- Shared or team knowledge: the shared repo for that team or project
+- Unclear: inspect `memory_repos`, then choose deliberately
+
+Do not treat `defaultRepo` as the only space. It is only the fallback.
+
+Default tool path:
+- Use `memory_repos` to inspect accessible spaces
+- Use `memory_repo_create` when a new repo should be owned by the current agent identity
+- Create an org-owned repo with raw `gh api` or `curl` when the memory space must be governed by an organization team
+- Pass `repo` explicitly to `memory_recall`, `memory_list`, `memory_get`, `memory_store`, `memory_update`, and `memory_forget` when the target is not the current `defaultRepo`
+
+This keeps private memory, project memory, and shared memory separate without forcing extra plugin configuration changes.
+
+## Collaboration model
 
 Reason with these rules before every collaboration action:
 
 - An organization is an explicit governance boundary.
 - Org membership is explicit and separate from team membership.
 - Teams are org-scoped authorization groups, not social groups.
-- Effective repo access is `max(org base permission, direct collaborator grant, team grant)` after owner/admin shortcuts.
+- Effective repo access is `max(org base permission, direct collaborator grant, team grant)` after owner or admin shortcuts.
 - Runtime permissions are only `none`, `read`, `write`, and `admin`.
 - `memory_repos` only shows repos that are already accessible now; it does not prove there are no pending invitations.
 - A repo collaborator grant may create a pending repository invitation instead of immediate access when the target user is not already a collaborator.
@@ -94,10 +114,10 @@ Use this decision map:
 | Bring one user into the org | Org invitation |
 | Grant a group access to selected repos | Team + team-repo grant |
 | Create a shared team memory space | Org-owned repo + team-repo grant |
+| Create another memory space under the current agent identity | `memory_repo_create` |
 | Inspect non-members who still have repo access | Outside collaborator listing |
 
 Hard rules:
-
 - Never assume team membership creates org membership.
 - Never use team membership as a side-door org bootstrap.
 - Never assume a repo share should become org membership; choose intentionally.
@@ -119,46 +139,70 @@ Read-only checks can run without confirmation.
 
 Translate user intent like this:
 
-- "Create a shared memory repo for team X"
-  - inspect org/teams first
-  - create the repo with `memory_repo_create` or raw repo tooling if needed
+- `Create a shared memory repo for team X`
+  - inspect or create the org and team first
+  - if the repo should be team-governed, create an org-owned repo with raw `gh api` or `curl`; `memory_repo_create` only creates repos under the current agent identity
   - grant the team access with `collaboration_team_repo_set`
-- "Give Alice access to this one memory repo"
+- `Give Alice access to this one memory repo`
   - inspect direct collaborators first with `collaboration_repo_collaborators`
   - then use `collaboration_repo_collaborator_set`
   - if the user was not already a collaborator, expect a pending repo invitation and verify with `collaboration_repo_invitations`
-- "Bring Alice into the org and platform team"
+- `Bring Alice into the org and platform team`
   - inspect teams first with `collaboration_teams`
   - then use `collaboration_org_invitation_create`
-- "Someone shared a memory repo with me; can you see it and accept it?"
+- `Someone shared a memory repo with me; can you see it and accept it?`
   - start with `collaboration_user_repo_invitations`
   - do not treat a `memory_repos` miss as proof that no share exists
   - if the correct pending invite is visible and the user asked to accept it, use `collaboration_user_repo_invitation_accept`
-- "I still cannot see the shared memory repo"
+- `I still cannot see the shared memory repo`
   - inspect `collaboration_user_repo_invitations` first
   - if needed, have the repo owner inspect `collaboration_repo_invitations`
-- "Why can Bob still see this repo?"
+- `Why can Bob still see this repo?`
   - start with `collaboration_repo_access_inspect`
   - then drill into `collaboration_repo_collaborators`, `collaboration_repo_invitations`, `collaboration_team_repos`, `collaboration_outside_collaborators`, and `collaboration_org_invitations` as needed
-- "Remove Carol from org-shared memory access"
+- `Remove Carol from org-shared memory access`
   - identify whether access comes from a direct collaborator grant, a team repo grant, or a pending invitation
   - remove the actual source of access rather than guessing
 
-## Recommended workflow
+## Team memory quality bar
 
-For read-only analysis:
+- Private memories can start rough and become cleaner over time
+- Shared memories should be conclusions, not speculation
+- When access is governed by teams or org policy, prefer org-owned repos over one user's private space
+- Use stable `kind:*` and `topic:*` labels so different agents can retrieve the same schema
+- Prefer updating a canonical shared fact in place instead of creating competing duplicates
 
-1. Identify the target org/repo/team.
-2. Use the relevant read-only collaboration tools.
-3. Summarize the current state in canonical terms: org membership, team grants, direct collaborator grants, pending repo invitations, outside collaborators, pending org invitations.
+## Collaboration rule of thumb
 
-For write actions:
+If knowledge should stay personal, keep it in the agent's default repo. If it should shape multiple agents or people, put it in a shared repo and target that repo explicitly on retrieval and save.
 
-1. Inspect current state first.
-2. Tell the user exactly what will change.
-3. Wait for explicit approval.
-4. Re-run the write tool with `confirmed=true`.
-5. Summarize the result and name the affected org/team/repo explicitly.
+## Manual org-owned shared repo creation
+
+Use the plugin tool path first. If the memory space must be org-governed, create an org-owned repo directly because `memory_repo_create` only creates repos under the current agent identity.
+
+### With `gh api`
+
+```sh
+GH_HOST="$CLAWMEM_HOST" GH_ENTERPRISE_TOKEN="$CLAWMEM_TOKEN" \
+  gh api -X POST "/orgs/<org>/repos" \
+    -f name='team-memory' \
+    -F private=true \
+    -F has_issues=true
+```
+
+### With `curl`
+
+```sh
+curl -sf -X POST "$CLAWMEM_BASE_URL/orgs/<org>/repos" \
+  -H "Authorization: token $CLAWMEM_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "team-memory", "private": true, "has_issues": true}'
+```
+
+After the repo exists:
+- grant the team access with `collaboration_team_repo_set`
+- use the main memory tools with explicit `repo` targeting for read and write flows
+- reuse [manual-ops.md](manual-ops.md) only if you need raw memory issue control after the repo already exists
 
 ## Fallback mode
 

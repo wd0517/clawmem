@@ -188,7 +188,7 @@ class ClawMemService {
 
     this.api.registerTool({
       name: "memory_labels",
-      description: "List existing ClawMem schema labels so the agent can reuse current kinds and topics before adding new ones.",
+      description: "List existing ClawMem schema labels so the agent can reuse current kinds and topics first, then extend the schema deliberately when a new reusable label is justified.",
       required: true,
       parameters: {
         type: "object",
