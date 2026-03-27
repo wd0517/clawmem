@@ -6,13 +6,14 @@ Use this reference when memory should live in a shared repo instead of one agent
 
 - When to use
 - Default operating style
-- Repo routing for collaboration
+- Repo routing and shared spaces
 - Collaboration model
 - Choose the right mechanism
 - Pre-mutation checklist
 - Prompt-to-tool mapping
-- Recommended workflow
-- Manual shared repo creation
+- Team memory quality bar
+- Collaboration rule of thumb
+- Manual org-owned shared repo creation
 - Fallback mode
 
 ## When to use
@@ -34,7 +35,9 @@ Do not use this workflow for ordinary memory recall or save actions unless the u
 ## Default operating style
 
 - Prefer the built-in ClawMem collaboration tools first.
-- Fall back to `gh api` or `curl` only when plugin tools are unavailable or when debugging backend behavior directly.
+- Inspect current state before mutating anything.
+- Set `confirmed=true` only after the user has approved the exact org, team, repo, invitation, or permission change.
+- Fall back to `gh api` or `curl` only when plugin tools are unavailable, when debugging backend behavior directly, or when you must create an org-owned repo because the plugin does not expose an org-repo creation tool yet.
 - Reuse the main `clawmem` skill's route-resolution helper when raw shell access is required.
 - Think in canonical runtime permissions: `read`, `write`, `admin`.
 - Treat GitHub-compatible aliases such as `pull`, `triage`, `push`, and `maintain` as transport compatibility only.
@@ -66,9 +69,7 @@ Tool-first rule:
   - `collaboration_user_org_invitation_accept`
   - `collaboration_user_org_invitation_decline`
 
-All write tools require `confirmed=true`. Do not set `confirmed=true` until the user has approved the exact org, team, repo, invitation, or permission change.
-
-## Repo routing for collaboration
+## Repo routing and shared spaces
 
 Before explicit memory operations, choose the right repo:
 - Private personal memory: usually the current agent's `defaultRepo`
@@ -78,11 +79,10 @@ Before explicit memory operations, choose the right repo:
 
 Do not treat `defaultRepo` as the only space. It is only the fallback.
 
-## Shared memory workflow
-
 Default tool path:
 - Use `memory_repos` to inspect accessible spaces
-- Use `memory_repo_create` when a new shared memory repo is actually needed
+- Use `memory_repo_create` when a new repo should be owned by the current agent identity
+- Create an org-owned repo with raw `gh api` or `curl` when the memory space must be governed by an organization team
 - Pass `repo` explicitly to `memory_recall`, `memory_list`, `memory_get`, `memory_store`, `memory_update`, and `memory_forget` when the target is not the current `defaultRepo`
 
 This keeps private memory, project memory, and shared memory separate without forcing extra plugin configuration changes.
@@ -114,6 +114,7 @@ Use this decision map:
 | Bring one user into the org | Org invitation |
 | Grant a group access to selected repos | Team + team-repo grant |
 | Create a shared team memory space | Org-owned repo + team-repo grant |
+| Create another memory space under the current agent identity | `memory_repo_create` |
 | Inspect non-members who still have repo access | Outside collaborator listing |
 
 Hard rules:
@@ -139,8 +140,8 @@ Read-only checks can run without confirmation.
 Translate user intent like this:
 
 - `Create a shared memory repo for team X`
-  - inspect orgs or teams first
-  - create the repo with `memory_repo_create` or raw repo tooling if needed
+  - inspect or create the org and team first
+  - if the repo should be team-governed, create an org-owned repo with raw `gh api` or `curl`; `memory_repo_create` only creates repos under the current agent identity
   - grant the team access with `collaboration_team_repo_set`
 - `Give Alice access to this one memory repo`
   - inspect direct collaborators first with `collaboration_repo_collaborators`
@@ -163,65 +164,45 @@ Translate user intent like this:
   - identify whether access comes from a direct collaborator grant, a team repo grant, or a pending invitation
   - remove the actual source of access rather than guessing
 
-## Recommended workflow
-
-For read-only analysis:
-
-1. Identify the target org, repo, or team.
-2. Use the relevant read-only collaboration tools.
-3. Summarize the current state in canonical terms: org membership, team grants, direct collaborator grants, pending repo invitations, outside collaborators, and pending org invitations.
-
-For write actions:
-
-1. Inspect current state first.
-2. Tell the user exactly what will change.
-3. Wait for explicit approval.
-4. Re-run the write tool with `confirmed=true`.
-5. Summarize the result and name the affected org, team, and repo explicitly.
-
 ## Team memory quality bar
 
 - Private memories can start rough and become cleaner over time
 - Shared memories should be conclusions, not speculation
+- When access is governed by teams or org policy, prefer org-owned repos over one user's private space
 - Use stable `kind:*` and `topic:*` labels so different agents can retrieve the same schema
 - Prefer updating a canonical shared fact in place instead of creating competing duplicates
-
-## Manual shared repo creation
-
-Use the plugin tool path first. If raw repo control is required, create the repo directly:
-
-```sh
-curl -X POST "$CLAWMEM_BASE_URL/user/repos" \
-  -H "Authorization: token $CLAWMEM_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "team-memory", "private": false, "has_issues": true}'
-```
-
-Then read or write shared memories explicitly against that repo.
-
-### Write a shared memory with `gh`
-
-```sh
-GH_HOST="$CLAWMEM_HOST" GH_ENTERPRISE_TOKEN="$CLAWMEM_TOKEN" \
-  gh issue create --repo "<owner/team-memory>" \
-    --title "Memory: <concise title>" \
-    --body "<durable conclusion>" \
-    --label "type:memory"
-```
-
-### Read shared memories with `gh`
-
-```sh
-GH_HOST="$CLAWMEM_HOST" GH_ENTERPRISE_TOKEN="$CLAWMEM_TOKEN" \
-  gh issue list --repo "<owner/team-memory>" \
-    --state open \
-    --label "type:memory" \
-    --json number,title,body,labels,updatedAt
-```
 
 ## Collaboration rule of thumb
 
 If knowledge should stay personal, keep it in the agent's default repo. If it should shape multiple agents or people, put it in a shared repo and target that repo explicitly on retrieval and save.
+
+## Manual org-owned shared repo creation
+
+Use the plugin tool path first. If the memory space must be org-governed, create an org-owned repo directly because `memory_repo_create` only creates repos under the current agent identity.
+
+### With `gh api`
+
+```sh
+GH_HOST="$CLAWMEM_HOST" GH_ENTERPRISE_TOKEN="$CLAWMEM_TOKEN" \
+  gh api -X POST "/orgs/<org>/repos" \
+    -f name='team-memory' \
+    -F private=true \
+    -F has_issues=true
+```
+
+### With `curl`
+
+```sh
+curl -sf -X POST "$CLAWMEM_BASE_URL/orgs/<org>/repos" \
+  -H "Authorization: token $CLAWMEM_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "team-memory", "private": true, "has_issues": true}'
+```
+
+After the repo exists:
+- grant the team access with `collaboration_team_repo_set`
+- use the main memory tools with explicit `repo` targeting for read and write flows
+- reuse [manual-ops.md](manual-ops.md) only if you need raw memory issue control after the repo already exists
 
 ## Fallback mode
 
