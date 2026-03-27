@@ -4,6 +4,9 @@
   "version": "0.1.10",
   "description": "Mirror OpenClaw sessions into GitHub-compatible issues and comments.",
   "kind": "memory",
+  "skills": [
+    "./skills"
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": true,
