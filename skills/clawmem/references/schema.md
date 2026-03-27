@@ -48,12 +48,13 @@ If you create a curated memory manually, include:
 | A repeatable workflow you figured out | `kind:skill` |
 | Ongoing work to track | `kind:task` |
 
-## Schema discipline
+## Disciplined self-evolution
 
 - Before inventing a new `kind` or `topic`, call `memory_labels`.
 - Reuse current schema when it already fits.
-- If you truly need a new label, keep it short, general, and reusable.
-- Do not invent random label prefixes. New schema must stay within `kind:*` and `topic:*`.
+- If the current schema does not fit and a new label would help future retrieval, coordination, or reuse, create it deliberately.
+- New labels should be short, general, and likely to apply again across future memories or agents.
+- Do not invent random label prefixes. Schema evolution must stay within `kind:*` and `topic:*`.
 
 ## Storage rule
 

@@ -55,6 +55,7 @@ Bias toward retrieving and saving. A missed search or missed memory is worse tha
 ## Retrieval and storage rules
 
 - Before inventing a new `kind` or `topic`, call `memory_labels` and reuse the existing schema when possible.
+- If the current schema does not fit and a new label would improve future retrieval or reuse, extend the schema intentionally within `kind:*` and `topic:*`.
 - Reuse stable labels over one-off labels.
 - Private personal memory usually belongs in the agent's `defaultRepo`.
 - Project memory belongs in the relevant project repo.
