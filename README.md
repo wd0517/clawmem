@@ -5,8 +5,8 @@
 **What it does:**
 - Creates one `type:conversation` issue per session, mirrors the full transcript as comments.
 - During request-scoped hooks: best-effort extracts durable memories and stores each as a `type:memory` issue.
-- On session start: searches active memories by relevance and injects them into context.
-- Lets agents inspect memory indexes and schema, fetch exact memories, update canonical facts in place, and write structured memories with `kind:*` and `topic:*` labels through plugin tools.
+- On session start: searches active memories with multi-query recall, reranks them locally, and injects only confident matches into context.
+- Lets agents inspect memory indexes and schema, fetch exact memories, update canonical facts in place, and write structured memories with `kind:*`, `topic:*`, and `source:*` metadata through plugin tools.
 
 ---
 
@@ -137,7 +137,10 @@ Full config with all options:
           },
           turnCommentDelayMs: 1000,
           summaryWaitTimeoutMs: 120000,
-          memoryRecallLimit: 5
+          memoryRecallLimit: 5,
+          memoryAutoRecallLimit: 5,
+          memorySearchCandidateLimit: 25,
+          memoryRecallMinScore: 8
         }
       }
     }
@@ -152,12 +155,13 @@ Full config with all options:
 - Conversation comments exclude tool calls, tool results, system messages, and heartbeat noise.
 - Summary failures do not block finalization; the `summary` field is written as `failed: ...`.
 - Memory search and auto-injection only return open `type:memory` issues. Closed memory issues are treated as stale.
-- `memory_recall` now prefers the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`; if backend search fails, clawmem falls back to local lexical ranking.
+- `memory_recall` now gathers candidates with multiple query rewrites, prefers the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`, reranks locally, and abstains on weak matches.
 - Durable memories are extracted best-effort during later request-scoped maintenance, not by background subagent work after a request has already ended.
 - The plugin exposes `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
 - Route resolution is now: agent identity supplies credentials, `defaultRepo` is the fallback memory space, and explicit tool calls may override repo per operation.
-- `memory_store` accepts optional schema hints such as kind and topics; the plugin normalizes them into managed `kind:*` and `topic:*` labels.
+- `memory_store` accepts optional schema hints such as kind and topics, plus retrieval metadata such as `sourceRole`, `entities`, `factType`, `eventDate`, and `timeAnchor`.
 - Memory issues no longer use `session:*` labels. Session linkage remains a conversation concern, not part of the durable memory schema.
 - `memory_update` updates one existing memory issue in place; use it for evolving canonical facts or active tasks instead of creating a duplicate node.
 - Conversation lifecycle is stored in native issue state (`open` while live, `closed` after finalize); memory lifecycle uses native issue state too (`open` active, `closed` stale).
-- Memory issue bodies store the durable detail plus flat metadata such as `memory_hash` and logical `date`; labels are reserved for schema and routing.
+- Memory extraction now prefers one atomic fact per memory item instead of bundling whole sessions into a single node.
+- Memory issue bodies store the durable detail plus flat metadata such as `memory_hash`, logical `date`, `source_role`, `entities_json`, `fact_type`, `event_date`, and `time_anchor`; labels stay focused on schema and routing.

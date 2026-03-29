@@ -159,6 +159,8 @@ class ClawMemService {
           status: { type: "string", enum: ["active", "stale", "all"], description: "Which memories to list. Defaults to active." },
           kind: { type: "string", minLength: 1, description: "Optional kind filter, for example core-fact, lesson, or task." },
           topic: { type: "string", minLength: 1, description: "Optional topic filter." },
+          sourceRole: { type: "string", enum: ["user", "assistant"], description: "Optional source role filter." },
+          factType: { type: "string", minLength: 1, description: "Optional fact type filter, for example preference, decision, or assistant-knowledge." },
           limit: { type: "integer", minimum: 1, maximum: 200, description: "Maximum number of memories to return." },
           repo: { type: "string", minLength: 3, description: "Optional memory repo override in owner/repo form. Defaults to the agent's defaultRepo." },
           agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
@@ -173,9 +175,17 @@ class ClawMemService {
         const limit = typeof p.limit === "number" && Number.isFinite(p.limit) ? Math.floor(p.limit) : 20;
         const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
         const topic = typeof p.topic === "string" && p.topic.trim() ? p.topic.trim() : undefined;
-        const memories = await resolved.mem.listMemories({ status, kind, topic, limit });
+        const sourceRole = p.sourceRole === "assistant" || p.sourceRole === "user" ? p.sourceRole : undefined;
+        const factType = typeof p.factType === "string" && p.factType.trim() ? p.factType.trim() : undefined;
+        const memories = await resolved.mem.listMemories({ status, kind, topic, sourceRole, factType, limit });
         if (memories.length === 0) {
-          const filters = [status !== "active" ? `status=${status}` : "", kind ? `kind=${kind}` : "", topic ? `topic=${topic}` : ""].filter(Boolean).join(", ");
+          const filters = [
+            status !== "active" ? `status=${status}` : "",
+            kind ? `kind=${kind}` : "",
+            topic ? `topic=${topic}` : "",
+            sourceRole ? `sourceRole=${sourceRole}` : "",
+            factType ? `factType=${factType}` : "",
+          ].filter(Boolean).join(", ");
           return toolText(`No memories matched in ${resolved.route.repo}${filters ? ` (${filters})` : ""}.`);
         }
         const lines = [
@@ -302,6 +312,17 @@ class ClawMemService {
             minItems: 1,
             maxItems: 10,
           },
+          sourceRole: { type: "string", enum: ["user", "assistant"], description: "Optional source role for the remembered fact." },
+          entities: {
+            type: "array",
+            description: "Optional entity anchors such as people, products, or organizations.",
+            items: { type: "string", minLength: 1 },
+            minItems: 1,
+            maxItems: 8,
+          },
+          factType: { type: "string", minLength: 1, description: "Optional fine-grained fact type such as preference, decision, or assistant-knowledge." },
+          eventDate: { type: "string", minLength: 4, description: "Optional normalized event date in YYYY-MM-DD form when the fact is date-bound." },
+          timeAnchor: { type: "string", minLength: 1, description: "Optional relative time expression such as next quarter or yesterday." },
           repo: { type: "string", minLength: 3, description: "Optional memory repo override in owner/repo form. Defaults to the agent's defaultRepo." },
           agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
         },
@@ -316,7 +337,21 @@ class ClawMemService {
         if ("error" in resolved) return toolText(resolved.error);
         const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
         const topics = Array.isArray(p.topics) ? p.topics.filter((topic): topic is string => typeof topic === "string" && topic.trim().length > 0) : undefined;
-        const result = await resolved.mem.store({ detail, ...(kind ? { kind } : {}), ...(topics && topics.length > 0 ? { topics } : {}) });
+        const sourceRole = p.sourceRole === "assistant" || p.sourceRole === "user" ? p.sourceRole : undefined;
+        const entities = Array.isArray(p.entities) ? p.entities.filter((entity): entity is string => typeof entity === "string" && entity.trim().length > 0) : undefined;
+        const factType = typeof p.factType === "string" && p.factType.trim() ? p.factType.trim() : undefined;
+        const eventDate = typeof p.eventDate === "string" && p.eventDate.trim() ? p.eventDate.trim() : undefined;
+        const timeAnchor = typeof p.timeAnchor === "string" && p.timeAnchor.trim() ? p.timeAnchor.trim() : undefined;
+        const result = await resolved.mem.store({
+          detail,
+          ...(kind ? { kind } : {}),
+          ...(topics && topics.length > 0 ? { topics } : {}),
+          ...(sourceRole ? { sourceRole } : {}),
+          ...(entities && entities.length > 0 ? { entities } : {}),
+          ...(factType ? { factType } : {}),
+          ...(eventDate ? { eventDate } : {}),
+          ...(timeAnchor ? { timeAnchor } : {}),
+        });
         if (!result.created) return toolText(`Memory already exists in ${resolved.route.repo}.\n${renderMemoryBlock(result.memory)}`);
         return toolText(`Stored memory in ${resolved.route.repo}.\n${renderMemoryBlock(result.memory)}`);
       },
@@ -340,6 +375,17 @@ class ClawMemService {
             minItems: 1,
             maxItems: 10,
           },
+          sourceRole: { type: "string", enum: ["user", "assistant"], description: "Optional replacement source role." },
+          entities: {
+            type: "array",
+            description: "Optional replacement entity anchors.",
+            items: { type: "string", minLength: 1 },
+            minItems: 1,
+            maxItems: 8,
+          },
+          factType: { type: "string", minLength: 1, description: "Optional replacement fact type." },
+          eventDate: { type: "string", minLength: 4, description: "Optional replacement event date in YYYY-MM-DD form." },
+          timeAnchor: { type: "string", minLength: 1, description: "Optional replacement relative time anchor." },
           repo: { type: "string", minLength: 3, description: "Optional memory repo override in owner/repo form. Defaults to the agent's defaultRepo." },
           agentId: { type: "string", minLength: 1, description: "Optional agent route override. Defaults to the current agent when available." },
         },
@@ -352,13 +398,29 @@ class ClawMemService {
         const detail = typeof p.detail === "string" && p.detail.trim() ? p.detail.trim() : undefined;
         const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
         const topics = Array.isArray(p.topics) ? p.topics.filter((topic): topic is string => typeof topic === "string" && topic.trim().length > 0) : undefined;
-        if (!detail && kind === undefined && topics === undefined) return toolText("Provide at least one of detail, kind, or topics.");
+        const sourceRole = p.sourceRole === "assistant" || p.sourceRole === "user" ? p.sourceRole : undefined;
+        const entities = Array.isArray(p.entities) ? p.entities.filter((entity): entity is string => typeof entity === "string" && entity.trim().length > 0) : undefined;
+        const factType = typeof p.factType === "string" && p.factType.trim() ? p.factType.trim() : undefined;
+        const eventDate = typeof p.eventDate === "string" && p.eventDate.trim() ? p.eventDate.trim() : undefined;
+        const timeAnchor = typeof p.timeAnchor === "string" && p.timeAnchor.trim() ? p.timeAnchor.trim() : undefined;
+        if (!detail && kind === undefined && topics === undefined && sourceRole === undefined && entities === undefined && factType === undefined && eventDate === undefined && timeAnchor === undefined) {
+          return toolText("Provide at least one of detail, kind, topics, sourceRole, entities, factType, eventDate, or timeAnchor.");
+        }
         const agentId = this.resolveToolAgentId(p.agentId);
         const resolved = await this.requireToolRoute(agentId, p.repo);
         if ("error" in resolved) return toolText(resolved.error);
         let updated;
         try {
-          updated = await resolved.mem.update(memoryId, { ...(detail ? { detail } : {}), ...(kind !== undefined ? { kind } : {}), ...(topics !== undefined ? { topics } : {}) });
+          updated = await resolved.mem.update(memoryId, {
+            ...(detail ? { detail } : {}),
+            ...(kind !== undefined ? { kind } : {}),
+            ...(topics !== undefined ? { topics } : {}),
+            ...(sourceRole !== undefined ? { sourceRole } : {}),
+            ...(entities !== undefined ? { entities } : {}),
+            ...(factType !== undefined ? { factType } : {}),
+            ...(eventDate !== undefined ? { eventDate } : {}),
+            ...(timeAnchor !== undefined ? { timeAnchor } : {}),
+          });
         } catch (error) {
           return toolText(`Unable to update memory "${memoryId}": ${String(error)}`);
         }
@@ -1287,9 +1349,9 @@ class ClawMemService {
     if (typeof prompt !== "string" || prompt.trim().length < 5) return;
     try {
       const { mem } = this.getServices(routeAgentId);
-      const memories = await mem.search(prompt, this.config.memoryRecallLimit);
+      const memories = await mem.search(prompt, this.config.memoryAutoRecallLimit);
       if (memories.length === 0) return;
-      const text = memories.map((m) => `- ${m.detail}`).join("\n");
+      const text = memories.map((m) => `- ${formatInjectedMemory(m)}`).join("\n");
       return { prependContext: `<relevant-memories>\nThe following active memories may be relevant to this conversation:\n${text}\n</relevant-memories>` };
     } catch (error) { this.api.logger.warn(`clawmem: memory recall failed: ${String(error)}`); }
   }
@@ -1706,11 +1768,39 @@ function shouldFallbackToAnonymousBootstrap(error: unknown): boolean {
 function toolText(text: string): { content: Array<{ type: "text"; text: string }> } {
   return { content: [{ type: "text", text }] };
 }
-function renderMemoryLine(memory: { memoryId: string; title?: string; detail: string; kind?: string; topics?: string[]; status: "active" | "stale" }): string {
-  const schema = [memory.kind ? `kind:${memory.kind}` : "", ...(memory.topics ?? []).map((topic) => `topic:${topic}`)].filter(Boolean).join(", ");
+function renderMemoryLine(memory: {
+  memoryId: string;
+  title?: string;
+  detail: string;
+  kind?: string;
+  topics?: string[];
+  sourceRole?: "user" | "assistant";
+  factType?: string;
+  status: "active" | "stale";
+}): string {
+  const schema = [
+    memory.kind ? `kind:${memory.kind}` : "",
+    ...(memory.topics ?? []).map((topic) => `topic:${topic}`),
+    memory.sourceRole ? `source:${memory.sourceRole}` : "",
+    memory.factType ? `factType:${memory.factType}` : "",
+  ].filter(Boolean).join(", ");
   return `[${memory.memoryId}] ${memory.title || "Memory"}${schema ? ` (${schema})` : ""}${memory.status === "stale" ? " [stale]" : ""}: ${memory.detail}`;
 }
-function renderMemoryBlock(memory: { memoryId: string; issueNumber?: number; title?: string; detail: string; kind?: string; topics?: string[]; status: "active" | "stale"; date?: string }): string {
+function renderMemoryBlock(memory: {
+  memoryId: string;
+  issueNumber?: number;
+  title?: string;
+  detail: string;
+  kind?: string;
+  topics?: string[];
+  sourceRole?: "user" | "assistant";
+  entities?: string[];
+  factType?: string;
+  eventDate?: string;
+  timeAnchor?: string;
+  status: "active" | "stale";
+  date?: string;
+}): string {
   const lines = [
     `Memory ID: ${memory.memoryId}`,
     ...(typeof memory.issueNumber === "number" ? [`Issue Number: ${memory.issueNumber}`] : []),
@@ -1718,10 +1808,31 @@ function renderMemoryBlock(memory: { memoryId: string; issueNumber?: number; tit
     `Title: ${memory.title || "Memory"}`,
     ...(memory.kind ? [`Kind: ${memory.kind}`] : []),
     ...(memory.topics && memory.topics.length > 0 ? [`Topics: ${memory.topics.join(", ")}`] : []),
+    ...(memory.sourceRole ? [`Source Role: ${memory.sourceRole}`] : []),
+    ...(memory.factType ? [`Fact Type: ${memory.factType}`] : []),
+    ...(memory.entities && memory.entities.length > 0 ? [`Entities: ${memory.entities.join(", ")}`] : []),
     ...(memory.date ? [`Date: ${memory.date}`] : []),
+    ...(memory.eventDate ? [`Event Date: ${memory.eventDate}`] : []),
+    ...(memory.timeAnchor ? [`Time Anchor: ${memory.timeAnchor}`] : []),
     `Detail: ${memory.detail}`,
   ];
   return lines.join("\n");
+}
+
+function formatInjectedMemory(memory: {
+  detail: string;
+  sourceRole?: "user" | "assistant";
+  eventDate?: string;
+  timeAnchor?: string;
+  factType?: string;
+}): string {
+  const meta = [
+    memory.sourceRole ? `source:${memory.sourceRole}` : "",
+    memory.factType ? `factType:${memory.factType}` : "",
+    memory.eventDate ? `eventDate:${memory.eventDate}` : "",
+    memory.timeAnchor ? `time:${memory.timeAnchor}` : "",
+  ].filter(Boolean).join(", ");
+  return meta ? `${memory.detail} (${meta})` : memory.detail;
 }
 
 function renderOrgLine(org: { login?: string; name?: string; default_repository_permission?: string; description?: string }): string {

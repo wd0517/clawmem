@@ -15,6 +15,9 @@ export type ClawMemPluginConfig = {
   authScheme: "token" | "bearer";
   agents: Record<string, ClawMemAgentConfig>;
   memoryRecallLimit: number;
+  memoryAutoRecallLimit: number;
+  memorySearchCandidateLimit: number;
+  memoryRecallMinScore: number;
   turnCommentDelayMs: number;
   summaryWaitTimeoutMs: number;
 };
@@ -43,16 +46,34 @@ export type SessionMirrorState = {
 export type PluginState = { version: 2; sessions: Record<string, SessionMirrorState>; migrations?: Record<string, string> };
 export type NormalizedMessage = { role: string; text: string; toolName?: string; timestamp?: string; stopReason?: string };
 export type TranscriptSnapshot = { sessionId?: string; messages: NormalizedMessage[] };
-export type MemoryDraft = { detail: string; kind?: string; topics?: string[] };
+export type MemorySourceRole = "user" | "assistant";
+export type MemoryDraft = {
+  detail: string;
+  kind?: string;
+  topics?: string[];
+  sourceRole?: MemorySourceRole;
+  entities?: string[];
+  factType?: string;
+  eventDate?: string;
+  timeAnchor?: string;
+};
 export type MemorySchema = { kinds: string[]; topics: string[] };
 export type MemoryListOptions = {
   status?: "active" | "stale" | "all";
   kind?: string;
   topic?: string;
+  sourceRole?: MemorySourceRole;
+  factType?: string;
   limit?: number;
 };
 export type ParsedMemoryIssue = {
   issueNumber: number; title: string; memoryId: string; memoryHash?: string;
   date: string; detail: string;
-  kind?: string; topics?: string[]; status: "active" | "stale";
+  kind?: string; topics?: string[];
+  sourceRole?: MemorySourceRole;
+  entities?: string[];
+  factType?: string;
+  eventDate?: string;
+  timeAnchor?: string;
+  status: "active" | "stale";
 };

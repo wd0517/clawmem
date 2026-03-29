@@ -76,6 +76,21 @@
         "type": "integer",
         "minimum": 1,
         "maximum": 20
+      },
+      "memoryAutoRecallLimit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20
+      },
+      "memorySearchCandidateLimit": {
+        "type": "integer",
+        "minimum": 5,
+        "maximum": 100
+      },
+      "memoryRecallMinScore": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 100
       }
     }
   },
@@ -118,7 +133,19 @@
     },
     "memoryRecallLimit": {
       "label": "Memory Recall Limit",
+      "help": "Default maximum number of active memories returned by memory recall tools."
+    },
+    "memoryAutoRecallLimit": {
+      "label": "Auto Recall Limit",
       "help": "Maximum number of active memories injected into context before an agent starts."
+    },
+    "memorySearchCandidateLimit": {
+      "label": "Search Candidate Limit",
+      "help": "How many candidate memories ClawMem gathers before reranking multi-query recall results."
+    },
+    "memoryRecallMinScore": {
+      "label": "Recall Min Score",
+      "help": "Minimum reranked score required before a memory is treated as a confident recall instead of a miss."
     }
   }
 }

@@ -3,26 +3,65 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { LABEL_MEMORY_STALE, MEMORY_TITLE_PREFIX, extractLabelNames, labelVal } from "./config.js";
 import type { GitHubIssueClient } from "./github-client.js";
 import { normalizeMessages } from "./transcript.js";
-import type { ClawMemPluginConfig, MemoryDraft, MemoryListOptions, MemorySchema, NormalizedMessage, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import type {
+  ClawMemPluginConfig,
+  MemoryDraft,
+  MemoryListOptions,
+  MemorySchema,
+  MemorySourceRole,
+  ParsedMemoryIssue,
+  SessionMirrorState,
+  TranscriptSnapshot,
+} from "./types.js";
 import { fmtTranscript, localDate, sha256, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 
 type MemoryDecision = { save: MemoryDraft[]; stale: string[] };
-type SearchIndex = { title: string; detail: string; kind?: string; topics: string[] };
+type SearchIndex = {
+  title: string;
+  detail: string;
+  kind?: string;
+  topics: string[];
+  sourceRole?: string;
+  entities: string[];
+  factType?: string;
+  eventDate?: string;
+  timeAnchor?: string;
+};
+type RecallPlan = {
+  rawQuery: string;
+  normalized: string;
+  variants: string[];
+  strictEntities: Set<string>;
+  looseEntities: Set<string>;
+  assistantBias: boolean;
+  temporalBias: boolean;
+};
+type ScoredMemory = ParsedMemoryIssue & {
+  score: number;
+  strictEntityHits: number;
+  looseEntityHits: number;
+};
+
+const SEARCH_STOPWORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does", "for", "from", "how", "i", "if", "in", "into", "is",
+  "it", "its", "me", "my", "of", "on", "or", "our", "said", "say", "says", "tell", "that", "the", "their", "them", "they",
+  "this", "to", "told", "us", "was", "we", "were", "what", "when", "where", "which", "who", "why", "with", "you", "your",
+]);
+const TEMPORAL_HINTS = ["date", "day", "during", "earlier", "former", "last", "latest", "month", "newest", "next", "now", "past", "previous", "recent", "time", "today", "tomorrow", "updated", "when", "year", "yesterday"];
 
 export class MemoryStore {
   constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
 
   async search(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
-    const q = normalizeSearch(query);
-    if (!q) return [];
-    try {
-      const results = await this.searchViaBackend(query, limit);
-      if (results.length > 0) return results;
-    } catch (error) {
-      this.api.logger?.warn?.(`clawmem: backend memory search failed, falling back to local lexical ranking: ${String(error)}`);
-    }
-    return this.searchLocally(q, limit);
+    const rawQuery = query.trim();
+    if (!rawQuery) return [];
+    const active = await this.listByStatus("active");
+    if (active.length === 0) return [];
+    const plan = buildRecallPlan(rawQuery);
+    const candidates = await this.collectCandidates(active, plan);
+    if (candidates.length === 0) return [];
+    return this.rankCandidates(candidates, plan, limit).map(stripSearchScore);
   }
 
   async listSchema(): Promise<MemorySchema> {
@@ -60,11 +99,14 @@ export class MemoryStore {
     const status = options.status ?? "active";
     const kind = normalizeOptionalLabelValue(options.kind, "kind:");
     const topic = normalizeOptionalLabelValue(options.topic, "topic:");
+    const factType = normalizeFactType(options.factType);
     const limit = Math.min(200, Math.max(1, options.limit ?? 20));
     return (await this.listByStatus(status))
       .filter((memory) => {
         if (kind && memory.kind !== kind) return false;
         if (topic && !(memory.topics ?? []).includes(topic)) return false;
+        if (options.sourceRole && memory.sourceRole !== options.sourceRole) return false;
+        if (factType && memory.factType !== factType) return false;
         return true;
       })
       .sort((a, b) => b.issueNumber - a.issueNumber)
@@ -78,33 +120,30 @@ export class MemoryStore {
     const hash = sha256(detail);
     const existing = allActive.find((m) => (m.memoryHash || sha256(norm(m.detail))) === hash);
     if (existing) {
-      const memory = await this.mergeSchema(existing, normalized);
+      const memory = await this.mergeMemoryDraft(existing, normalized);
       return { created: false, memory };
     }
 
-    const date = localDate();
-    const labels = memLabels(normalized.kind, normalized.topics);
-    const title = `${MEMORY_TITLE_PREFIX}${trunc(detail, 72)}`;
-    const body = stringifyFlatYaml([["memory_hash", hash], ["date", date], ["detail", detail]]);
-    await this.client.ensureLabels(labels);
-    const issue = await this.client.createIssue({ title, body, labels });
-    return {
-      created: true,
-      memory: {
-        issueNumber: issue.number,
-        title,
-        memoryId: String(issue.number),
-        memoryHash: hash,
-        date,
-        detail,
-        ...(normalized.kind ? { kind: normalized.kind } : {}),
-        ...(normalized.topics && normalized.topics.length > 0 ? { topics: normalized.topics } : {}),
-        status: "active",
-      },
-    };
+    const memory = createMemoryRecord(normalized, hash);
+    await this.client.ensureLabels(memLabels(memory.kind, memory.topics, memory.sourceRole));
+    const issue = await this.client.createIssue({
+      title: memory.title,
+      body: buildMemoryBody(memory),
+      labels: memLabels(memory.kind, memory.topics, memory.sourceRole),
+    });
+    return { created: true, memory: { ...memory, issueNumber: issue.number, memoryId: String(issue.number) } };
   }
 
-  async update(memoryId: string, patch: { detail?: string; kind?: string; topics?: string[] }): Promise<ParsedMemoryIssue | null> {
+  async update(memoryId: string, patch: {
+    detail?: string;
+    kind?: string;
+    topics?: string[];
+    sourceRole?: MemorySourceRole;
+    entities?: string[];
+    factType?: string;
+    eventDate?: string;
+    timeAnchor?: string;
+  }): Promise<ParsedMemoryIssue | null> {
     const current = await this.get(memoryId, "all");
     if (!current) return null;
     const nextDetail = typeof patch.detail === "string" && patch.detail.trim() ? norm(patch.detail) : current.detail;
@@ -112,26 +151,35 @@ export class MemoryStore {
     const nextTopics = patch.topics !== undefined
       ? uniqueNormalized(patch.topics.map((topic) => normalizeLabelValue(topic, "topic:")).filter(Boolean) as string[])
       : uniqueNormalized(current.topics ?? []);
+    const nextSourceRole = patch.sourceRole !== undefined ? normalizeSourceRole(patch.sourceRole) : current.sourceRole;
+    const nextEntities = patch.entities !== undefined ? normalizeEntities(patch.entities) : normalizeEntities(current.entities ?? []);
+    const nextFactType = patch.factType !== undefined ? normalizeFactType(patch.factType) : current.factType;
+    const nextEventDate = patch.eventDate !== undefined ? normalizeDateValue(patch.eventDate) : current.eventDate;
+    const nextTimeAnchor = patch.timeAnchor !== undefined ? normalizeFreeformText(patch.timeAnchor) : current.timeAnchor;
     const nextHash = sha256(nextDetail);
     const duplicate = (await this.listByStatus("active")).find((memory) => {
       if (memory.issueNumber === current.issueNumber) return false;
       return (memory.memoryHash || sha256(norm(memory.detail))) === nextHash;
     });
     if (duplicate) throw new Error(`another active memory already stores this detail as [${duplicate.memoryId}]`);
-    const nextTitle = `${MEMORY_TITLE_PREFIX}${trunc(nextDetail, 72)}`;
-    const nextBody = stringifyFlatYaml([["memory_hash", nextHash], ["date", current.date], ["detail", nextDetail]]);
-    const nextLabels = memLabels(nextKind, nextTopics);
-    await this.client.ensureLabels(nextLabels);
-    await this.client.updateIssue(current.issueNumber, { title: nextTitle, body: nextBody });
-    await this.client.syncManagedLabels(current.issueNumber, nextLabels);
-    return {
+    const next: ParsedMemoryIssue = {
       ...current,
-      title: nextTitle,
+      title: `${MEMORY_TITLE_PREFIX}${trunc(nextDetail, 72)}`,
       memoryHash: nextHash,
       detail: nextDetail,
       ...(nextKind ? { kind: nextKind } : {}),
       ...(nextTopics.length > 0 ? { topics: nextTopics } : {}),
+      ...(nextSourceRole ? { sourceRole: nextSourceRole } : {}),
+      ...(nextEntities.length > 0 ? { entities: nextEntities } : {}),
+      ...(nextFactType ? { factType: nextFactType } : {}),
+      ...(nextEventDate ? { eventDate: nextEventDate } : {}),
+      ...(nextTimeAnchor ? { timeAnchor: nextTimeAnchor } : {}),
     };
+    const nextLabels = memLabels(next.kind, next.topics, next.sourceRole);
+    await this.client.ensureLabels(nextLabels);
+    await this.client.updateIssue(current.issueNumber, { title: next.title, body: buildMemoryBody(next) });
+    await this.client.syncManagedLabels(current.issueNumber, nextLabels);
+    return next;
   }
 
   async forget(memoryId: string): Promise<ParsedMemoryIssue | null> {
@@ -139,7 +187,7 @@ export class MemoryStore {
     if (!id) throw new Error("memoryId is empty");
     const mem = await this.get(id, "active");
     if (!mem) return null;
-    await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.kind, mem.topics));
+    await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.kind, mem.topics, mem.sourceRole));
     await this.client.updateIssue(mem.issueNumber, { state: "closed" });
     return { ...mem, status: "stale" };
   }
@@ -174,21 +222,62 @@ export class MemoryStore {
     return out;
   }
 
+  private async collectCandidates(memories: ParsedMemoryIssue[], plan: RecallPlan): Promise<ParsedMemoryIssue[]> {
+    const candidateLimit = Math.min(memories.length, this.config.memorySearchCandidateLimit);
+    const candidates = new Map<number, ParsedMemoryIssue>();
+    let backendFailed = false;
+
+    for (const variant of plan.variants) {
+      if (!backendFailed) {
+        try {
+          for (const memory of await this.searchViaBackend(variant, candidateLimit)) {
+            candidates.set(memory.issueNumber, memory);
+          }
+        } catch (error) {
+          backendFailed = true;
+          this.api.logger?.warn?.(`clawmem: backend memory search failed, continuing with local reranking: ${String(error)}`);
+        }
+      }
+      for (const memory of this.searchLocally(normalizeSearch(variant), candidateLimit, memories)) {
+        candidates.set(memory.issueNumber, memory);
+      }
+    }
+
+    return [...candidates.values()];
+  }
+
+  private rankCandidates(candidates: ParsedMemoryIssue[], plan: RecallPlan, limit: number): ScoredMemory[] {
+    const scored = candidates
+      .map((memory) => ({ ...memory, ...scoreMemoryCandidate(memory, plan) }))
+      .sort((a, b) => b.score - a.score || b.strictEntityHits - a.strictEntityHits || b.looseEntityHits - a.looseEntityHits || b.issueNumber - a.issueNumber);
+    const topScore = scored[0]?.score ?? 0;
+    if (topScore < this.config.memoryRecallMinScore) return [];
+    const minAccepted = Math.max(this.config.memoryRecallMinScore, topScore * 0.35);
+    return scored
+      .filter((memory) => {
+        if (memory.score < minAccepted) return false;
+        if (plan.strictEntities.size === 0) return true;
+        if (memory.strictEntityHits > 0) return true;
+        return memory.looseEntityHits >= 2 && memory.score >= Math.max(minAccepted * 2, topScore * 0.9);
+      })
+      .slice(0, limit);
+  }
+
   private async searchViaBackend(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const repo = this.client.repo();
     if (!repo) return [];
     const qualified = buildMemorySearchQuery(query, repo);
-    const batch = await this.client.searchIssues(qualified, { perPage: Math.min(100, Math.max(limit * 3, 20)) });
+    const batch = await this.client.searchIssues(qualified, { perPage: Math.min(100, Math.max(limit, 20)) });
     return batch
       .map((issue) => this.parseIssue(issue))
       .filter((memory): memory is ParsedMemoryIssue => memory !== null && memory.status === "active")
       .slice(0, limit);
   }
 
-  private async searchLocally(normalizedQuery: string, limit: number): Promise<ParsedMemoryIssue[]> {
-    const memories = await this.listByStatus("active");
+  private searchLocally(normalizedQuery: string, limit: number, memories: ParsedMemoryIssue[]): ParsedMemoryIssue[] {
+    if (!normalizedQuery) return [];
     return memories
-      .map((m) => ({ m, score: scoreMemoryMatch(m, normalizedQuery) }))
+      .map((m) => ({ m, score: scoreSearchIndex(buildSearchIndex(m), normalizedQuery) }))
       .filter((e) => e.score > 0)
       .sort((a, b) => b.score - a.score || b.m.issueNumber - a.m.issueNumber)
       .slice(0, limit)
@@ -200,19 +289,27 @@ export class MemoryStore {
     if (!labels.includes("type:memory")) return null;
     const kind = labelVal(labels, "kind:");
     const topics = labels.filter((l) => l.startsWith("topic:")).map((l) => l.slice(6).trim()).filter(Boolean);
+    const sourceRole = normalizeSourceRole(labelVal(labels, "source:") as MemorySourceRole | undefined);
     const rawBody = (issue.body ?? "").trim();
     const body = rawBody ? parseFlatYaml(rawBody) : {};
     const detail = body.detail?.trim() || rawBody;
     const status = issue.state === "closed" || labels.includes(LABEL_MEMORY_STALE) ? "stale" : "active";
     if (!detail) return null;
+    const entities = parseEntityList(body.entities_json?.trim() || body.entities?.trim());
     return {
-      issueNumber: issue.number, title: issue.title?.trim() || "",
+      issueNumber: issue.number,
+      title: issue.title?.trim() || "",
       memoryId: body.memory_id?.trim() || String(issue.number),
       memoryHash: body.memory_hash?.trim() || undefined,
       date: body.date?.trim() || "1970-01-01",
       detail,
       ...(kind ? { kind } : {}),
       ...(topics.length > 0 ? { topics } : {}),
+      ...(sourceRole || body.source_role?.trim() ? { sourceRole: normalizeSourceRole((body.source_role?.trim() || sourceRole) as MemorySourceRole | undefined) } : {}),
+      ...(entities.length > 0 ? { entities } : {}),
+      ...(normalizeFactType(body.fact_type?.trim()) ? { factType: normalizeFactType(body.fact_type?.trim()) } : {}),
+      ...(normalizeDateValue(body.event_date?.trim()) ? { eventDate: normalizeDateValue(body.event_date?.trim()) } : {}),
+      ...(normalizeFreeformText(body.time_anchor?.trim()) ? { timeAnchor: normalizeFreeformText(body.time_anchor?.trim()) } : {}),
       status,
     };
   }
@@ -229,34 +326,25 @@ export class MemoryStore {
       const hash = sha256(detail);
       const existing = activeByHash.get(hash);
       if (existing) {
-        const merged = await this.mergeSchema(existing, draft);
+        const merged = await this.mergeMemoryDraft(existing, draft);
         activeByHash.set(hash, merged);
         continue;
       }
-      const labels = memLabels(draft.kind, draft.topics);
-      const date = localDate();
-      const title = `${MEMORY_TITLE_PREFIX}${trunc(detail, 72)}`;
-      const body = stringifyFlatYaml([["memory_hash", hash], ["date", date], ["detail", detail]]);
-      await this.client.ensureLabels(labels);
-      const issue = await this.client.createIssue({ title, body, labels });
-      activeByHash.set(hash, {
-        issueNumber: issue.number,
-        title,
-        memoryId: String(issue.number),
-        memoryHash: hash,
-        date,
-        detail,
-        ...(draft.kind ? { kind: draft.kind } : {}),
-        ...(draft.topics && draft.topics.length > 0 ? { topics: draft.topics } : {}),
-        status: "active",
+      const memory = createMemoryRecord(draft, hash);
+      await this.client.ensureLabels(memLabels(memory.kind, memory.topics, memory.sourceRole));
+      const issue = await this.client.createIssue({
+        title: memory.title,
+        body: buildMemoryBody(memory),
+        labels: memLabels(memory.kind, memory.topics, memory.sourceRole),
       });
+      activeByHash.set(hash, { ...memory, issueNumber: issue.number, memoryId: String(issue.number) });
       savedCount++;
     }
     let staledCount = 0;
     for (const id of [...new Set(decision.stale.map((s) => s.trim()).filter(Boolean))]) {
       const mem = activeById.get(id);
       if (!mem) continue;
-      await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.kind, mem.topics));
+      await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.kind, mem.topics, mem.sourceRole));
       await this.client.updateIssue(mem.issueNumber, { state: "closed" });
       staledCount++;
     }
@@ -267,23 +355,35 @@ export class MemoryStore {
     if (snapshot.messages.length === 0) return { save: [], stale: [] };
     const recent = (await this.listByStatus("active")).sort((a, b) => b.issueNumber - a.issueNumber).slice(0, 20);
     const existingBlock = recent.length === 0 ? "None." : recent.map((m) => {
-      const schema = [m.kind ? `kind=${m.kind}` : "", ...(m.topics ?? []).map((topic) => `topic=${topic}`)].filter(Boolean).join(", ");
+      const schema = [
+        m.kind ? `kind=${m.kind}` : "",
+        ...(m.topics ?? []).map((topic) => `topic=${topic}`),
+        m.sourceRole ? `source=${m.sourceRole}` : "",
+        m.factType ? `fact_type=${m.factType}` : "",
+        m.eventDate ? `event_date=${m.eventDate}` : "",
+      ].filter(Boolean).join(", ");
       return `[${m.memoryId}] ${schema ? `${schema} | ` : ""}${m.detail}`;
     }).join("\n");
     const schema = await this.listSchema();
     const schemaBlock = [
       `Existing kinds: ${schema.kinds.length > 0 ? schema.kinds.join(", ") : "None."}`,
       `Existing topics: ${schema.topics.length > 0 ? schema.topics.join(", ") : "None."}`,
+      `Today: ${localDate()}`,
     ].join("\n");
     const subagent = this.api.runtime.subagent;
     const sessionKey = subKey(session, "memory");
     const message = [
       "Extract durable memories from the conversation below.",
-      'Return JSON only in the form {"save":[{"detail":"...","kind":"...","topics":["..."]}],"stale":["memory-id"]}.',
+      'Return JSON only in the form {"save":[{"detail":"...","kind":"...","topics":["..."],"sourceRole":"user|assistant","entities":["..."],"factType":"...","eventDate":"YYYY-MM-DD","timeAnchor":"..."}],"stale":["memory-id"]}.',
+      "Each save item must contain exactly one atomic memory. Never bundle multiple facts, people, motivations, or timeline updates into one memory.",
+      "Split independent facts even when they appear in the same turn. If one message contains three durable facts, return three save items.",
       "Use save for stable, reusable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
       "Use stale for existing memory IDs only when the conversation clearly supersedes or invalidates them.",
       "Infer kind and topics when they would help future retrieval. Reuse existing kinds and topics when possible.",
-      "If no existing kind fits, you may propose a new short kind label. Keep kinds concise and reusable.",
+      "sourceRole must reflect whether the durable fact originated from the user or the assistant.",
+      "entities should contain 1-5 short names, products, people, places, organizations, or exact concepts that anchor future retrieval.",
+      "factType should be a short reusable category such as preference, identity, timeline-event, project-status, assistant-knowledge, task, or decision.",
+      "If the conversation gives an absolute date, normalize it into eventDate as YYYY-MM-DD. If it only gives a relative time such as yesterday or next quarter, preserve that in timeAnchor.",
       "Topics should be short reusable tags, not sentences. Prefer 0-3 topics per memory.",
       "Do not save temporary requests, startup boilerplate, tool chatter, summaries about internal helper sessions, or one-off operational details.",
       "Prefer empty arrays when nothing durable should be remembered.",
@@ -293,9 +393,12 @@ export class MemoryStore {
     ].join("\n");
     try {
       const run = await subagent.run({
-        sessionKey, message, deliver: false, lane: "clawmem-memory",
+        sessionKey,
+        message,
+        deliver: false,
+        lane: "clawmem-memory",
         idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:memory-decision`),
-        extraSystemPrompt: "You extract durable memory updates from OpenClaw conversations. Output JSON only with save objects containing detail, optional kind, and optional topics, plus stale string ids.",
+        extraSystemPrompt: "You extract durable memory updates from OpenClaw conversations. Output JSON only. Store one atomic fact per save item. Prefer precise entities, sourceRole, factType, and normalized dates when present.",
       });
       const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.summaryWaitTimeoutMs });
       if (wait.status === "timeout") throw new Error("memory decision subagent timed out");
@@ -304,48 +407,114 @@ export class MemoryStore {
       const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
       if (!text) throw new Error("memory decision subagent returned no assistant text");
       return parseDecision(text);
-    } finally { subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {}); }
+    } finally {
+      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
+    }
   }
 
-  private async mergeSchema(memory: ParsedMemoryIssue, draft: MemoryDraft): Promise<ParsedMemoryIssue> {
+  private async mergeMemoryDraft(memory: ParsedMemoryIssue, draft: MemoryDraft): Promise<ParsedMemoryIssue> {
     const normalized = normalizeDraft(draft);
     const nextKind = normalized.kind ?? memory.kind;
     const currentTopics = uniqueNormalized(memory.topics ?? []);
     const nextTopics = uniqueNormalized([...currentTopics, ...(normalized.topics ?? [])]);
+    const nextSourceRole = normalized.sourceRole ?? memory.sourceRole;
+    const nextEntities = mergeEntities(memory.entities ?? [], normalized.entities ?? []);
+    const nextFactType = normalized.factType ?? memory.factType;
+    const nextEventDate = normalized.eventDate ?? memory.eventDate;
+    const nextTimeAnchor = normalized.timeAnchor ?? memory.timeAnchor;
     const sameKind = (memory.kind ?? "") === (nextKind ?? "");
     const sameTopics = JSON.stringify(currentTopics) === JSON.stringify(nextTopics);
-    if (sameKind && sameTopics) return memory;
-    const labels = memLabels(nextKind, nextTopics);
-    await this.client.ensureLabels(labels);
-    await this.client.syncManagedLabels(memory.issueNumber, labels);
-    return {
+    const sameSourceRole = (memory.sourceRole ?? "") === (nextSourceRole ?? "");
+    const sameEntities = JSON.stringify(memory.entities ?? []) === JSON.stringify(nextEntities);
+    const sameFactType = (memory.factType ?? "") === (nextFactType ?? "");
+    const sameEventDate = (memory.eventDate ?? "") === (nextEventDate ?? "");
+    const sameTimeAnchor = (memory.timeAnchor ?? "") === (nextTimeAnchor ?? "");
+    if (sameKind && sameTopics && sameSourceRole && sameEntities && sameFactType && sameEventDate && sameTimeAnchor) return memory;
+    const next: ParsedMemoryIssue = {
       ...memory,
       ...(nextKind ? { kind: nextKind } : {}),
       ...(nextTopics.length > 0 ? { topics: nextTopics } : {}),
+      ...(nextSourceRole ? { sourceRole: nextSourceRole } : {}),
+      ...(nextEntities.length > 0 ? { entities: nextEntities } : {}),
+      ...(nextFactType ? { factType: nextFactType } : {}),
+      ...(nextEventDate ? { eventDate: nextEventDate } : {}),
+      ...(nextTimeAnchor ? { timeAnchor: nextTimeAnchor } : {}),
     };
+    const labels = memLabels(next.kind, next.topics, next.sourceRole);
+    await this.client.ensureLabels(labels);
+    await this.client.updateIssue(memory.issueNumber, { body: buildMemoryBody(next) });
+    await this.client.syncManagedLabels(memory.issueNumber, labels);
+    return next;
   }
 }
 
-function memLabels(kind?: string, topics?: string[]): string[] {
+function memLabels(kind?: string, topics?: string[], sourceRole?: MemorySourceRole): string[] {
   return [
     "type:memory",
     ...(kind ? [`kind:${kind}`] : []),
+    ...(sourceRole ? [`source:${sourceRole}`] : []),
     ...((topics ?? []).map((topic) => `topic:${topic}`)),
   ];
 }
+
+function createMemoryRecord(draft: MemoryDraft, hash: string): ParsedMemoryIssue {
+  const date = localDate();
+  const detail = norm(draft.detail);
+  return {
+    issueNumber: 0,
+    title: `${MEMORY_TITLE_PREFIX}${trunc(detail, 72)}`,
+    memoryId: "0",
+    memoryHash: hash,
+    date,
+    detail,
+    ...(draft.kind ? { kind: draft.kind } : {}),
+    ...(draft.topics && draft.topics.length > 0 ? { topics: draft.topics } : {}),
+    ...(draft.sourceRole ? { sourceRole: draft.sourceRole } : {}),
+    ...(draft.entities && draft.entities.length > 0 ? { entities: draft.entities } : {}),
+    ...(draft.factType ? { factType: draft.factType } : {}),
+    ...(draft.eventDate ? { eventDate: draft.eventDate } : {}),
+    ...(draft.timeAnchor ? { timeAnchor: draft.timeAnchor } : {}),
+    status: "active",
+  };
+}
+
+function buildMemoryBody(memory: Pick<ParsedMemoryIssue, "memoryHash" | "date" | "detail" | "sourceRole" | "entities" | "factType" | "eventDate" | "timeAnchor">): string {
+  return filteredYaml([
+    ["memory_hash", memory.memoryHash?.trim() || undefined],
+    ["date", memory.date],
+    ["detail", memory.detail],
+    ["source_role", memory.sourceRole],
+    ["fact_type", memory.factType],
+    ["event_date", memory.eventDate],
+    ["time_anchor", memory.timeAnchor],
+    ["entities_json", memory.entities && memory.entities.length > 0 ? JSON.stringify(memory.entities) : undefined],
+  ]);
+}
+
+function filteredYaml(entries: Array<[key: string, value: string | undefined]>): string {
+  return stringifyFlatYaml(entries.filter(([, value]) => value !== undefined));
+}
+
 function norm(v: string): string { return v.replace(/\s+/g, " ").trim(); }
 function trunc(v: string, max: number): string { const s = norm(v); return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`; }
 function normalizeSearch(v: string): string {
   return v.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
 }
+
 function buildSearchIndex(memory: ParsedMemoryIssue): SearchIndex {
   return {
     title: normalizeSearch(memory.title),
     detail: normalizeSearch(memory.detail),
     ...(memory.kind ? { kind: normalizeSearch(memory.kind) } : {}),
     topics: (memory.topics ?? []).map(normalizeSearch).filter(Boolean),
+    ...(memory.sourceRole ? { sourceRole: normalizeSearch(memory.sourceRole) } : {}),
+    entities: (memory.entities ?? []).map(normalizeSearch).filter(Boolean),
+    ...(memory.factType ? { factType: normalizeSearch(memory.factType) } : {}),
+    ...(memory.eventDate ? { eventDate: normalizeSearch(memory.eventDate) } : {}),
+    ...(memory.timeAnchor ? { timeAnchor: normalizeSearch(memory.timeAnchor) } : {}),
   };
 }
+
 function searchTokens(v: string): string[] {
   const seen = new Set<string>();
   for (const token of v.split(/[^0-9\p{L}]+/u)) {
@@ -359,6 +528,7 @@ function searchTokens(v: string): string[] {
   }
   return [...seen];
 }
+
 function charBigrams(v: string): Set<string> {
   const compact = v.replace(/\s+/g, "");
   if (compact.length < 2) return new Set(compact ? [compact] : []);
@@ -366,62 +536,194 @@ function charBigrams(v: string): Set<string> {
   for (let i = 0; i < compact.length - 1; i++) out.add(compact.slice(i, i + 2));
   return out;
 }
+
 function overlapRatio(left: Set<string>, right: Set<string>): number {
   if (left.size === 0 || right.size === 0) return 0;
   let hits = 0;
   for (const token of left) if (right.has(token)) hits++;
   return hits / Math.max(left.size, right.size);
 }
+
+function countOverlap(left: Set<string>, right: Set<string>): number {
+  let hits = 0;
+  for (const token of left) if (right.has(token)) hits++;
+  return hits;
+}
+
 function buildMemorySearchQuery(query: string, repo: string): string {
   const parts = [query.trim(), `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].filter(Boolean);
   return parts.join(" ");
 }
-export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): number {
-  const query = normalizeSearch(rawQuery);
-  if (!query) return 0;
+
+function buildRecallPlan(rawQuery: string): RecallPlan {
+  const normalized = normalizeSearch(rawQuery);
+  const keywordTokens = searchTokens(normalized).filter((token) => !SEARCH_STOPWORDS.has(token)).slice(0, 8);
+  const quotedPhrases = [...rawQuery.matchAll(/"([^"]+)"|'([^']+)'/g)].map((match) => norm(match[1] || match[2] || "")).filter(Boolean);
+  const strictEntities = new Set([
+    ...quotedPhrases.map(normalizeSearch),
+    ...extractStrictEntities(rawQuery),
+  ]);
+  const looseEntities = new Set([
+    ...keywordTokens.filter((token) => token.length > 2),
+    ...strictEntities,
+  ]);
+  const variants = uniqueStable([
+    rawQuery,
+    keywordTokens.join(" "),
+    [...strictEntities].join(" "),
+    ...expandSemanticVariants(rawQuery),
+  ]).filter((variant) => normalizeSearch(variant).length > 0).slice(0, 6);
+  const assistantBias = /\b(assistant|model|ai|you|your|you said|you told|your response|your answer)\b/i.test(rawQuery);
+  const temporalBias = TEMPORAL_HINTS.some((hint) => normalized.includes(hint)) || /\b\d{4}\b/.test(rawQuery) || /\b\d{4}-\d{2}-\d{2}\b/.test(rawQuery);
+  return { rawQuery, normalized, variants, strictEntities, looseEntities, assistantBias, temporalBias };
+}
+
+function expandSemanticVariants(rawQuery: string): string[] {
+  const rewrites: Array<[pattern: RegExp, replacement: string]> = [
+    [/\brecent\b|\blatest\b|\bcurrent\b|\bnewest\b/gi, "recent latest current now most recent"],
+    [/\bprevious\b|\bformer\b|\bpast\b|\bearlier\b/gi, "previous former past earlier before"],
+    [/\boccupation\b|\bprofession\b|\bjob\b|\bwork\b|\brole\b/gi, "occupation profession job work role"],
+    [/\bpublication\b|\bpublications\b|\bpaper\b|\bpapers\b|\barticle\b|\barticles\b/gi, "publication paper article writing research"],
+    [/\bmentor\b|\bmentorship\b|\badvisor\b|\bcoached\b/gi, "mentor mentorship advisor coached guidance"],
+    [/\blegal\b|\bcase\b|\bcases\b|\blaw\b|\bruling\b/gi, "legal case law ruling court"],
+  ];
+  const out: string[] = [];
+  for (const [pattern, replacement] of rewrites) {
+    if (!pattern.test(rawQuery)) continue;
+    out.push(rawQuery.replace(pattern, replacement));
+  }
+  return out;
+}
+
+function extractStrictEntities(rawQuery: string): string[] {
+  const out = new Set<string>();
+  for (const match of rawQuery.match(/\b(?:[A-Z][a-z0-9]+|[A-Z]{2,}|[0-9]{4}|[0-9]{4}-[0-9]{2}-[0-9]{2})(?:[\s/-]+(?:[A-Z][a-z0-9]+|[A-Z]{2,}|[0-9]{4}))*/g) ?? []) {
+    const entity = normalizeSearch(match);
+    if (entity.length > 1 && !SEARCH_STOPWORDS.has(entity)) out.add(entity);
+  }
+  return [...out];
+}
+
+function scoreMemoryCandidate(memory: ParsedMemoryIssue, plan: RecallPlan): { score: number; strictEntityHits: number; looseEntityHits: number } {
   const idx = buildSearchIndex(memory);
-  const tokens = searchTokens(query);
+  let score = scoreSearchIndex(idx, plan.normalized);
+  let variantBonus = 0;
+  for (const variant of plan.variants) {
+    const normalizedVariant = normalizeSearch(variant);
+    if (!normalizedVariant || normalizedVariant === plan.normalized) continue;
+    variantBonus = Math.max(variantBonus, scoreSearchIndex(idx, normalizedVariant) * 0.6);
+  }
+  score += variantBonus;
+
+  const memoryEntitySet = new Set([
+    ...searchTokens(idx.title),
+    ...searchTokens(idx.detail),
+    ...idx.entities.flatMap(searchTokens),
+    ...idx.topics.flatMap(searchTokens),
+    ...searchTokens(idx.factType ?? ""),
+    ...searchTokens(idx.eventDate ?? ""),
+    ...searchTokens(idx.timeAnchor ?? ""),
+  ]);
+  const strictEntityHits = countOverlap(plan.strictEntities, memoryEntitySet);
+  const looseEntityHits = countOverlap(plan.looseEntities, memoryEntitySet);
+  score += strictEntityHits * 10;
+  score += looseEntityHits * 1.5;
+  if (plan.strictEntities.size > 0 && strictEntityHits === 0) score -= 8;
+
+  if (plan.assistantBias) {
+    if (idx.sourceRole === "assistant") score += 6;
+    if (idx.sourceRole === "user") score -= 1;
+  }
+
+  if (plan.temporalBias) {
+    if (idx.eventDate) score += 5;
+    if (idx.timeAnchor) score += 3;
+    const temporalTerms = new Set(TEMPORAL_HINTS.filter((hint) => plan.normalized.includes(hint)));
+    if (countOverlap(temporalTerms, memoryEntitySet) > 0) score += 2;
+  }
+
+  return { score, strictEntityHits, looseEntityHits };
+}
+
+function scoreSearchIndex(idx: SearchIndex, normalizedQuery: string): number {
+  const tokens = searchTokens(normalizedQuery);
   const queryTokenSet = new Set(tokens);
   const titleTokenSet = new Set(searchTokens(idx.title));
   const detailTokenSet = new Set(searchTokens(idx.detail));
   const kindTokenSet = new Set(searchTokens(idx.kind ?? ""));
   const topicTokenSet = new Set(idx.topics.flatMap(searchTokens));
+  const entityTokenSet = new Set(idx.entities.flatMap(searchTokens));
+  const factTypeTokenSet = new Set(searchTokens(idx.factType ?? ""));
+  const dateTokenSet = new Set(searchTokens(`${idx.eventDate ?? ""} ${idx.timeAnchor ?? ""}`));
   let score = 0;
 
-  if (idx.title.includes(query)) score += 18;
-  if (idx.detail.includes(query)) score += 12;
-  if (idx.kind?.includes(query)) score += 8;
-  for (const topic of idx.topics) if (topic.includes(query)) score += 10;
+  if (idx.title.includes(normalizedQuery)) score += 18;
+  if (idx.detail.includes(normalizedQuery)) score += 12;
+  if (idx.kind?.includes(normalizedQuery)) score += 8;
+  if (idx.factType?.includes(normalizedQuery)) score += 8;
+  if (idx.eventDate?.includes(normalizedQuery)) score += 10;
+  if (idx.timeAnchor?.includes(normalizedQuery)) score += 6;
+  for (const topic of idx.topics) if (topic.includes(normalizedQuery)) score += 10;
+  for (const entity of idx.entities) if (entity.includes(normalizedQuery)) score += 10;
 
   for (const token of tokens) {
     if (idx.title.includes(token)) score += 4;
     if (idx.detail.includes(token)) score += 2;
     if (idx.kind?.includes(token)) score += 3;
+    if (idx.factType?.includes(token)) score += 3;
+    if (idx.eventDate?.includes(token)) score += 4;
+    if (idx.timeAnchor?.includes(token)) score += 2;
     if (idx.topics.some((topic) => topic.includes(token))) score += 3;
+    if (idx.entities.some((entity) => entity.includes(token))) score += 4;
   }
 
   score += overlapRatio(queryTokenSet, titleTokenSet) * 10;
   score += overlapRatio(queryTokenSet, detailTokenSet) * 6;
   score += overlapRatio(queryTokenSet, kindTokenSet) * 6;
   score += overlapRatio(queryTokenSet, topicTokenSet) * 8;
+  score += overlapRatio(queryTokenSet, entityTokenSet) * 10;
+  score += overlapRatio(queryTokenSet, factTypeTokenSet) * 6;
+  score += overlapRatio(queryTokenSet, dateTokenSet) * 8;
 
-  const queryBigrams = charBigrams(query);
+  const queryBigrams = charBigrams(normalizedQuery);
   score += overlapRatio(queryBigrams, charBigrams(idx.title)) * 6;
   score += overlapRatio(queryBigrams, charBigrams(idx.detail)) * 3;
+  score += overlapRatio(queryBigrams, new Set(idx.entities.flatMap((entity) => [...charBigrams(entity)]))) * 5;
 
   return score;
 }
+
+export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): number {
+  return scoreMemoryCandidate(memory, buildRecallPlan(rawQuery)).score;
+}
+
+function stripSearchScore(memory: ScoredMemory): ParsedMemoryIssue {
+  const { score: _score, strictEntityHits: _strictEntityHits, looseEntityHits: _looseEntityHits, ...plain } = memory;
+  return plain;
+}
+
 function normalizeDraft(input: MemoryDraft): MemoryDraft {
   const detail = norm(input.detail);
   if (!detail) throw new Error("memory detail is empty");
   const kind = normalizeLabelValue(input.kind, "kind:");
   const topics = uniqueNormalized((input.topics ?? []).map((topic) => normalizeLabelValue(topic, "topic:")).filter(Boolean) as string[]);
+  const sourceRole = normalizeSourceRole(input.sourceRole);
+  const entities = normalizeEntities(input.entities ?? []);
+  const factType = normalizeFactType(input.factType);
+  const eventDate = normalizeDateValue(input.eventDate);
+  const timeAnchor = normalizeFreeformText(input.timeAnchor);
   return {
     detail,
     ...(kind ? { kind } : {}),
     ...(topics.length > 0 ? { topics } : {}),
+    ...(sourceRole ? { sourceRole } : {}),
+    ...(entities.length > 0 ? { entities } : {}),
+    ...(factType ? { factType } : {}),
+    ...(eventDate ? { eventDate } : {}),
+    ...(timeAnchor ? { timeAnchor } : {}),
   };
 }
+
 function normalizeLabelValue(value: string | undefined, prefix: string): string | undefined {
   if (!value) return undefined;
   const raw = value.trim().replace(new RegExp(`^${prefix}`, "i"), "");
@@ -433,6 +735,7 @@ function normalizeLabelValue(value: string | undefined, prefix: string): string 
     .replace(/^-+|-+$/g, "");
   return normalized || undefined;
 }
+
 function normalizeOptionalLabelValue(value: string | undefined, prefix: string): string | undefined {
   try {
     return normalizeLabelValue(value, prefix);
@@ -440,16 +743,85 @@ function normalizeOptionalLabelValue(value: string | undefined, prefix: string):
     return undefined;
   }
 }
+
+function normalizeSourceRole(value: MemorySourceRole | undefined): MemorySourceRole | undefined {
+  if (value !== "assistant" && value !== "user") return undefined;
+  return value;
+}
+
+function normalizeFactType(value: string | undefined): string | undefined {
+  return normalizeLabelValue(value, "fact_type:");
+}
+
+function normalizeDateValue(value: string | undefined): string | undefined {
+  const trimmed = normalizeFreeformText(value);
+  if (!trimmed) return undefined;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+  const parsed = new Date(trimmed);
+  return Number.isFinite(parsed.getTime()) ? localDate(parsed) : undefined;
+}
+
+function normalizeFreeformText(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const normalized = norm(value);
+  return normalized || undefined;
+}
+
+function normalizeEntities(values: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const normalized = normalizeFreeformText(value);
+    if (!normalized) continue;
+    const key = normalizeSearch(normalized);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+  }
+  return out.slice(0, 8);
+}
+
+function mergeEntities(left: string[], right: string[]): string[] {
+  return normalizeEntities([...left, ...right]);
+}
+
 function uniqueNormalized(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort();
 }
+
+function uniqueStable(values: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const normalized = norm(value);
+    const key = normalizeSearch(normalized);
+    if (!normalized || seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function parseEntityList(value: string | undefined): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) return normalizeEntities(parsed.filter((item): item is string => typeof item === "string"));
+  } catch { /* fall through */ }
+  return normalizeEntities(value.split(/[,\n]/g));
+}
+
 function parseDecision(raw: string): MemoryDecision {
   const tryParse = (s: string): MemoryDecision | null => {
     try {
       const p = JSON.parse(s) as Record<string, unknown>;
-      return { save: Array.isArray(p.save) ? p.save.map(parseSaveItem).filter((v): v is MemoryDraft => Boolean(v)) : [],
-               stale: Array.isArray(p.stale) ? p.stale.filter((v): v is string => typeof v === "string") : [] };
-    } catch { return null; }
+      return {
+        save: Array.isArray(p.save) ? p.save.map(parseSaveItem).filter((v): v is MemoryDraft => Boolean(v)) : [],
+        stale: Array.isArray(p.stale) ? p.stale.filter((v): v is string => typeof v === "string") : [],
+      };
+    } catch {
+      return null;
+    }
   };
   const t = raw.trim();
   return tryParse(t) ?? (() => {
@@ -459,6 +831,7 @@ function parseDecision(raw: string): MemoryDecision {
     throw new Error("memory decision subagent returned invalid JSON");
   })();
 }
+
 function parseSaveItem(value: unknown): MemoryDraft | null {
   if (typeof value === "string") {
     const detail = norm(value);
@@ -470,8 +843,30 @@ function parseSaveItem(value: unknown): MemoryDraft | null {
   if (!detail) return null;
   const kind = typeof record.kind === "string" ? record.kind : undefined;
   const topics = Array.isArray(record.topics) ? record.topics.filter((v): v is string => typeof v === "string") : undefined;
+  const sourceRole = record.sourceRole === "assistant" || record.sourceRole === "user"
+    ? record.sourceRole
+    : record.source_role === "assistant" || record.source_role === "user"
+      ? record.source_role
+      : undefined;
+  const entities = Array.isArray(record.entities)
+    ? record.entities.filter((v): v is string => typeof v === "string")
+    : typeof record.entities === "string"
+      ? parseEntityList(record.entities)
+      : undefined;
+  const factType = typeof record.factType === "string" ? record.factType : typeof record.fact_type === "string" ? record.fact_type : undefined;
+  const eventDate = typeof record.eventDate === "string" ? record.eventDate : typeof record.event_date === "string" ? record.event_date : undefined;
+  const timeAnchor = typeof record.timeAnchor === "string" ? record.timeAnchor : typeof record.time_anchor === "string" ? record.time_anchor : undefined;
   try {
-    return normalizeDraft({ detail, ...(kind ? { kind } : {}), ...(topics ? { topics } : {}) });
+    return normalizeDraft({
+      detail,
+      ...(kind ? { kind } : {}),
+      ...(topics ? { topics } : {}),
+      ...(sourceRole ? { sourceRole } : {}),
+      ...(entities ? { entities } : {}),
+      ...(factType ? { factType } : {}),
+      ...(eventDate ? { eventDate } : {}),
+      ...(timeAnchor ? { timeAnchor } : {}),
+    });
   } catch {
     return null;
   }
