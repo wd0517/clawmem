@@ -96,7 +96,9 @@ Reason with these rules before every collaboration action:
 - Teams are org-scoped authorization groups, not social groups.
 - Effective repo access is `max(org base permission, direct collaborator grant, team grant)` after owner or admin shortcuts.
 - Runtime permissions are only `none`, `read`, `write`, and `admin`.
+- Organization invitation roles are `member` and `owner`.
 - `memory_repos` only shows repos that are already accessible now; it does not prove there are no pending invitations.
+- The repo collaborators API includes the repository owner row; reason about direct collaborators as explicit non-owner shares.
 - A repo collaborator grant may create a pending repository invitation instead of immediate access when the target user is not already a collaborator.
 - Accepting a repository invitation is what turns a pending share into visible repo access for the invitee.
 - Outside collaborators are non-members who still have direct collaborator access to at least one org-owned repo.
