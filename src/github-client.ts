@@ -39,6 +39,9 @@ type CollaboratorResponse = {
   name?: string;
   permissions?: PermissionMap;
   role_name?: string;
+  organization_member?: boolean;
+  outside_collaborator?: boolean;
+  type?: string;
 };
 type RepositoryInvitationResponse = {
   id?: number;
@@ -209,9 +212,6 @@ export class GitHubIssueClient {
   async getRepo(owner: string, repo: string): Promise<RepoResponse> {
     return this.req<RepoResponse>(`repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, { method: "GET" });
   }
-  async listRepoTeams(owner: string, repo: string): Promise<TeamResponse[]> {
-    return this.req<TeamResponse[]>(`repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/teams`, { method: "GET" });
-  }
   async listUserRepoInvitations(): Promise<RepositoryInvitationResponse[]> {
     return this.req<RepositoryInvitationResponse[]>("user/repository_invitations", { method: "GET" });
   }
@@ -226,7 +226,7 @@ export class GitHubIssueClient {
   }
   async createOrgInvitation(
     org: string,
-    params: { inviteeLogin: string; role?: "member" | "admin"; teamIds?: number[]; expiresInDays?: number },
+    params: { inviteeLogin: string; role?: "member" | "owner"; teamIds?: number[]; expiresInDays?: number },
   ): Promise<InvitationResponse> {
     return this.req<InvitationResponse>(`orgs/${encodeURIComponent(org)}/invitations`, {
       method: "POST",

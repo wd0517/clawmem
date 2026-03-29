@@ -2,6 +2,13 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { hasDefaultRepo, isAgentConfigured, resolveAgentRoute, resolvePluginConfig } from "./config.js";
 import { ConversationMirror } from "./conversation.js";
+import {
+  filterDirectCollaborators,
+  listRepoAccessTeams,
+  normalizePermissionAlias,
+  repoSummaryFullName,
+  resolveOrgInvitationRole,
+} from "./collaboration.js";
 import { GitHubIssueClient } from "./github-client.js";
 import { KeyedAsyncQueue } from "./keyed-async-queue.js";
 import { MemoryStore } from "./memory.js";
@@ -9,11 +16,10 @@ import { loadState, resolveStatePath, saveState } from "./state.js";
 import { readTranscriptSnapshot } from "./transcript.js";
 import type { BootstrapIdentityResponse, ClawMemPluginConfig, ClawMemResolvedRoute, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { buildAgentBootstrapRegistration, inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
+import type { CollaborationPermission } from "./collaboration.js";
 
 type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; messages: unknown[] };
 type FinalizePayload = { sessionId?: string; sessionKey?: string; sessionFile?: string; agentId?: string; reason?: string; messages?: unknown[] };
-type CollaborationPermission = "read" | "write" | "admin";
-type CollaborationOrgRole = "member" | "admin";
 type CollaborationTeamRole = "member" | "maintainer";
 
 class ClawMemService {
@@ -728,7 +734,7 @@ class ClawMemService {
 
     this.api.registerTool({
       name: "collaboration_repo_collaborators",
-      description: "List direct collaborators on a repo before changing repository-level access.",
+      description: "List explicit non-owner collaborators on a repo before changing repository-level access.",
       required: true,
       parameters: {
         type: "object",
@@ -744,10 +750,10 @@ class ClawMemService {
         const target = await this.requireCollaborationRepo(agentId, p.repo);
         if ("error" in target) return toolText(target.error);
         try {
-          const collaborators = await target.client.listRepoCollaborators(target.owner, target.repo);
-          if (collaborators.length === 0) return toolText(`No direct collaborators found on ${target.fullName}.`);
+          const collaborators = filterDirectCollaborators(await target.client.listRepoCollaborators(target.owner, target.repo), target.owner);
+          if (collaborators.length === 0) return toolText(`No explicit non-owner collaborators found on ${target.fullName}.`);
           return toolText([
-            `Direct collaborators on ${target.fullName}:`,
+            `Explicit collaborators on ${target.fullName}:`,
             ...collaborators.map((collaborator) => `- ${renderCollaboratorLine(collaborator)}`),
           ].join("\n"));
         } catch (error) {
@@ -827,7 +833,7 @@ class ClawMemService {
 
     this.api.registerTool({
       name: "collaboration_repo_collaborator_remove",
-      description: "Remove a direct collaborator from a repo. Requires confirmed=true after explicit user approval.",
+      description: "Remove a repo collaborator or revoke a pending direct-share invitation. Requires confirmed=true after explicit user approval.",
       required: true,
       parameters: {
         type: "object",
@@ -851,7 +857,7 @@ class ClawMemService {
         if ("error" in target) return toolText(target.error);
         try {
           await target.client.removeRepoCollaborator(target.owner, target.repo, username);
-          return toolText(`Removed ${username} from ${target.fullName}.`);
+          return toolText(`Removed direct access or pending invitation for ${username} from ${target.fullName}.`);
         } catch (error) {
           return toolText(`Unable to remove ${username} from ${target.fullName}: ${String(error)}`);
         }
@@ -1006,7 +1012,7 @@ class ClawMemService {
         properties: {
           org: { type: "string", minLength: 1, description: "Organization login." },
           inviteeLogin: { type: "string", minLength: 1, description: "Username to invite." },
-          role: { type: "string", enum: ["member", "admin"], description: "Org role for the invitation. Defaults to member." },
+          role: { type: "string", enum: ["member", "owner"], description: "Org role for the invitation. Defaults to member." },
           teamIds: {
             type: "array",
             description: "Optional numeric team ids to pre-assign on acceptance.",
@@ -1027,7 +1033,8 @@ class ClawMemService {
         const org = typeof p.org === "string" ? p.org.trim() : "";
         const inviteeLogin = typeof p.inviteeLogin === "string" ? p.inviteeLogin.trim() : "";
         if (!org || !inviteeLogin) return toolText("org and inviteeLogin are required.");
-        const role: CollaborationOrgRole = p.role === "admin" ? "admin" : "member";
+        const role = resolveOrgInvitationRole(p.role, "member");
+        if ("error" in role) return toolText(role.error);
         const teamIds = Array.isArray(p.teamIds)
           ? p.teamIds.filter((value): value is number => typeof value === "number" && Number.isInteger(value) && value > 0)
           : undefined;
@@ -1039,7 +1046,7 @@ class ClawMemService {
         try {
           const invitation = await resolved.client.createOrgInvitation(org, {
             inviteeLogin,
-            role,
+            role: role.role,
             ...(teamIds && teamIds.length > 0 ? { teamIds } : {}),
             ...(expiresInDays ? { expiresInDays } : {}),
           });
@@ -1209,6 +1216,7 @@ class ClawMemService {
           const lines = [`Repo access inspection for ${target.fullName}:`];
           const notes: string[] = [];
           let orgName: string | undefined;
+          let hasOrgContext = false;
 
           try {
             const repo = await target.client.getRepo(target.owner, target.repo);
@@ -1222,15 +1230,16 @@ class ClawMemService {
 
           try {
             const org = await target.client.getOrg(orgName);
+            hasOrgContext = true;
             lines.push(`- Org default repository permission: ${org.default_repository_permission?.trim() || "unknown"}`);
           } catch (error) {
             notes.push(`Org metadata unavailable for "${orgName}": ${String(error)}`);
           }
 
           try {
-            const collaborators = await target.client.listRepoCollaborators(target.owner, target.repo);
+            const collaborators = filterDirectCollaborators(await target.client.listRepoCollaborators(target.owner, target.repo), target.owner);
             lines.push("");
-            lines.push("Direct collaborators:");
+            lines.push("Explicit collaborators (excluding owner):");
             if (collaborators.length === 0) lines.push("- None visible");
             else lines.push(...collaborators.map((collaborator) => `- ${renderCollaboratorLine(collaborator)}`));
           } catch (error) {
@@ -1247,24 +1256,29 @@ class ClawMemService {
             notes.push(`Repo invitation lookup failed: ${String(error)}`);
           }
 
-          try {
-            const teams = await target.client.listRepoTeams(target.owner, target.repo);
-            lines.push("");
-            lines.push("Teams with repo access:");
-            if (teams.length === 0) lines.push("- None visible");
-            else lines.push(...teams.map((team) => `- ${renderTeamLine(team)}`));
-          } catch (error) {
-            notes.push(`Repo team grant lookup failed: ${String(error)}`);
+          if (hasOrgContext && orgName) {
+            try {
+              const teamAccess = await listRepoAccessTeams(target.client, orgName, target.fullName);
+              lines.push("");
+              lines.push("Teams with repo access:");
+              if (teamAccess.teams.length === 0) lines.push("- None visible");
+              else lines.push(...teamAccess.teams.map((team) => `- ${renderTeamLine(team)}`));
+              notes.push(...teamAccess.notes);
+            } catch (error) {
+              notes.push(`Repo team grant lookup failed: ${String(error)}`);
+            }
           }
 
-          try {
-            const outside = await target.client.listOrgOutsideCollaborators(orgName);
-            lines.push("");
-            lines.push(`Outside collaborators in owner org "${orgName}":`);
-            if (outside.length === 0) lines.push("- None visible");
-            else lines.push(...outside.map((user) => `- ${renderCollaboratorLine(user)}`));
-          } catch (error) {
-            notes.push(`Outside collaborator lookup failed: ${String(error)}`);
+          if (hasOrgContext && orgName) {
+            try {
+              const outside = await target.client.listOrgOutsideCollaborators(orgName);
+              lines.push("");
+              lines.push(`Outside collaborators in owner org "${orgName}":`);
+              if (outside.length === 0) lines.push("- None visible");
+              else lines.push(...outside.map((user) => `- ${renderCollaboratorLine(user)}`));
+            } catch (error) {
+              notes.push(`Outside collaborator lookup failed: ${String(error)}`);
+            }
           }
 
           if (notes.length > 0) {
@@ -1742,15 +1756,6 @@ function renderTeamLine(team: { slug?: string; name?: string; description?: stri
   return `${slug}${name}${privacy}${permissionText}${description}`;
 }
 
-function repoSummaryFullName(repo?: { full_name?: string; owner?: { login?: string }; name?: string }): string | undefined {
-  const fullName = repo?.full_name?.trim();
-  if (fullName) return fullName;
-  const owner = repo?.owner?.login?.trim();
-  const name = repo?.name?.trim();
-  if (owner && name) return `${owner}/${name}`;
-  return name || undefined;
-}
-
 function renderRepoGrantLine(repo: { full_name?: string; name?: string; permissions?: Record<string, boolean | undefined>; role_name?: string; description?: string }): string {
   const fullName = repoSummaryFullName(repo) || "unknown-repo";
   const permission = canonicalPermission(repo.permissions, repo.role_name);
@@ -1759,12 +1764,21 @@ function renderRepoGrantLine(repo: { full_name?: string; name?: string; permissi
   return `${fullName}${permissionText}${description}`;
 }
 
-function renderCollaboratorLine(user: { login?: string; name?: string; permissions?: Record<string, boolean | undefined>; role_name?: string }): string {
+function renderCollaboratorLine(user: {
+  login?: string;
+  name?: string;
+  permissions?: Record<string, boolean | undefined>;
+  role_name?: string;
+  organization_member?: boolean;
+  outside_collaborator?: boolean;
+}): string {
   const login = user.login?.trim() || user.name?.trim() || "unknown-user";
   const name = user.name?.trim() && user.name?.trim() !== login ? ` (${user.name.trim()})` : "";
   const permission = canonicalPermission(user.permissions, user.role_name);
   const permissionText = permission !== "unknown" ? ` [${permission}]` : "";
-  return `${login}${name}${permissionText}`;
+  const orgMemberText = user.organization_member === true ? " [org-member]" : "";
+  const outsideText = user.outside_collaborator === true ? " [outside]" : "";
+  return `${login}${name}${permissionText}${orgMemberText}${outsideText}`;
 }
 
 function renderRepoInvitationLine(invitation: { id?: number; created_at?: string; permissions?: string; repository?: { full_name?: string; owner?: { login?: string }; name?: string }; invitee?: { login?: string }; inviter?: { login?: string } }): string {
@@ -1815,17 +1829,6 @@ function canonicalPermission(permissions?: Record<string, boolean | undefined>, 
   if (permissions.maintain === true || permissions.push === true || permissions.write === true) return "write";
   if (permissions.triage === true || permissions.pull === true || permissions.read === true) return "read";
   return "unknown";
-}
-
-function normalizePermissionAlias(value: unknown): "none" | CollaborationPermission | undefined {
-  if (typeof value !== "string") return undefined;
-  const normalized = value.trim().toLowerCase();
-  if (!normalized) return undefined;
-  if (normalized === "none") return "none";
-  if (normalized === "read" || normalized === "pull" || normalized === "triage") return "read";
-  if (normalized === "write" || normalized === "push" || normalized === "maintain") return "write";
-  if (normalized === "admin") return "admin";
-  return undefined;
 }
 
 export function createClawMemPlugin(api: OpenClawPluginApi): void { new ClawMemService(api).register(); }
