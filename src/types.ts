@@ -16,8 +16,6 @@ export type ClawMemPluginConfig = {
   agents: Record<string, ClawMemAgentConfig>;
   memoryRecallLimit: number;
   memoryAutoRecallLimit: number;
-  memorySearchCandidateLimit: number;
-  memoryRecallMinScore: number;
   turnCommentDelayMs: number;
   summaryWaitTimeoutMs: number;
 };

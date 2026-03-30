@@ -28,27 +28,6 @@ type SearchIndex = {
   eventDate?: string;
   timeAnchor?: string;
 };
-type RecallPlan = {
-  rawQuery: string;
-  normalized: string;
-  variants: string[];
-  strictEntities: Set<string>;
-  looseEntities: Set<string>;
-  assistantBias: boolean;
-  temporalBias: boolean;
-};
-type ScoredMemory = ParsedMemoryIssue & {
-  score: number;
-  strictEntityHits: number;
-  looseEntityHits: number;
-};
-
-const SEARCH_STOPWORDS = new Set([
-  "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does", "for", "from", "how", "i", "if", "in", "into", "is",
-  "it", "its", "me", "my", "of", "on", "or", "our", "said", "say", "says", "tell", "that", "the", "their", "them", "they",
-  "this", "to", "told", "us", "was", "we", "were", "what", "when", "where", "which", "who", "why", "with", "you", "your",
-]);
-const TEMPORAL_HINTS = ["date", "day", "during", "earlier", "former", "last", "latest", "month", "newest", "next", "now", "past", "previous", "recent", "time", "today", "tomorrow", "updated", "when", "year", "yesterday"];
 
 export class MemoryStore {
   constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
@@ -56,12 +35,15 @@ export class MemoryStore {
   async search(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const rawQuery = query.trim();
     if (!rawQuery) return [];
+    try {
+      const backend = await this.searchViaBackend(rawQuery, limit);
+      if (backend.length > 0) return backend;
+    } catch (error) {
+      this.api.logger?.warn?.(`clawmem: backend memory search failed, falling back to local lexical search: ${String(error)}`);
+    }
     const active = await this.listByStatus("active");
     if (active.length === 0) return [];
-    const plan = buildRecallPlan(rawQuery);
-    const candidates = await this.collectCandidates(active, plan);
-    if (candidates.length === 0) return [];
-    return this.rankCandidates(candidates, plan, limit).map(stripSearchScore);
+    return this.searchLocally(normalizeSearch(rawQuery), limit, active);
   }
 
   async listSchema(): Promise<MemorySchema> {
@@ -222,47 +204,6 @@ export class MemoryStore {
     return out;
   }
 
-  private async collectCandidates(memories: ParsedMemoryIssue[], plan: RecallPlan): Promise<ParsedMemoryIssue[]> {
-    const candidateLimit = Math.min(memories.length, this.config.memorySearchCandidateLimit);
-    const candidates = new Map<number, ParsedMemoryIssue>();
-    let backendFailed = false;
-
-    for (const variant of plan.variants) {
-      if (!backendFailed) {
-        try {
-          for (const memory of await this.searchViaBackend(variant, candidateLimit)) {
-            candidates.set(memory.issueNumber, memory);
-          }
-        } catch (error) {
-          backendFailed = true;
-          this.api.logger?.warn?.(`clawmem: backend memory search failed, continuing with local reranking: ${String(error)}`);
-        }
-      }
-      for (const memory of this.searchLocally(normalizeSearch(variant), candidateLimit, memories)) {
-        candidates.set(memory.issueNumber, memory);
-      }
-    }
-
-    return [...candidates.values()];
-  }
-
-  private rankCandidates(candidates: ParsedMemoryIssue[], plan: RecallPlan, limit: number): ScoredMemory[] {
-    const scored = candidates
-      .map((memory) => ({ ...memory, ...scoreMemoryCandidate(memory, plan) }))
-      .sort((a, b) => b.score - a.score || b.strictEntityHits - a.strictEntityHits || b.looseEntityHits - a.looseEntityHits || b.issueNumber - a.issueNumber);
-    const topScore = scored[0]?.score ?? 0;
-    if (topScore < this.config.memoryRecallMinScore) return [];
-    const minAccepted = Math.max(this.config.memoryRecallMinScore, topScore * 0.35);
-    return scored
-      .filter((memory) => {
-        if (memory.score < minAccepted) return false;
-        if (plan.strictEntities.size === 0) return true;
-        if (memory.strictEntityHits > 0) return true;
-        return memory.looseEntityHits >= 2 && memory.score >= Math.max(minAccepted * 2, topScore * 0.9);
-      })
-      .slice(0, limit);
-  }
-
   private async searchViaBackend(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const repo = this.client.repo();
     if (!repo) return [];
@@ -379,12 +320,13 @@ export class MemoryStore {
       "Split independent facts even when they appear in the same turn. If one message contains three durable facts, return three save items.",
       "Use save for stable, reusable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
       "Use stale for existing memory IDs only when the conversation clearly supersedes or invalidates them.",
-      "Infer kind and topics when they would help future retrieval. Reuse existing kinds and topics when possible.",
+      "Infer kind and topics only when they materially help future retrieval. Reuse existing kinds and topics when possible, and prefer leaving them empty over inventing one-off labels.",
       "sourceRole must reflect whether the durable fact originated from the user or the assistant.",
       "entities should contain 1-5 short names, products, people, places, organizations, or exact concepts that anchor future retrieval.",
       "factType should be a short reusable category such as preference, identity, timeline-event, project-status, assistant-knowledge, task, or decision.",
       "If the conversation gives an absolute date, normalize it into eventDate as YYYY-MM-DD. If it only gives a relative time such as yesterday or next quarter, preserve that in timeAnchor.",
       "Topics should be short reusable tags, not sentences. Prefer 0-3 topics per memory.",
+      "Do not create separate memories that only restate the same fact with slightly different wording.",
       "Do not save temporary requests, startup boilerplate, tool chatter, summaries about internal helper sessions, or one-off operational details.",
       "Prefer empty arrays when nothing durable should be remembered.",
       "", "<existing-schema>", schemaBlock, "</existing-schema>",
@@ -544,105 +486,9 @@ function overlapRatio(left: Set<string>, right: Set<string>): number {
   return hits / Math.max(left.size, right.size);
 }
 
-function countOverlap(left: Set<string>, right: Set<string>): number {
-  let hits = 0;
-  for (const token of left) if (right.has(token)) hits++;
-  return hits;
-}
-
 function buildMemorySearchQuery(query: string, repo: string): string {
   const parts = [query.trim(), `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].filter(Boolean);
   return parts.join(" ");
-}
-
-function buildRecallPlan(rawQuery: string): RecallPlan {
-  const normalized = normalizeSearch(rawQuery);
-  const keywordTokens = searchTokens(normalized).filter((token) => !SEARCH_STOPWORDS.has(token)).slice(0, 8);
-  const quotedPhrases = [...rawQuery.matchAll(/"([^"]+)"|'([^']+)'/g)].map((match) => norm(match[1] || match[2] || "")).filter(Boolean);
-  const strictEntities = new Set([
-    ...quotedPhrases.map(normalizeSearch),
-    ...extractStrictEntities(rawQuery),
-  ]);
-  const looseEntities = new Set([
-    ...keywordTokens.filter((token) => token.length > 2),
-    ...strictEntities,
-  ]);
-  const variants = uniqueStable([
-    rawQuery,
-    keywordTokens.join(" "),
-    [...strictEntities].join(" "),
-    ...expandSemanticVariants(rawQuery),
-  ]).filter((variant) => normalizeSearch(variant).length > 0).slice(0, 6);
-  const assistantBias = /\b(assistant|model|ai|you|your|you said|you told|your response|your answer)\b/i.test(rawQuery);
-  const temporalBias = TEMPORAL_HINTS.some((hint) => normalized.includes(hint)) || /\b\d{4}\b/.test(rawQuery) || /\b\d{4}-\d{2}-\d{2}\b/.test(rawQuery);
-  return { rawQuery, normalized, variants, strictEntities, looseEntities, assistantBias, temporalBias };
-}
-
-function expandSemanticVariants(rawQuery: string): string[] {
-  const rewrites: Array<[pattern: RegExp, replacement: string]> = [
-    [/\brecent\b|\blatest\b|\bcurrent\b|\bnewest\b/gi, "recent latest current now most recent"],
-    [/\bprevious\b|\bformer\b|\bpast\b|\bearlier\b/gi, "previous former past earlier before"],
-    [/\boccupation\b|\bprofession\b|\bjob\b|\bwork\b|\brole\b/gi, "occupation profession job work role"],
-    [/\bpublication\b|\bpublications\b|\bpaper\b|\bpapers\b|\barticle\b|\barticles\b/gi, "publication paper article writing research"],
-    [/\bmentor\b|\bmentorship\b|\badvisor\b|\bcoached\b/gi, "mentor mentorship advisor coached guidance"],
-    [/\blegal\b|\bcase\b|\bcases\b|\blaw\b|\bruling\b/gi, "legal case law ruling court"],
-  ];
-  const out: string[] = [];
-  for (const [pattern, replacement] of rewrites) {
-    if (!pattern.test(rawQuery)) continue;
-    out.push(rawQuery.replace(pattern, replacement));
-  }
-  return out;
-}
-
-function extractStrictEntities(rawQuery: string): string[] {
-  const out = new Set<string>();
-  for (const match of rawQuery.match(/\b(?:[A-Z][a-z0-9]+|[A-Z]{2,}|[0-9]{4}|[0-9]{4}-[0-9]{2}-[0-9]{2})(?:[\s/-]+(?:[A-Z][a-z0-9]+|[A-Z]{2,}|[0-9]{4}))*/g) ?? []) {
-    const entity = normalizeSearch(match);
-    if (entity.length > 1 && !SEARCH_STOPWORDS.has(entity)) out.add(entity);
-  }
-  return [...out];
-}
-
-function scoreMemoryCandidate(memory: ParsedMemoryIssue, plan: RecallPlan): { score: number; strictEntityHits: number; looseEntityHits: number } {
-  const idx = buildSearchIndex(memory);
-  let score = scoreSearchIndex(idx, plan.normalized);
-  let variantBonus = 0;
-  for (const variant of plan.variants) {
-    const normalizedVariant = normalizeSearch(variant);
-    if (!normalizedVariant || normalizedVariant === plan.normalized) continue;
-    variantBonus = Math.max(variantBonus, scoreSearchIndex(idx, normalizedVariant) * 0.6);
-  }
-  score += variantBonus;
-
-  const memoryEntitySet = new Set([
-    ...searchTokens(idx.title),
-    ...searchTokens(idx.detail),
-    ...idx.entities.flatMap(searchTokens),
-    ...idx.topics.flatMap(searchTokens),
-    ...searchTokens(idx.factType ?? ""),
-    ...searchTokens(idx.eventDate ?? ""),
-    ...searchTokens(idx.timeAnchor ?? ""),
-  ]);
-  const strictEntityHits = countOverlap(plan.strictEntities, memoryEntitySet);
-  const looseEntityHits = countOverlap(plan.looseEntities, memoryEntitySet);
-  score += strictEntityHits * 10;
-  score += looseEntityHits * 1.5;
-  if (plan.strictEntities.size > 0 && strictEntityHits === 0) score -= 8;
-
-  if (plan.assistantBias) {
-    if (idx.sourceRole === "assistant") score += 6;
-    if (idx.sourceRole === "user") score -= 1;
-  }
-
-  if (plan.temporalBias) {
-    if (idx.eventDate) score += 5;
-    if (idx.timeAnchor) score += 3;
-    const temporalTerms = new Set(TEMPORAL_HINTS.filter((hint) => plan.normalized.includes(hint)));
-    if (countOverlap(temporalTerms, memoryEntitySet) > 0) score += 2;
-  }
-
-  return { score, strictEntityHits, looseEntityHits };
 }
 
 function scoreSearchIndex(idx: SearchIndex, normalizedQuery: string): number {
@@ -692,16 +538,6 @@ function scoreSearchIndex(idx: SearchIndex, normalizedQuery: string): number {
 
   return score;
 }
-
-export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): number {
-  return scoreMemoryCandidate(memory, buildRecallPlan(rawQuery)).score;
-}
-
-function stripSearchScore(memory: ScoredMemory): ParsedMemoryIssue {
-  const { score: _score, strictEntityHits: _strictEntityHits, looseEntityHits: _looseEntityHits, ...plain } = memory;
-  return plain;
-}
-
 function normalizeDraft(input: MemoryDraft): MemoryDraft {
   const detail = norm(input.detail);
   if (!detail) throw new Error("memory detail is empty");
@@ -787,19 +623,6 @@ function mergeEntities(left: string[], right: string[]): string[] {
 
 function uniqueNormalized(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort();
-}
-
-function uniqueStable(values: string[]): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const value of values) {
-    const normalized = norm(value);
-    const key = normalizeSearch(normalized);
-    if (!normalized || seen.has(key)) continue;
-    seen.add(key);
-    out.push(normalized);
-  }
-  return out;
 }
 
 function parseEntityList(value: string | undefined): string[] {

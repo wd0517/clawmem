@@ -234,7 +234,7 @@ class ClawMemService {
 
     this.api.registerTool({
       name: "memory_recall",
-      description: "Search ClawMem active memories for relevant prior facts, decisions, conventions, and lessons.",
+      description: "Search ClawMem active memories for relevant prior facts, decisions, conventions, and lessons. Use this before answering questions about prior conversations, earlier assistant responses, user preferences, or historical project context.",
       required: true,
       parameters: {
         type: "object",
@@ -297,7 +297,7 @@ class ClawMemService {
 
     this.api.registerTool({
       name: "memory_store",
-      description: "Store a durable ClawMem memory immediately instead of waiting for session finalization.",
+      description: "Store one atomic durable ClawMem memory immediately instead of waiting for session finalization. Keep each write to a single fact, preference, decision, or timeline update.",
       required: true,
       parameters: {
         type: "object",
@@ -1775,7 +1775,10 @@ function renderMemoryLine(memory: {
   kind?: string;
   topics?: string[];
   sourceRole?: "user" | "assistant";
+  entities?: string[];
   factType?: string;
+  eventDate?: string;
+  timeAnchor?: string;
   status: "active" | "stale";
 }): string {
   const schema = [
@@ -1783,6 +1786,9 @@ function renderMemoryLine(memory: {
     ...(memory.topics ?? []).map((topic) => `topic:${topic}`),
     memory.sourceRole ? `source:${memory.sourceRole}` : "",
     memory.factType ? `factType:${memory.factType}` : "",
+    ...(memory.entities ?? []).slice(0, 3).map((entity) => `entity:${entity}`),
+    memory.eventDate ? `eventDate:${memory.eventDate}` : "",
+    memory.timeAnchor ? `time:${memory.timeAnchor}` : "",
   ].filter(Boolean).join(", ");
   return `[${memory.memoryId}] ${memory.title || "Memory"}${schema ? ` (${schema})` : ""}${memory.status === "stale" ? " [stale]" : ""}: ${memory.detail}`;
 }
@@ -1822,6 +1828,7 @@ function renderMemoryBlock(memory: {
 function formatInjectedMemory(memory: {
   detail: string;
   sourceRole?: "user" | "assistant";
+  entities?: string[];
   eventDate?: string;
   timeAnchor?: string;
   factType?: string;
@@ -1829,6 +1836,7 @@ function formatInjectedMemory(memory: {
   const meta = [
     memory.sourceRole ? `source:${memory.sourceRole}` : "",
     memory.factType ? `factType:${memory.factType}` : "",
+    ...(memory.entities ?? []).slice(0, 3).map((entity) => `entity:${entity}`),
     memory.eventDate ? `eventDate:${memory.eventDate}` : "",
     memory.timeAnchor ? `time:${memory.timeAnchor}` : "",
   ].filter(Boolean).join(", ");

@@ -1,4 +1,4 @@
-import { MemoryStore, scoreMemoryMatch } from "./memory.js";
+import { MemoryStore } from "./memory.js";
 import type { ClawMemPluginConfig, ParsedMemoryIssue } from "./types.js";
 import { stringifyFlatYaml } from "./yaml.js";
 
@@ -55,8 +55,6 @@ function testConfig(overrides: Partial<ClawMemPluginConfig> = {}): ClawMemPlugin
     agents: {},
     memoryRecallLimit: 5,
     memoryAutoRecallLimit: 5,
-    memorySearchCandidateLimit: 25,
-    memoryRecallMinScore: 8,
     turnCommentDelayMs: 1000,
     summaryWaitTimeoutMs: 120000,
     ...overrides,
@@ -151,26 +149,6 @@ async function testBackendSearchFallsBackToLocalLexical(): Promise<void> {
   const found = await store.search("redis rate limiting", 5);
 
   assert(found.length === 1 && found[0]?.issueNumber === 3, "expected lexical fallback when backend search fails");
-}
-
-function testCjkScoring(): void {
-  const billing = memory({
-    issueNumber: 3,
-    title: "Memory: 账单修复流程",
-    detail: "遇到账单不一致时，先核对 invoice_id，再补发 webhook。",
-    topics: ["账单", "支付"],
-    entities: ["invoice_id", "webhook"],
-  });
-  const unrelated = memory({
-    issueNumber: 4,
-    title: "Memory: 部署备注",
-    detail: "发布前需要确认灰度流量比例。",
-    topics: ["部署"],
-  });
-  const billingScore = scoreMemoryMatch(billing, "账单 webhook");
-  const unrelatedScore = scoreMemoryMatch(unrelated, "账单 webhook");
-  assert(billingScore > unrelatedScore, "expected Chinese query scoring to prefer the billing memory");
-  assert(billingScore > 0, "expected Chinese query to produce a positive match score");
 }
 
 async function testStructuredStoreAndSchema(): Promise<void> {
@@ -296,7 +274,7 @@ async function testLegacyMemoriesWithoutSessionOrDate(): Promise<void> {
       });
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig({ memoryRecallMinScore: 0 }));
+  const store = new MemoryStore(client as never, {} as never, testConfig());
   const exact = await store.get("4");
   const recalled = await store.search("xiangz likes F1 and Dota 2", 5);
 
@@ -410,71 +388,6 @@ async function testDuplicateStoreMergesMetadata(): Promise<void> {
   assert(syncedLabels[0]?.labels.includes("topic:rate-limit"), "expected duplicate merge to extend topic labels");
 }
 
-async function testSemanticVariantRecall(): Promise<void> {
-  const issues = [
-    issueFromMemory(memory({
-      issueNumber: 20,
-      title: "Memory: latest papers",
-      detail: "The project's latest papers are on retrieval calibration and memory compression.",
-      topics: ["research"],
-      factType: "assistant-knowledge",
-    })),
-  ];
-  const client = {
-    repo: () => "owner/main-memory",
-    listIssues: async () => issues,
-    searchIssues: async () => [] as IssueRecord[],
-  };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
-  const found = await store.search("recent publications", 5);
-  assert(found.length === 1 && found[0]?.issueNumber === 20, "expected semantic variant expansion to match recent publications to latest papers");
-}
-
-async function testAssistantBias(): Promise<void> {
-  const issues = [
-    issueFromMemory(memory({
-      issueNumber: 30,
-      title: "Memory: assistant legal explanation",
-      detail: "I explained the difference between civil and criminal cases.",
-      sourceRole: "assistant",
-      factType: "assistant-knowledge",
-      entities: ["civil cases", "criminal cases"],
-    })),
-    issueFromMemory(memory({
-      issueNumber: 31,
-      title: "Memory: user legal preference",
-      detail: "The user asked for more legal examples.",
-      sourceRole: "user",
-      factType: "preference",
-    })),
-  ];
-  const client = {
-    listIssues: async () => issues,
-  };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
-  const found = await store.search("what did you say about legal cases", 5);
-  assert(found[0]?.issueNumber === 30, "expected assistant-source memory to rank first for assistant-centric queries");
-}
-
-async function testEntityGuardAbstains(): Promise<void> {
-  const issues = [
-    issueFromMemory(memory({
-      issueNumber: 40,
-      title: "Memory: generic lawsuit notes",
-      detail: "We discussed a lawsuit in broad legal terms.",
-      sourceRole: "assistant",
-      factType: "assistant-knowledge",
-      entities: ["lawsuit"],
-    })),
-  ];
-  const client = {
-    listIssues: async () => issues,
-  };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
-  const found = await store.search("What did you say about Miyazaki lawsuit", 5);
-  assert(found.length === 0, "expected strict entity validation to abstain on vague false positives");
-}
-
 async function testForgetClosesMemoryIssue(): Promise<void> {
   const issues: IssueRecord[] = [
     issueFromMemory(memory({
@@ -525,15 +438,11 @@ async function main(): Promise<void> {
   await testSearchRanking();
   await testBackendSearchPreferredForRecall();
   await testBackendSearchFallsBackToLocalLexical();
-  testCjkScoring();
   await testStructuredStoreAndSchema();
   await testGetAndListMemories();
   await testLegacyMemoriesWithoutSessionOrDate();
   await testUpdateMemoryInPlace();
   await testDuplicateStoreMergesMetadata();
-  await testSemanticVariantRecall();
-  await testAssistantBias();
-  await testEntityGuardAbstains();
   await testForgetClosesMemoryIssue();
   console.log("memory tests passed");
 }

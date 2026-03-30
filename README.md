@@ -138,9 +138,7 @@ Full config with all options:
           turnCommentDelayMs: 1000,
           summaryWaitTimeoutMs: 120000,
           memoryRecallLimit: 5,
-          memoryAutoRecallLimit: 5,
-          memorySearchCandidateLimit: 25,
-          memoryRecallMinScore: 8
+          memoryAutoRecallLimit: 5
         }
       }
     }
@@ -155,7 +153,7 @@ Full config with all options:
 - Conversation comments exclude tool calls, tool results, system messages, and heartbeat noise.
 - Summary failures do not block finalization; the `summary` field is written as `failed: ...`.
 - Memory search and auto-injection only return open `type:memory` issues. Closed memory issues are treated as stale.
-- `memory_recall` now gathers candidates with multiple query rewrites, prefers the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`, reranks locally, and abstains on weak matches.
+- `memory_recall` now prefers the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`, with a simple local lexical fallback when backend search is unavailable or returns no matches.
 - Durable memories are extracted best-effort during later request-scoped maintenance, not by background subagent work after a request has already ended.
 - The plugin exposes `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
 - Route resolution is now: agent identity supplies credentials, `defaultRepo` is the fallback memory space, and explicit tool calls may override repo per operation.
