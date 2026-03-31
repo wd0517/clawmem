@@ -103,6 +103,8 @@ Rules:
 
 The first implementation keeps the memory issue body minimal and stores only the memory detail text itself.
 
+For new memories, the human-readable memory title and body should default to the user's current language. When updating an existing memory, preserve that memory node's current language unless the user explicitly requests a rewrite.
+
 Metadata such as type, session, date, and status are carried by labels and issue metadata, not repeated in the body.
 
 Example:
@@ -155,6 +157,7 @@ New durable memories are created during the finalize pipeline.
 Default behavior:
 
 - create a `type:memory` issue
+- write the human-readable memory title and body in the user's current language by default
 - apply `session:<session_id>`
 - apply `date:YYYY-MM-DD`
 - optionally apply one or more `topic:*` labels

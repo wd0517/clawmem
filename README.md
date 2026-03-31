@@ -73,6 +73,7 @@ The plugin package is now the runtime source of truth:
 
 That bundled skill covers:
 - recall and save behavior
+- storage-language discipline for memory titles and bodies
 - schema discipline and deliberate self-evolution
 - shared-memory and collaboration routing
 - repair and verification guidance
@@ -160,4 +161,5 @@ Full config with all options:
 - Memory issues no longer use `session:*` labels. Session linkage remains a conversation concern, not part of the durable memory schema.
 - `memory_update` updates one existing memory issue in place; use it for evolving canonical facts or active tasks instead of creating a duplicate node.
 - Conversation lifecycle is stored in native issue state (`open` while live, `closed` after finalize); memory lifecycle uses native issue state too (`open` active, `closed` stale).
-- Memory issue bodies store the durable detail plus flat metadata such as `memory_hash` and logical `date`; labels are reserved for schema and routing.
+- New memory titles and bodies default to the user's current language; updating an existing memory preserves that node's current language unless the user explicitly requests a rewrite.
+- Memory issue bodies store the durable detail plus flat metadata such as `memory_hash` and logical `date`; labels and structural identifiers remain reserved for schema and routing.

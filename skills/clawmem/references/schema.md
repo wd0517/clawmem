@@ -58,6 +58,12 @@ If you create a curated memory manually, include:
 - New labels should be short, general, and likely to apply again across future memories or agents.
 - Do not invent random label prefixes. Schema evolution must stay within `kind:*` and `topic:*`.
 
+## Storage language
+
+- For new memory nodes, write the human-readable title and body in the user's current language by default.
+- When updating an existing memory node, preserve that node's current language unless the user explicitly asks for a rewrite.
+- Do not translate schema or routing markers such as `type:*`, `kind:*`, `topic:*`, or other machine-oriented field names.
+
 ## Storage rule
 
 If you are writing something so the agent remembers it later, store it in ClawMem. If you are writing something for a tool or human to read directly, write a file instead.

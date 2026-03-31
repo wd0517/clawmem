@@ -75,6 +75,10 @@ Do not export `GH_HOST` or `GH_ENTERPRISE_TOKEN` globally for unrelated github.c
 
 Use the tool path first. If raw issue control is required:
 
+- For new memories, write the issue title and body in the user's current language.
+- When manually updating an existing memory, preserve that memory's current language unless the user explicitly asks for a rewrite.
+- Keep labels and schema markers such as `type:*`, `kind:*`, and `topic:*` in their fixed machine-readable form.
+
 ### With `gh`
 
 ```sh
@@ -85,8 +89,8 @@ done
 
 GH_HOST="$CLAWMEM_HOST" GH_ENTERPRISE_TOKEN="$CLAWMEM_TOKEN" \
   gh issue create --repo "$CLAWMEM_REPO" \
-    --title "Memory: <concise title>" \
-    --body "<durable detail in plain language>" \
+    --title "<concise title in the user's current language>" \
+    --body "<durable detail in the user's current language>" \
     --label "type:memory" \
     --label "kind:lesson"
 ```
@@ -105,8 +109,8 @@ curl -sf -X POST -H "Authorization: token $CLAWMEM_TOKEN" \
   -H "Content-Type: application/json" \
   "$CLAWMEM_BASE_URL/repos/$CLAWMEM_REPO/issues" \
   -d "{
-    \"title\": \"Memory: <concise title>\",
-    \"body\": \"<durable detail in plain language>\",
+    \"title\": \"<concise title in the user's current language>\",
+    \"body\": \"<durable detail in the user's current language>\",
     \"labels\": [\"type:memory\", \"kind:lesson\"]
   }" | jq '{number, title, url: .html_url}'
 ```

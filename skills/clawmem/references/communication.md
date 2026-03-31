@@ -27,6 +27,11 @@ Preferred confirmation:
 - say that you remembered, saved, or updated it
 - include the memory id and title only when they help with debugging, traceability, or explicit user requests
 
+Storage language defaults:
+- For new memories, store the human-readable title and body in the user's current language.
+- For updates, preserve the memory node's current language unless the user explicitly asks for a rewrite.
+- Keep labels and structural markers such as `type:*`, `kind:*`, and `topic:*` in their fixed machine-readable form.
+
 Do not force English markers like `Memory hit` or `Locked memory` in non-English conversations. Those are examples, not required phrasing.
 
 Examples:
