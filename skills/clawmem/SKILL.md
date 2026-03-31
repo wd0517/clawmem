@@ -46,6 +46,7 @@ On every user turn, run this loop:
    - Never treat a `memory_recall` miss by itself as proof that no relevant memory exists.
 2. After answering, ask: did this turn create durable knowledge?
    - Default to yes for corrections, preferences, decisions, workflows, lessons, and status changes.
+   - Prefer one durable fact per memory. If a turn contains several independent facts, save them separately instead of bundling them into one summary memory.
    - Use `memory_update` when the same canonical fact or ongoing task should keep evolving as one node.
    - When updating an existing memory, preserve that node's current language unless the user explicitly asks for a rewrite.
    - Use `memory_store` when this is a genuinely new memory.

@@ -3,7 +3,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { LABEL_MEMORY_STALE, MEMORY_TITLE_PREFIX, extractLabelNames, labelVal } from "./config.js";
 import type { GitHubIssueClient } from "./github-client.js";
 import { normalizeMessages } from "./transcript.js";
-import type { ClawMemPluginConfig, MemoryDraft, MemoryListOptions, MemorySchema, NormalizedMessage, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import type { ClawMemPluginConfig, MemoryDraft, MemoryListOptions, MemorySchema, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { fmtTranscript, localDate, sha256, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 
@@ -206,7 +206,8 @@ export class MemoryStore {
     const status = issue.state === "closed" || labels.includes(LABEL_MEMORY_STALE) ? "stale" : "active";
     if (!detail) return null;
     return {
-      issueNumber: issue.number, title: issue.title?.trim() || "",
+      issueNumber: issue.number,
+      title: issue.title?.trim() || "",
       memoryId: body.memory_id?.trim() || String(issue.number),
       memoryHash: body.memory_hash?.trim() || undefined,
       date: body.date?.trim() || "1970-01-01",
@@ -280,6 +281,7 @@ export class MemoryStore {
     const message = [
       "Extract durable memories from the conversation below.",
       'Return JSON only in the form {"save":[{"detail":"...","kind":"...","topics":["..."]}],"stale":["memory-id"]}.',
+      "Each save item must contain one durable fact. If a turn contains several independent facts, save them separately instead of bundling them into one summary memory.",
       "Use save for stable, reusable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
       "Use stale for existing memory IDs only when the conversation clearly supersedes or invalidates them.",
       "Infer kind and topics when they would help future retrieval. Reuse existing kinds and topics when possible.",
@@ -293,9 +295,12 @@ export class MemoryStore {
     ].join("\n");
     try {
       const run = await subagent.run({
-        sessionKey, message, deliver: false, lane: "clawmem-memory",
+        sessionKey,
+        message,
+        deliver: false,
+        lane: "clawmem-memory",
         idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:memory-decision`),
-        extraSystemPrompt: "You extract durable memory updates from OpenClaw conversations. Output JSON only with save objects containing detail, optional kind, and optional topics, plus stale string ids.",
+        extraSystemPrompt: "You extract durable memory updates from OpenClaw conversations. Output JSON only with save objects containing detail, optional kind, and optional topics, plus stale string ids. Keep each save item to one durable fact.",
       });
       const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.summaryWaitTimeoutMs });
       if (wait.status === "timeout") throw new Error("memory decision subagent timed out");
@@ -304,7 +309,9 @@ export class MemoryStore {
       const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
       if (!text) throw new Error("memory decision subagent returned no assistant text");
       return parseDecision(text);
-    } finally { subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {}); }
+    } finally {
+      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
+    }
   }
 
   private async mergeSchema(memory: ParsedMemoryIssue, draft: MemoryDraft): Promise<ParsedMemoryIssue> {
@@ -333,11 +340,13 @@ function memLabels(kind?: string, topics?: string[]): string[] {
     ...((topics ?? []).map((topic) => `topic:${topic}`)),
   ];
 }
+
 function norm(v: string): string { return v.replace(/\s+/g, " ").trim(); }
 function trunc(v: string, max: number): string { const s = norm(v); return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`; }
 function normalizeSearch(v: string): string {
   return v.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
 }
+
 function buildSearchIndex(memory: ParsedMemoryIssue): SearchIndex {
   return {
     title: normalizeSearch(memory.title),
@@ -346,6 +355,7 @@ function buildSearchIndex(memory: ParsedMemoryIssue): SearchIndex {
     topics: (memory.topics ?? []).map(normalizeSearch).filter(Boolean),
   };
 }
+
 function searchTokens(v: string): string[] {
   const seen = new Set<string>();
   for (const token of v.split(/[^0-9\p{L}]+/u)) {
@@ -359,6 +369,7 @@ function searchTokens(v: string): string[] {
   }
   return [...seen];
 }
+
 function charBigrams(v: string): Set<string> {
   const compact = v.replace(/\s+/g, "");
   if (compact.length < 2) return new Set(compact ? [compact] : []);
@@ -366,16 +377,19 @@ function charBigrams(v: string): Set<string> {
   for (let i = 0; i < compact.length - 1; i++) out.add(compact.slice(i, i + 2));
   return out;
 }
+
 function overlapRatio(left: Set<string>, right: Set<string>): number {
   if (left.size === 0 || right.size === 0) return 0;
   let hits = 0;
   for (const token of left) if (right.has(token)) hits++;
   return hits / Math.max(left.size, right.size);
 }
+
 function buildMemorySearchQuery(query: string, repo: string): string {
   const parts = [query.trim(), `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].filter(Boolean);
   return parts.join(" ");
 }
+
 export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): number {
   const query = normalizeSearch(rawQuery);
   if (!query) return 0;
@@ -411,6 +425,7 @@ export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): n
 
   return score;
 }
+
 function normalizeDraft(input: MemoryDraft): MemoryDraft {
   const detail = norm(input.detail);
   if (!detail) throw new Error("memory detail is empty");
@@ -422,6 +437,7 @@ function normalizeDraft(input: MemoryDraft): MemoryDraft {
     ...(topics.length > 0 ? { topics } : {}),
   };
 }
+
 function normalizeLabelValue(value: string | undefined, prefix: string): string | undefined {
   if (!value) return undefined;
   const raw = value.trim().replace(new RegExp(`^${prefix}`, "i"), "");
@@ -433,6 +449,7 @@ function normalizeLabelValue(value: string | undefined, prefix: string): string 
     .replace(/^-+|-+$/g, "");
   return normalized || undefined;
 }
+
 function normalizeOptionalLabelValue(value: string | undefined, prefix: string): string | undefined {
   try {
     return normalizeLabelValue(value, prefix);
@@ -440,16 +457,22 @@ function normalizeOptionalLabelValue(value: string | undefined, prefix: string):
     return undefined;
   }
 }
+
 function uniqueNormalized(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort();
 }
+
 function parseDecision(raw: string): MemoryDecision {
   const tryParse = (s: string): MemoryDecision | null => {
     try {
       const p = JSON.parse(s) as Record<string, unknown>;
-      return { save: Array.isArray(p.save) ? p.save.map(parseSaveItem).filter((v): v is MemoryDraft => Boolean(v)) : [],
-               stale: Array.isArray(p.stale) ? p.stale.filter((v): v is string => typeof v === "string") : [] };
-    } catch { return null; }
+      return {
+        save: Array.isArray(p.save) ? p.save.map(parseSaveItem).filter((v): v is MemoryDraft => Boolean(v)) : [],
+        stale: Array.isArray(p.stale) ? p.stale.filter((v): v is string => typeof v === "string") : [],
+      };
+    } catch {
+      return null;
+    }
   };
   const t = raw.trim();
   return tryParse(t) ?? (() => {
@@ -459,6 +482,7 @@ function parseDecision(raw: string): MemoryDecision {
     throw new Error("memory decision subagent returned invalid JSON");
   })();
 }
+
 function parseSaveItem(value: unknown): MemoryDraft | null {
   if (typeof value === "string") {
     const detail = norm(value);

@@ -1,14 +1,8 @@
 // Thin orchestrator: wires conversation mirroring, memory store, and plugin lifecycle.
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { hasDefaultRepo, isAgentConfigured, resolveAgentRoute, resolvePluginConfig } from "./config.js";
+import { filterDirectCollaborators, listRepoAccessTeams, resolveOrgInvitationRole } from "./collaboration.js";
 import { ConversationMirror } from "./conversation.js";
-import {
-  filterDirectCollaborators,
-  listRepoAccessTeams,
-  normalizePermissionAlias,
-  repoSummaryFullName,
-  resolveOrgInvitationRole,
-} from "./collaboration.js";
 import { GitHubIssueClient } from "./github-client.js";
 import { KeyedAsyncQueue } from "./keyed-async-queue.js";
 import { MemoryStore } from "./memory.js";
@@ -16,11 +10,13 @@ import { loadState, resolveStatePath, saveState } from "./state.js";
 import { readTranscriptSnapshot } from "./transcript.js";
 import type { BootstrapIdentityResponse, ClawMemPluginConfig, ClawMemResolvedRoute, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { buildAgentBootstrapRegistration, inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
-import type { CollaborationPermission } from "./collaboration.js";
 
 type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; messages: unknown[] };
 type FinalizePayload = { sessionId?: string; sessionKey?: string; sessionFile?: string; agentId?: string; reason?: string; messages?: unknown[] };
+type CollaborationPermission = "read" | "write" | "admin";
 type CollaborationTeamRole = "member" | "maintainer";
+
+const SESSION_MAINTENANCE_RETRY_DELAYS_MS = [5000, 30000, 120000] as const;
 
 class ClawMemService {
   private readonly config: ClawMemPluginConfig;
@@ -28,6 +24,7 @@ class ClawMemService {
   private readonly stateQueue = new KeyedAsyncQueue();
   private readonly pending = new Set<Promise<unknown>>();
   private readonly syncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly maintenanceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private statePath = "";
   private state: PluginState = { version: 2, sessions: {} };
   private unsubTranscript?: () => void;
@@ -68,6 +65,8 @@ class ClawMemService {
         this.unsubTranscript?.();
         for (const t of this.syncTimers.values()) clearTimeout(t);
         this.syncTimers.clear();
+        for (const t of this.maintenanceTimers.values()) clearTimeout(t);
+        this.maintenanceTimers.clear();
         await Promise.allSettled([...this.pending]);
       },
     });
@@ -230,7 +229,7 @@ class ClawMemService {
 
     this.api.registerTool({
       name: "memory_recall",
-      description: "Search ClawMem active memories for relevant prior facts, decisions, conventions, and lessons.",
+      description: "Search ClawMem active memories for relevant prior facts, decisions, conventions, and lessons. Use this before answering questions about prior conversations, earlier assistant responses, user preferences, or historical project context.",
       required: true,
       parameters: {
         type: "object",
@@ -293,7 +292,7 @@ class ClawMemService {
 
     this.api.registerTool({
       name: "memory_store",
-      description: "Store a durable ClawMem memory immediately instead of waiting for session finalization.",
+      description: "Store one atomic durable ClawMem memory immediately instead of waiting for session finalization. Keep each write to a single fact, preference, decision, or timeline update.",
       required: true,
       parameters: {
         type: "object",
@@ -322,7 +321,11 @@ class ClawMemService {
         if ("error" in resolved) return toolText(resolved.error);
         const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
         const topics = Array.isArray(p.topics) ? p.topics.filter((topic): topic is string => typeof topic === "string" && topic.trim().length > 0) : undefined;
-        const result = await resolved.mem.store({ detail, ...(kind ? { kind } : {}), ...(topics && topics.length > 0 ? { topics } : {}) });
+        const result = await resolved.mem.store({
+          detail,
+          ...(kind ? { kind } : {}),
+          ...(topics && topics.length > 0 ? { topics } : {}),
+        });
         if (!result.created) return toolText(`Memory already exists in ${resolved.route.repo}.\n${renderMemoryBlock(result.memory)}`);
         return toolText(`Stored memory in ${resolved.route.repo}.\n${renderMemoryBlock(result.memory)}`);
       },
@@ -734,7 +737,7 @@ class ClawMemService {
 
     this.api.registerTool({
       name: "collaboration_repo_collaborators",
-      description: "List explicit non-owner collaborators on a repo before changing repository-level access.",
+      description: "List direct collaborators on a repo before changing repository-level access.",
       required: true,
       parameters: {
         type: "object",
@@ -750,10 +753,10 @@ class ClawMemService {
         const target = await this.requireCollaborationRepo(agentId, p.repo);
         if ("error" in target) return toolText(target.error);
         try {
-          const collaborators = filterDirectCollaborators(await target.client.listRepoCollaborators(target.owner, target.repo), target.owner);
-          if (collaborators.length === 0) return toolText(`No explicit non-owner collaborators found on ${target.fullName}.`);
+          const collaborators = await target.client.listRepoCollaborators(target.owner, target.repo);
+          if (collaborators.length === 0) return toolText(`No direct collaborators found on ${target.fullName}.`);
           return toolText([
-            `Explicit collaborators on ${target.fullName}:`,
+            `Direct collaborators on ${target.fullName}:`,
             ...collaborators.map((collaborator) => `- ${renderCollaboratorLine(collaborator)}`),
           ].join("\n"));
         } catch (error) {
@@ -833,7 +836,7 @@ class ClawMemService {
 
     this.api.registerTool({
       name: "collaboration_repo_collaborator_remove",
-      description: "Remove a repo collaborator or revoke a pending direct-share invitation. Requires confirmed=true after explicit user approval.",
+      description: "Remove a direct collaborator from a repo. Requires confirmed=true after explicit user approval.",
       required: true,
       parameters: {
         type: "object",
@@ -857,7 +860,7 @@ class ClawMemService {
         if ("error" in target) return toolText(target.error);
         try {
           await target.client.removeRepoCollaborator(target.owner, target.repo, username);
-          return toolText(`Removed direct access or pending invitation for ${username} from ${target.fullName}.`);
+          return toolText(`Removed ${username} from ${target.fullName}.`);
         } catch (error) {
           return toolText(`Unable to remove ${username} from ${target.fullName}: ${String(error)}`);
         }
@@ -1216,7 +1219,6 @@ class ClawMemService {
           const lines = [`Repo access inspection for ${target.fullName}:`];
           const notes: string[] = [];
           let orgName: string | undefined;
-          let hasOrgContext = false;
 
           try {
             const repo = await target.client.getRepo(target.owner, target.repo);
@@ -1230,7 +1232,6 @@ class ClawMemService {
 
           try {
             const org = await target.client.getOrg(orgName);
-            hasOrgContext = true;
             lines.push(`- Org default repository permission: ${org.default_repository_permission?.trim() || "unknown"}`);
           } catch (error) {
             notes.push(`Org metadata unavailable for "${orgName}": ${String(error)}`);
@@ -1256,7 +1257,7 @@ class ClawMemService {
             notes.push(`Repo invitation lookup failed: ${String(error)}`);
           }
 
-          if (hasOrgContext && orgName) {
+          if (orgName) {
             try {
               const teamAccess = await listRepoAccessTeams(target.client, orgName, target.fullName);
               lines.push("");
@@ -1269,16 +1270,14 @@ class ClawMemService {
             }
           }
 
-          if (hasOrgContext && orgName) {
-            try {
-              const outside = await target.client.listOrgOutsideCollaborators(orgName);
-              lines.push("");
-              lines.push(`Outside collaborators in owner org "${orgName}":`);
-              if (outside.length === 0) lines.push("- None visible");
-              else lines.push(...outside.map((user) => `- ${renderCollaboratorLine(user)}`));
-            } catch (error) {
-              notes.push(`Outside collaborator lookup failed: ${String(error)}`);
-            }
+          try {
+            const outside = await target.client.listOrgOutsideCollaborators(orgName);
+            lines.push("");
+            lines.push(`Outside collaborators in owner org "${orgName}":`);
+            if (outside.length === 0) lines.push("- None visible");
+            else lines.push(...outside.map((user) => `- ${renderCollaboratorLine(user)}`));
+          } catch (error) {
+            notes.push(`Outside collaborator lookup failed: ${String(error)}`);
           }
 
           if (notes.length > 0) {
@@ -1297,13 +1296,13 @@ class ClawMemService {
   private async handleBeforeAgentStart(prompt: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
     const routeAgentId = normalizeAgentId(agentId);
     if (!(await this.ensureDefaultRepoConfigured(routeAgentId))) return;
-    await this.runRequestMaintenance(routeAgentId);
+    this.scheduleRecentSessionMaintenance(routeAgentId);
     if (typeof prompt !== "string" || prompt.trim().length < 5) return;
     try {
       const { mem } = this.getServices(routeAgentId);
-      const memories = await mem.search(prompt, this.config.memoryRecallLimit);
+      const memories = await mem.search(prompt, this.config.memoryAutoRecallLimit);
       if (memories.length === 0) return;
-      const text = memories.map((m) => `- ${m.detail}`).join("\n");
+      const text = memories.map((m) => `- ${formatInjectedMemory(m)}`).join("\n");
       return { prependContext: `<relevant-memories>\nThe following active memories may be relevant to this conversation:\n${text}\n</relevant-memories>` };
     } catch (error) { this.api.logger.warn(`clawmem: memory recall failed: ${String(error)}`); }
   }
@@ -1371,6 +1370,7 @@ class ClawMemService {
   private async finalize(p: FinalizePayload): Promise<void> {
     if (!p.sessionId) return;
     const agentId = normalizeAgentId(p.agentId);
+    const scopeKey = sessionScopeKey(p.sessionId, agentId);
     if (!(await this.ensureDefaultRepoConfigured(agentId))) return;
     const { conv } = this.getServices(agentId);
     const s = this.getOrCreate(p.sessionId, agentId);
@@ -1389,6 +1389,7 @@ class ClawMemService {
     s.summaryStatus = "pending";
     if (allOk) s.finalizedAt = new Date().toISOString();
     await this.persistState();
+    this.scheduleSessionMaintenance(scopeKey, agentId, { reason: p.reason ?? "finalize" });
   }
 
   // --- Infrastructure ---
@@ -1545,55 +1546,109 @@ class ClawMemService {
       },
     });
   }
-  private async runRequestMaintenance(agentId: string): Promise<void> {
+  private scheduleRecentSessionMaintenance(agentId: string): void {
     const sessions = Object.values(this.state.sessions)
       .filter((session) => normalizeAgentId(session.agentId) === agentId)
       .sort((a, b) => Date.parse(b.updatedAt ?? b.createdAt ?? "") - Date.parse(a.updatedAt ?? a.createdAt ?? ""))
       .slice(0, 8);
-    if (sessions.length === 0) return;
-    const { conv, mem } = this.getServices(agentId);
-    let changed = false;
-    let workDone = 0;
     for (const session of sessions) {
-      if (workDone >= 3) break;
-      const snap = await conv.loadSnapshot(session, []);
-      if (!conv.shouldMirror(session.sessionId, snap.messages) || snap.messages.length === 0) continue;
-      if (!session.issueNumber) {
-        await conv.ensureIssue(session, snap);
-        changed = true;
-      }
-      if (session.summaryStatus === "pending") {
-        try {
-          const result = await conv.generateSummaryAndTitle(session, snap);
-          await conv.syncLabels(session, snap, true);
-          await conv.syncBody(session, snap, result.summary, true, result.title);
-          session.summaryStatus = "complete";
-          if (result.title?.trim()) {
-            session.issueTitle = result.title.trim();
-            session.titleSource = "llm";
-          }
-          this.maybeAutoNameRepo(agentId, result.summary, result.title);
-          changed = true;
-          workDone++;
-        } catch (error) {
-          this.warn(`request-scoped summary sync for ${session.sessionId}`, error);
+      if (!this.sessionNeedsMaintenance(session)) continue;
+      this.scheduleSessionMaintenance(sessionScopeKey(session.sessionId, session.agentId), agentId, {
+        reason: "request-start-fallback",
+        delayMs: 0,
+      });
+      break;
+    }
+  }
+
+  private scheduleSessionMaintenance(
+    scopeKey: string,
+    agentId: string,
+    options: { delayMs?: number; attempt?: number; reason?: string } = {},
+  ): void {
+    const prev = this.maintenanceTimers.get(scopeKey);
+    if (prev) clearTimeout(prev);
+    const delayMs = Math.max(0, options.delayMs ?? 0);
+    const attempt = Math.max(0, options.attempt ?? 0);
+    const reason = options.reason ?? "scheduled";
+    const timer = setTimeout(() => {
+      this.maintenanceTimers.delete(scopeKey);
+      void this.track(this.enqueueSession(scopeKey, () => this.runSessionMaintenance(scopeKey, agentId, attempt, reason)))
+        .catch((error) => this.warn(`background maintenance for ${scopeKey}`, error));
+    }, delayMs);
+    timer.unref?.();
+    this.maintenanceTimers.set(scopeKey, timer);
+  }
+
+  private async runSessionMaintenance(scopeKey: string, agentId: string, attempt: number, reason: string): Promise<void> {
+    const session = this.state.sessions[scopeKey];
+    if (!session || !this.sessionNeedsMaintenance(session)) return;
+    if (!(await this.ensureDefaultRepoConfigured(agentId))) return;
+    const { conv, mem } = this.getServices(agentId);
+    const snap = await conv.loadSnapshot(session, []);
+    if (!conv.shouldMirror(session.sessionId, snap.messages) || snap.messages.length === 0) return;
+    let changed = false;
+    let retryNeeded = false;
+    if (!session.issueNumber) {
+      await conv.ensureIssue(session, snap);
+      changed = true;
+    }
+    if (session.summaryStatus === "pending") {
+      try {
+        const result = await conv.generateSummaryAndTitle(session, snap);
+        await conv.syncLabels(session, snap, true);
+        await conv.syncBody(session, snap, result.summary, true, result.title);
+        session.summaryStatus = "complete";
+        if (result.title?.trim()) {
+          session.issueTitle = result.title.trim();
+          session.titleSource = "llm";
         }
+        this.maybeAutoNameRepo(agentId, result.summary, result.title);
+        changed = true;
+      } catch (error) {
+        retryNeeded = true;
+        this.warn(`background summary sync for ${session.sessionId}`, error);
       }
-      if (session.titleSource !== "llm" && snap.messages.length >= 2) {
+    }
+    if (session.titleSource !== "llm" && snap.messages.length >= 2) {
+      try {
         await conv.syncTitle(session, snap);
         changed = true;
-        workDone++;
+      } catch (error) {
+        retryNeeded = true;
+        this.warn(`background title sync for ${session.sessionId}`, error);
       }
-      if (snap.messages.length >= 2 && snap.messages.length > (session.lastMemorySyncCount ?? 0)) {
-        const ok = await mem.syncFromConversation(session, snap);
-        if (ok) {
-          session.lastMemorySyncCount = snap.messages.length;
-          changed = true;
-        }
-        workDone++;
+    }
+    if (snap.messages.length >= 2 && snap.messages.length > (session.lastMemorySyncCount ?? 0)) {
+      const ok = await mem.syncFromConversation(session, snap);
+      if (ok) {
+        session.lastMemorySyncCount = snap.messages.length;
+        changed = true;
+      } else {
+        retryNeeded = true;
       }
     }
     if (changed) await this.persistState();
+    if (!retryNeeded || !this.sessionNeedsMaintenance(session)) return;
+    if (attempt < SESSION_MAINTENANCE_RETRY_DELAYS_MS.length) {
+      const delayMs = SESSION_MAINTENANCE_RETRY_DELAYS_MS[attempt];
+      this.api.logger.warn?.(
+        `clawmem: background maintenance incomplete for ${session.sessionId}; retrying in ${Math.round(delayMs / 1000)}s (${reason})`,
+      );
+      this.scheduleSessionMaintenance(scopeKey, agentId, { delayMs, attempt: attempt + 1, reason: "retry" });
+      return;
+    }
+    this.api.logger.warn?.(
+      `clawmem: background maintenance remains pending for ${session.sessionId}; it will be retried opportunistically on future requests`,
+    );
+  }
+
+  private sessionNeedsMaintenance(session: SessionMirrorState): boolean {
+    if (session.summaryStatus === "pending") return true;
+    const hasMeaningfulTranscript = Math.max(session.lastMirroredCount, session.turnCount) >= 2;
+    if (!hasMeaningfulTranscript) return false;
+    if (session.titleSource !== "llm") return true;
+    return (session.lastMemorySyncCount ?? 0) < session.lastMirroredCount;
   }
 
   private getServices(agentId?: string, repo?: string): { route: ClawMemResolvedRoute; conv: ConversationMirror; mem: MemoryStore; client: GitHubIssueClient } {
@@ -1720,11 +1775,30 @@ function shouldFallbackToAnonymousBootstrap(error: unknown): boolean {
 function toolText(text: string): { content: Array<{ type: "text"; text: string }> } {
   return { content: [{ type: "text", text }] };
 }
-function renderMemoryLine(memory: { memoryId: string; title?: string; detail: string; kind?: string; topics?: string[]; status: "active" | "stale" }): string {
-  const schema = [memory.kind ? `kind:${memory.kind}` : "", ...(memory.topics ?? []).map((topic) => `topic:${topic}`)].filter(Boolean).join(", ");
+function renderMemoryLine(memory: {
+  memoryId: string;
+  title?: string;
+  detail: string;
+  kind?: string;
+  topics?: string[];
+  status: "active" | "stale";
+}): string {
+  const schema = [
+    memory.kind ? `kind:${memory.kind}` : "",
+    ...(memory.topics ?? []).map((topic) => `topic:${topic}`),
+  ].filter(Boolean).join(", ");
   return `[${memory.memoryId}] ${memory.title || "Memory"}${schema ? ` (${schema})` : ""}${memory.status === "stale" ? " [stale]" : ""}: ${memory.detail}`;
 }
-function renderMemoryBlock(memory: { memoryId: string; issueNumber?: number; title?: string; detail: string; kind?: string; topics?: string[]; status: "active" | "stale"; date?: string }): string {
+function renderMemoryBlock(memory: {
+  memoryId: string;
+  issueNumber?: number;
+  title?: string;
+  detail: string;
+  kind?: string;
+  topics?: string[];
+  status: "active" | "stale";
+  date?: string;
+}): string {
   const lines = [
     `Memory ID: ${memory.memoryId}`,
     ...(typeof memory.issueNumber === "number" ? [`Issue Number: ${memory.issueNumber}`] : []),
@@ -1736,6 +1810,12 @@ function renderMemoryBlock(memory: { memoryId: string; issueNumber?: number; tit
     `Detail: ${memory.detail}`,
   ];
   return lines.join("\n");
+}
+
+function formatInjectedMemory(memory: {
+  detail: string;
+}): string {
+  return memory.detail;
 }
 
 function renderOrgLine(org: { login?: string; name?: string; default_repository_permission?: string; description?: string }): string {
@@ -1756,6 +1836,15 @@ function renderTeamLine(team: { slug?: string; name?: string; description?: stri
   return `${slug}${name}${privacy}${permissionText}${description}`;
 }
 
+function repoSummaryFullName(repo?: { full_name?: string; owner?: { login?: string }; name?: string }): string | undefined {
+  const fullName = repo?.full_name?.trim();
+  if (fullName) return fullName;
+  const owner = repo?.owner?.login?.trim();
+  const name = repo?.name?.trim();
+  if (owner && name) return `${owner}/${name}`;
+  return name || undefined;
+}
+
 function renderRepoGrantLine(repo: { full_name?: string; name?: string; permissions?: Record<string, boolean | undefined>; role_name?: string; description?: string }): string {
   const fullName = repoSummaryFullName(repo) || "unknown-repo";
   const permission = canonicalPermission(repo.permissions, repo.role_name);
@@ -1764,21 +1853,12 @@ function renderRepoGrantLine(repo: { full_name?: string; name?: string; permissi
   return `${fullName}${permissionText}${description}`;
 }
 
-function renderCollaboratorLine(user: {
-  login?: string;
-  name?: string;
-  permissions?: Record<string, boolean | undefined>;
-  role_name?: string;
-  organization_member?: boolean;
-  outside_collaborator?: boolean;
-}): string {
+function renderCollaboratorLine(user: { login?: string; name?: string; permissions?: Record<string, boolean | undefined>; role_name?: string }): string {
   const login = user.login?.trim() || user.name?.trim() || "unknown-user";
   const name = user.name?.trim() && user.name?.trim() !== login ? ` (${user.name.trim()})` : "";
   const permission = canonicalPermission(user.permissions, user.role_name);
   const permissionText = permission !== "unknown" ? ` [${permission}]` : "";
-  const orgMemberText = user.organization_member === true ? " [org-member]" : "";
-  const outsideText = user.outside_collaborator === true ? " [outside]" : "";
-  return `${login}${name}${permissionText}${orgMemberText}${outsideText}`;
+  return `${login}${name}${permissionText}`;
 }
 
 function renderRepoInvitationLine(invitation: { id?: number; created_at?: string; permissions?: string; repository?: { full_name?: string; owner?: { login?: string }; name?: string }; invitee?: { login?: string }; inviter?: { login?: string } }): string {
@@ -1829,6 +1909,17 @@ function canonicalPermission(permissions?: Record<string, boolean | undefined>, 
   if (permissions.maintain === true || permissions.push === true || permissions.write === true) return "write";
   if (permissions.triage === true || permissions.pull === true || permissions.read === true) return "read";
   return "unknown";
+}
+
+function normalizePermissionAlias(value: unknown): "none" | CollaborationPermission | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized === "none") return "none";
+  if (normalized === "read" || normalized === "pull" || normalized === "triage") return "read";
+  if (normalized === "write" || normalized === "push" || normalized === "maintain") return "write";
+  if (normalized === "admin") return "admin";
+  return undefined;
 }
 
 export function createClawMemPlugin(api: OpenClawPluginApi): void { new ClawMemService(api).register(); }

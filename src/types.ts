@@ -15,6 +15,7 @@ export type ClawMemPluginConfig = {
   authScheme: "token" | "bearer";
   agents: Record<string, ClawMemAgentConfig>;
   memoryRecallLimit: number;
+  memoryAutoRecallLimit: number;
   turnCommentDelayMs: number;
   summaryWaitTimeoutMs: number;
 };
