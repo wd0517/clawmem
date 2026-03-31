@@ -12,13 +12,14 @@ export const LABEL_CLOSED = "status:closed";
 export const LABEL_MEMORY_ACTIVE = "memory-status:active";
 export const LABEL_MEMORY_STALE = "memory-status:stale";
 
-const MANAGED_PREFIXES = ["type:", "kind:", "session:", "date:", "topic:", "agent:", "source:"];
+const MANAGED_PREFIXES = ["type:", "kind:", "session:", "date:", "topic:", "agent:"];
 const MANAGED_EXACT = new Set([LABEL_ACTIVE, LABEL_CLOSED, LABEL_MEMORY_ACTIVE, LABEL_MEMORY_STALE]);
 
 export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig {
   const raw = (api.pluginConfig ?? {}) as Record<string, unknown>;
   const str = (v: unknown) => typeof v === "string" && v.trim() ? v.trim() : undefined;
   const num = (v: unknown, d: number) => typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : d;
+  const float = (v: unknown, d: number) => typeof v === "number" && Number.isFinite(v) ? v : d;
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
   const baseUrl = (str(raw.baseUrl) ?? "https://git.clawmem.ai").replace(/\/+$/, "");
   const rawAgents = raw.agents && typeof raw.agents === "object" && !Array.isArray(raw.agents)
@@ -45,6 +46,7 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
     authScheme: raw.authScheme === "bearer" ? "bearer" : "token",
     agents,
     memoryRecallLimit: clamp(num(raw.memoryRecallLimit, 5), 1, 20),
+    memoryAutoRecallLimit: clamp(num(raw.memoryAutoRecallLimit, num(raw.memoryRecallLimit, 5)), 1, 20),
     turnCommentDelayMs: num(raw.turnCommentDelayMs, 1000),
     summaryWaitTimeoutMs: clamp(num(raw.summaryWaitTimeoutMs, 120000), 1000, 600000),
   };
@@ -83,14 +85,13 @@ export function resolveLabelColor(label: string): string {
   if (label.startsWith("topic:")) return "fbca04";
   if (label.startsWith("session:")) return "bfdadc";
   if (label.startsWith("agent:")) return "1d76db";
-  if (label.startsWith("source:")) return "0e8a16";
   return "0e8a16";
 }
 
 export function labelDescription(label: string): string {
   for (const [pfx, d] of [["type:", "Issue type"], ["kind:", "Memory kind"], ["memory-status:", "Memory lifecycle status"],
     ["status:", "Conversation lifecycle status"], ["session:", "Session association"],
-    ["date:", "Date"], ["topic:", "Topic"], ["agent:", "Agent"], ["source:", "Source"]] as const)
+    ["date:", "Date"], ["topic:", "Topic"], ["agent:", "Agent"]] as const)
     if (label.startsWith(pfx)) return `${d} label managed by clawmem.`;
   return "Label managed by clawmem.";
 }

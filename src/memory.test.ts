@@ -41,6 +41,15 @@ function assert(condition: unknown, message: string): void {
   if (!condition) throw new Error(message);
 }
 
+function testConfig(): never {
+  return {
+    memoryRecallLimit: 5,
+    memoryAutoRecallLimit: 5,
+    turnCommentDelayMs: 1000,
+    summaryWaitTimeoutMs: 120000,
+  } as never;
+}
+
 async function testSearchRanking(): Promise<void> {
   const issues = [
     issueFromMemory(memory({
@@ -60,7 +69,7 @@ async function testSearchRanking(): Promise<void> {
   const client = {
     listIssues: async () => issues,
   };
-  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const store = new MemoryStore(client as never, {} as never, testConfig());
   const found = await store.search("redis rate limiting", 5);
   assert(found.length === 2, "expected both memories to match");
   assert(found[0]?.issueNumber === 1, "expected the more specific Redis rate limiting memory to rank first");
@@ -93,7 +102,7 @@ async function testBackendSearchPreferredForRecall(): Promise<void> {
       return searched;
     },
   };
-  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const store = new MemoryStore(client as never, {} as never, testConfig());
   const found = await store.search("redis rate limiting", 5);
 
   assert(queries.length === 1, "expected backend search to be called once");
@@ -117,7 +126,7 @@ async function testBackendSearchFallsBackToLocalLexical(): Promise<void> {
     listIssues: async () => issues,
     searchIssues: async () => { throw new Error("search unavailable"); },
   };
-  const store = new MemoryStore(client as never, { logger: { warn: () => {} } } as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const store = new MemoryStore(client as never, { logger: { warn: () => {} } } as never, testConfig());
   const found = await store.search("redis rate limiting", 5);
 
   assert(found.length === 1 && found[0]?.issueNumber === 3, "expected lexical fallback when backend search fails");
@@ -155,7 +164,7 @@ async function testStructuredStoreAndSchema(): Promise<void> {
       return { number: 99, title: payload.title };
     },
   };
-  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const store = new MemoryStore(client as never, {} as never, testConfig());
   const result = await store.store({ detail: "Redis Lua scripts are required for atomic rate limiting.", kind: "Lesson", topics: ["Redis Ops", "rate_limit"] });
   const schema = await store.listSchema();
 
@@ -211,7 +220,7 @@ async function testGetAndListMemories(): Promise<void> {
       });
     },
   };
-  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const store = new MemoryStore(client as never, {} as never, testConfig());
   const exact = await store.get("4");
   const activeFacts = await store.listMemories({ status: "active", kind: "core-fact", limit: 10 });
   const sports = await store.listMemories({ status: "all", topic: "sports", limit: 10 });
@@ -243,7 +252,7 @@ async function testLegacyMemoriesWithoutSessionOrDate(): Promise<void> {
       });
     },
   };
-  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const store = new MemoryStore(client as never, {} as never, testConfig());
   const exact = await store.get("4");
   const recalled = await store.search("F1 Dota 2", 5);
 
@@ -292,7 +301,7 @@ async function testUpdateMemoryInPlace(): Promise<void> {
       issue.labels = labels;
     },
   };
-  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const store = new MemoryStore(client as never, {} as never, testConfig());
   const updated = await store.update("4", {
     detail: "xiangz likes F1, watches Dota 2 as a viewer, and recently follows tennis.",
     topics: ["preferences", "sports"],
@@ -344,7 +353,7 @@ async function testForgetClosesMemoryIssue(): Promise<void> {
       return issue;
     },
   };
-  const store = new MemoryStore(client as never, {} as never, { memoryRecallLimit: 5, turnCommentDelayMs: 1000, summaryWaitTimeoutMs: 120000 } as never);
+  const store = new MemoryStore(client as never, {} as never, testConfig());
   const forgotten = await store.forget("12");
 
   assert(forgotten?.status === "stale", "expected forgotten memory to be returned as stale");

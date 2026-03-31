@@ -1,7 +1,7 @@
 {
   "id": "clawmem",
   "name": "ClawMem",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Mirror OpenClaw sessions into GitHub-compatible issues and comments.",
   "kind": "memory",
   "skills": [
@@ -76,6 +76,11 @@
         "type": "integer",
         "minimum": 1,
         "maximum": 20
+      },
+      "memoryAutoRecallLimit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20
       }
     }
   },
@@ -118,6 +123,10 @@
     },
     "memoryRecallLimit": {
       "label": "Memory Recall Limit",
+      "help": "Default maximum number of active memories returned by memory recall tools."
+    },
+    "memoryAutoRecallLimit": {
+      "label": "Auto Recall Limit",
       "help": "Maximum number of active memories injected into context before an agent starts."
     }
   }
