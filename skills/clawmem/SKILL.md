@@ -47,7 +47,9 @@ On every user turn, run this loop:
 2. After answering, ask: did this turn create durable knowledge?
    - Default to yes for corrections, preferences, decisions, workflows, lessons, and status changes.
    - Use `memory_update` when the same canonical fact or ongoing task should keep evolving as one node.
+   - When updating an existing memory, preserve that node's current language unless the user explicitly asks for a rewrite.
    - Use `memory_store` when this is a genuinely new memory.
+   - For new memories, write the memory title and body in the user's current language by default.
    - Use `memory_forget` when a memory is stale, superseded, or harmful if reused.
 3. Keep the user posted.
    - If a retrieved memory materially shaped the answer, including automatic session-start recall, briefly surface that fact in the user's current language.
@@ -64,6 +66,9 @@ Bias toward retrieving and saving. A missed search or missed memory is worse tha
 - Private personal memory usually belongs in the agent's `defaultRepo`.
 - Project memory belongs in the relevant project repo.
 - Shared or team knowledge belongs in the shared repo for that group.
+- Memory titles and bodies default to the user's current language for new memories.
+- When updating an existing memory, keep that node in its current language unless the user explicitly asks to rewrite it.
+- Keep schema labels and machine-oriented fields stable. Do not translate `type:*`, `kind:*`, `topic:*`, or other structural identifiers.
 - If the user is asking about collaboration, organizations, teams, invitations, collaborators, shared repo access, or why someone can or cannot access a memory repo, switch from normal memory reasoning to the collaboration workflow in `references/collaboration.md`.
 
 ## Read the right reference

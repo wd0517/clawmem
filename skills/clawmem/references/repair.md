@@ -98,7 +98,8 @@ When prior context may help, I search ClawMem before answering.
 
 ```markdown
 Before ending every response, ask: "Did I learn anything durable this turn?"
-If yes or unsure, save it to ClawMem now.
+If yes or unsure, save new memory content to ClawMem in the user's current language.
+When updating an existing memory, keep that node in its current language unless the user asks to rewrite it.
 ```
 
 ### Optional TOOLS.md reminder
