@@ -16,12 +16,15 @@ type CollaborationPermission = "read" | "write" | "admin";
 type CollaborationOrgRole = "member" | "admin";
 type CollaborationTeamRole = "member" | "maintainer";
 
+const SESSION_MAINTENANCE_RETRY_DELAYS_MS = [5000, 30000, 120000] as const;
+
 class ClawMemService {
   private readonly config: ClawMemPluginConfig;
   private readonly queue = new KeyedAsyncQueue();
   private readonly stateQueue = new KeyedAsyncQueue();
   private readonly pending = new Set<Promise<unknown>>();
   private readonly syncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly maintenanceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private statePath = "";
   private state: PluginState = { version: 2, sessions: {} };
   private unsubTranscript?: () => void;
@@ -62,6 +65,8 @@ class ClawMemService {
         this.unsubTranscript?.();
         for (const t of this.syncTimers.values()) clearTimeout(t);
         this.syncTimers.clear();
+        for (const t of this.maintenanceTimers.values()) clearTimeout(t);
+        this.maintenanceTimers.clear();
         await Promise.allSettled([...this.pending]);
       },
     });
@@ -1345,7 +1350,7 @@ class ClawMemService {
   private async handleBeforeAgentStart(prompt: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
     const routeAgentId = normalizeAgentId(agentId);
     if (!(await this.ensureDefaultRepoConfigured(routeAgentId))) return;
-    await this.runRequestMaintenance(routeAgentId);
+    this.scheduleRecentSessionMaintenance(routeAgentId);
     if (typeof prompt !== "string" || prompt.trim().length < 5) return;
     try {
       const { mem } = this.getServices(routeAgentId);
@@ -1419,6 +1424,7 @@ class ClawMemService {
   private async finalize(p: FinalizePayload): Promise<void> {
     if (!p.sessionId) return;
     const agentId = normalizeAgentId(p.agentId);
+    const scopeKey = sessionScopeKey(p.sessionId, agentId);
     if (!(await this.ensureDefaultRepoConfigured(agentId))) return;
     const { conv } = this.getServices(agentId);
     const s = this.getOrCreate(p.sessionId, agentId);
@@ -1437,6 +1443,7 @@ class ClawMemService {
     s.summaryStatus = "pending";
     if (allOk) s.finalizedAt = new Date().toISOString();
     await this.persistState();
+    this.scheduleSessionMaintenance(scopeKey, agentId, { reason: p.reason ?? "finalize" });
   }
 
   // --- Infrastructure ---
@@ -1593,55 +1600,109 @@ class ClawMemService {
       },
     });
   }
-  private async runRequestMaintenance(agentId: string): Promise<void> {
+  private scheduleRecentSessionMaintenance(agentId: string): void {
     const sessions = Object.values(this.state.sessions)
       .filter((session) => normalizeAgentId(session.agentId) === agentId)
       .sort((a, b) => Date.parse(b.updatedAt ?? b.createdAt ?? "") - Date.parse(a.updatedAt ?? a.createdAt ?? ""))
       .slice(0, 8);
-    if (sessions.length === 0) return;
-    const { conv, mem } = this.getServices(agentId);
-    let changed = false;
-    let workDone = 0;
     for (const session of sessions) {
-      if (workDone >= 3) break;
-      const snap = await conv.loadSnapshot(session, []);
-      if (!conv.shouldMirror(session.sessionId, snap.messages) || snap.messages.length === 0) continue;
-      if (!session.issueNumber) {
-        await conv.ensureIssue(session, snap);
-        changed = true;
-      }
-      if (session.summaryStatus === "pending") {
-        try {
-          const result = await conv.generateSummaryAndTitle(session, snap);
-          await conv.syncLabels(session, snap, true);
-          await conv.syncBody(session, snap, result.summary, true, result.title);
-          session.summaryStatus = "complete";
-          if (result.title?.trim()) {
-            session.issueTitle = result.title.trim();
-            session.titleSource = "llm";
-          }
-          this.maybeAutoNameRepo(agentId, result.summary, result.title);
-          changed = true;
-          workDone++;
-        } catch (error) {
-          this.warn(`request-scoped summary sync for ${session.sessionId}`, error);
+      if (!this.sessionNeedsMaintenance(session)) continue;
+      this.scheduleSessionMaintenance(sessionScopeKey(session.sessionId, session.agentId), agentId, {
+        reason: "request-start-fallback",
+        delayMs: 0,
+      });
+      break;
+    }
+  }
+
+  private scheduleSessionMaintenance(
+    scopeKey: string,
+    agentId: string,
+    options: { delayMs?: number; attempt?: number; reason?: string } = {},
+  ): void {
+    const prev = this.maintenanceTimers.get(scopeKey);
+    if (prev) clearTimeout(prev);
+    const delayMs = Math.max(0, options.delayMs ?? 0);
+    const attempt = Math.max(0, options.attempt ?? 0);
+    const reason = options.reason ?? "scheduled";
+    const timer = setTimeout(() => {
+      this.maintenanceTimers.delete(scopeKey);
+      void this.track(this.enqueueSession(scopeKey, () => this.runSessionMaintenance(scopeKey, agentId, attempt, reason)))
+        .catch((error) => this.warn(`background maintenance for ${scopeKey}`, error));
+    }, delayMs);
+    timer.unref?.();
+    this.maintenanceTimers.set(scopeKey, timer);
+  }
+
+  private async runSessionMaintenance(scopeKey: string, agentId: string, attempt: number, reason: string): Promise<void> {
+    const session = this.state.sessions[scopeKey];
+    if (!session || !this.sessionNeedsMaintenance(session)) return;
+    if (!(await this.ensureDefaultRepoConfigured(agentId))) return;
+    const { conv, mem } = this.getServices(agentId);
+    const snap = await conv.loadSnapshot(session, []);
+    if (!conv.shouldMirror(session.sessionId, snap.messages) || snap.messages.length === 0) return;
+    let changed = false;
+    let retryNeeded = false;
+    if (!session.issueNumber) {
+      await conv.ensureIssue(session, snap);
+      changed = true;
+    }
+    if (session.summaryStatus === "pending") {
+      try {
+        const result = await conv.generateSummaryAndTitle(session, snap);
+        await conv.syncLabels(session, snap, true);
+        await conv.syncBody(session, snap, result.summary, true, result.title);
+        session.summaryStatus = "complete";
+        if (result.title?.trim()) {
+          session.issueTitle = result.title.trim();
+          session.titleSource = "llm";
         }
+        this.maybeAutoNameRepo(agentId, result.summary, result.title);
+        changed = true;
+      } catch (error) {
+        retryNeeded = true;
+        this.warn(`background summary sync for ${session.sessionId}`, error);
       }
-      if (session.titleSource !== "llm" && snap.messages.length >= 2) {
+    }
+    if (session.titleSource !== "llm" && snap.messages.length >= 2) {
+      try {
         await conv.syncTitle(session, snap);
         changed = true;
-        workDone++;
+      } catch (error) {
+        retryNeeded = true;
+        this.warn(`background title sync for ${session.sessionId}`, error);
       }
-      if (snap.messages.length >= 2 && snap.messages.length > (session.lastMemorySyncCount ?? 0)) {
-        const ok = await mem.syncFromConversation(session, snap);
-        if (ok) {
-          session.lastMemorySyncCount = snap.messages.length;
-          changed = true;
-        }
-        workDone++;
+    }
+    if (snap.messages.length >= 2 && snap.messages.length > (session.lastMemorySyncCount ?? 0)) {
+      const ok = await mem.syncFromConversation(session, snap);
+      if (ok) {
+        session.lastMemorySyncCount = snap.messages.length;
+        changed = true;
+      } else {
+        retryNeeded = true;
       }
     }
     if (changed) await this.persistState();
+    if (!retryNeeded || !this.sessionNeedsMaintenance(session)) return;
+    if (attempt < SESSION_MAINTENANCE_RETRY_DELAYS_MS.length) {
+      const delayMs = SESSION_MAINTENANCE_RETRY_DELAYS_MS[attempt];
+      this.api.logger.warn?.(
+        `clawmem: background maintenance incomplete for ${session.sessionId}; retrying in ${Math.round(delayMs / 1000)}s (${reason})`,
+      );
+      this.scheduleSessionMaintenance(scopeKey, agentId, { delayMs, attempt: attempt + 1, reason: "retry" });
+      return;
+    }
+    this.api.logger.warn?.(
+      `clawmem: background maintenance remains pending for ${session.sessionId}; it will be retried opportunistically on future requests`,
+    );
+  }
+
+  private sessionNeedsMaintenance(session: SessionMirrorState): boolean {
+    if (session.summaryStatus === "pending") return true;
+    const hasMeaningfulTranscript = Math.max(session.lastMirroredCount, session.turnCount) >= 2;
+    if (!hasMeaningfulTranscript) return false;
+    if (session.titleSource !== "llm") return true;
+    return (session.lastMemorySyncCount ?? 0) < session.lastMirroredCount;
   }
 
   private getServices(agentId?: string, repo?: string): { route: ClawMemResolvedRoute; conv: ConversationMirror; mem: MemoryStore; client: GitHubIssueClient } {
