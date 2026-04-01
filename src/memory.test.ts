@@ -185,6 +185,28 @@ async function testStructuredStoreAndSchema(): Promise<void> {
   assert(schema.topics.includes("redis"), "expected schema to expose existing topic labels");
 }
 
+async function testStoreKeepsFullAutoTitleAndSupportsExplicitTitle(): Promise<void> {
+  const created: Array<{ title: string; body: string; labels: string[] }> = [];
+  const client = {
+    listIssues: async () => [] as IssueRecord[],
+    listLabels: async () => [] as LabelRecord[],
+    ensureLabels: async () => {},
+    createIssue: async (payload: { title: string; body: string; labels: string[] }) => {
+      created.push(payload);
+      return { number: created.length + 100, title: payload.title };
+    },
+  };
+  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const longDetail = "Tech Decision #001: Frontend = React Native, Backend = FastAPI, Database = PostgreSQL, and analytics events must stay append-only for auditability.";
+  const auto = await store.store({ detail: longDetail });
+  const explicit = await store.store({ title: "Architecture Decision #001", detail: "Use React Native + FastAPI for the first mobile stack." });
+
+  assert(auto.memory.title === `Memory: ${longDetail}`, "expected auto-generated memory title to keep the full detail without truncation");
+  assert(explicit.memory.title === "Memory: Architecture Decision #001", "expected explicit memory title to be preserved");
+  assert(created[0]?.title === `Memory: ${longDetail}`, "expected created issue title to keep the full auto title");
+  assert(created[1]?.title === "Memory: Architecture Decision #001", "expected created issue title to use the explicit title");
+}
+
 async function testGetAndListMemories(): Promise<void> {
   const issues = [
     issueFromMemory(memory({
@@ -321,6 +343,45 @@ async function testUpdateMemoryInPlace(): Promise<void> {
   assert(syncedLabels[0]?.labels.includes("kind:core-fact"), "expected existing kind label to be preserved");
 }
 
+async function testUpdateSupportsExplicitRetitle(): Promise<void> {
+  const issues: IssueRecord[] = [
+    issueFromMemory(memory({
+      issueNumber: 20,
+      title: "Memory: old short title",
+      detail: "We use append-only audit events for billing changes.",
+      kind: "convention",
+    })),
+  ];
+  const updatedIssues: Array<{ number: number; title?: string; body?: string }> = [];
+  const client = {
+    listIssues: async (params?: { labels?: string[]; state?: "open" | "closed" | "all" }) => {
+      const labels = params?.labels ?? [];
+      const state = params?.state ?? "open";
+      return issues.filter((issue) => {
+        const issueLabels = issue.labels ?? [];
+        if (!labels.every((label) => issueLabels.includes(label))) return false;
+        if (state === "all") return true;
+        return (issue.state ?? "open") === state;
+      });
+    },
+    ensureLabels: async () => {},
+    updateIssue: async (number: number, patch: { title?: string; body?: string }) => {
+      updatedIssues.push({ number, ...patch });
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      if (patch.title) issue.title = patch.title;
+      if (patch.body) issue.body = patch.body;
+      return issue;
+    },
+    syncManagedLabels: async () => {},
+  };
+  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const updated = await store.update("20", { title: "Billing Audit Convention" });
+
+  assert(updated?.title === "Memory: Billing Audit Convention", "expected memory_update to support explicit retitle");
+  assert(updatedIssues[0]?.title === "Memory: Billing Audit Convention", "expected issue title patch to use the explicit retitle");
+}
+
 async function testForgetClosesMemoryIssue(): Promise<void> {
   const issues: IssueRecord[] = [
     issueFromMemory(memory({
@@ -372,9 +433,11 @@ async function main(): Promise<void> {
   await testBackendSearchFallsBackToLocalLexical();
   testCjkScoring();
   await testStructuredStoreAndSchema();
+  await testStoreKeepsFullAutoTitleAndSupportsExplicitTitle();
   await testGetAndListMemories();
   await testLegacyMemoriesWithoutSessionOrDate();
   await testUpdateMemoryInPlace();
+  await testUpdateSupportsExplicitRetitle();
   await testForgetClosesMemoryIssue();
   console.log("memory tests passed");
 }
