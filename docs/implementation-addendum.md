@@ -101,16 +101,18 @@ Rules:
 
 ### 3.1 Body Format
 
-The first implementation keeps the memory issue body minimal and stores only the memory detail text itself.
+Plugin-managed memory issues store the human-readable memory detail in a YAML `detail` field.
 
 For new memories, the human-readable memory title and body should default to the user's current language. When updating an existing memory, preserve that memory node's current language unless the user explicitly requests a rewrite.
 
-Metadata such as type, session, date, and status are carried by labels and issue metadata, not repeated in the body.
+Metadata such as type and schema are carried by labels and issue metadata. Plugin-managed compatibility metadata such as logical date or hash may also be stored as additional flat YAML fields in the issue body.
 
 Example:
 
 ```text
-User prefers storing conversation issue bodies as full YAML instead of markdown plus front matter.
+memory_hash: abc123
+date: 2026-03-10
+detail: User prefers storing conversation issue bodies as full YAML instead of markdown plus front matter.
 ```
 
 ### 3.2 Labels

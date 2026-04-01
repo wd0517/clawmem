@@ -162,4 +162,4 @@ Full config with all options:
 - `memory_update` updates one existing memory issue in place; use it for evolving canonical facts or active tasks instead of creating a duplicate node.
 - Conversation lifecycle is stored in native issue state (`open` while live, `closed` after finalize); memory lifecycle uses native issue state too (`open` active, `closed` stale).
 - Memory extraction now prefers one atomic fact per memory item instead of bundling whole sessions into a single node.
-- Memory issue bodies store the durable detail plus flat metadata such as `memory_hash` and logical `date`; labels are reserved for schema and routing.
+- Memory issue bodies store the durable detail in a YAML `detail` field plus flat metadata such as `memory_hash` and logical `date`; this matches the current Console parser in `agent-git-service/web`.

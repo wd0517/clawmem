@@ -84,8 +84,8 @@ export class MemoryStore {
 
     const date = localDate();
     const labels = memLabels(normalized.kind, normalized.topics);
-    const title = `${MEMORY_TITLE_PREFIX}${trunc(detail, 72)}`;
-    const body = stringifyFlatYaml([["memory_hash", hash], ["date", date], ["detail", detail]]);
+    const title = renderMemoryTitle(normalized);
+    const body = renderMemoryBody(detail, hash, date);
     await this.client.ensureLabels(labels);
     const issue = await this.client.createIssue({ title, body, labels });
     return {
@@ -104,10 +104,15 @@ export class MemoryStore {
     };
   }
 
-  async update(memoryId: string, patch: { detail?: string; kind?: string; topics?: string[] }): Promise<ParsedMemoryIssue | null> {
+  async update(memoryId: string, patch: { title?: string; detail?: string; kind?: string; topics?: string[] }): Promise<ParsedMemoryIssue | null> {
     const current = await this.get(memoryId, "all");
     if (!current) return null;
     const nextDetail = typeof patch.detail === "string" && patch.detail.trim() ? norm(patch.detail) : current.detail;
+    const nextTitle = typeof patch.title === "string" && patch.title.trim()
+      ? renderMemoryTitle({ title: patch.title.trim(), detail: nextDetail })
+      : patch.detail !== undefined
+        ? renderMemoryTitle({ detail: nextDetail })
+        : current.title || renderMemoryTitle({ detail: nextDetail });
     const nextKind = patch.kind !== undefined ? normalizeLabelValue(patch.kind, "kind:") : current.kind;
     const nextTopics = patch.topics !== undefined
       ? uniqueNormalized(patch.topics.map((topic) => normalizeLabelValue(topic, "topic:")).filter(Boolean) as string[])
@@ -118,8 +123,7 @@ export class MemoryStore {
       return (memory.memoryHash || sha256(norm(memory.detail))) === nextHash;
     });
     if (duplicate) throw new Error(`another active memory already stores this detail as [${duplicate.memoryId}]`);
-    const nextTitle = `${MEMORY_TITLE_PREFIX}${trunc(nextDetail, 72)}`;
-    const nextBody = stringifyFlatYaml([["memory_hash", nextHash], ["date", current.date], ["detail", nextDetail]]);
+    const nextBody = renderMemoryBody(nextDetail, nextHash, current.date);
     const nextLabels = memLabels(nextKind, nextTopics);
     await this.client.ensureLabels(nextLabels);
     await this.client.updateIssue(current.issueNumber, { title: nextTitle, body: nextBody });
@@ -201,16 +205,16 @@ export class MemoryStore {
     const kind = labelVal(labels, "kind:");
     const topics = labels.filter((l) => l.startsWith("topic:")).map((l) => l.slice(6).trim()).filter(Boolean);
     const rawBody = (issue.body ?? "").trim();
-    const body = rawBody ? parseFlatYaml(rawBody) : {};
-    const detail = body.detail?.trim() || rawBody;
+    const parsed = parseStoredMemoryBody(rawBody);
+    const detail = parsed.detail?.trim() || rawBody;
     const status = issue.state === "closed" || labels.includes(LABEL_MEMORY_STALE) ? "stale" : "active";
     if (!detail) return null;
     return {
       issueNumber: issue.number,
       title: issue.title?.trim() || "",
-      memoryId: body.memory_id?.trim() || String(issue.number),
-      memoryHash: body.memory_hash?.trim() || undefined,
-      date: body.date?.trim() || "1970-01-01",
+      memoryId: parsed.meta.memory_id?.trim() || String(issue.number),
+      memoryHash: parsed.meta.memory_hash?.trim() || undefined,
+      date: parsed.meta.date?.trim() || "1970-01-01",
       detail,
       ...(kind ? { kind } : {}),
       ...(topics.length > 0 ? { topics } : {}),
@@ -236,8 +240,8 @@ export class MemoryStore {
       }
       const labels = memLabels(draft.kind, draft.topics);
       const date = localDate();
-      const title = `${MEMORY_TITLE_PREFIX}${trunc(detail, 72)}`;
-      const body = stringifyFlatYaml([["memory_hash", hash], ["date", date], ["detail", detail]]);
+      const title = renderMemoryTitle(draft);
+      const body = renderMemoryBody(detail, hash, date);
       await this.client.ensureLabels(labels);
       const issue = await this.client.createIssue({ title, body, labels });
       activeByHash.set(hash, {
@@ -280,9 +284,10 @@ export class MemoryStore {
     const sessionKey = subKey(session, "memory");
     const message = [
       "Extract durable memories from the conversation below.",
-      'Return JSON only in the form {"save":[{"detail":"...","kind":"...","topics":["..."]}],"stale":["memory-id"]}.',
+      'Return JSON only in the form {"save":[{"title":"...","detail":"...","kind":"...","topics":["..."]}],"stale":["memory-id"]}.',
       "Each save item must contain one durable fact. If a turn contains several independent facts, save them separately instead of bundling them into one summary memory.",
       "Use save for stable, reusable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
+      "Title is optional. If you provide one, make it concise and human-readable.",
       "Use stale for existing memory IDs only when the conversation clearly supersedes or invalidates them.",
       "Infer kind and topics when they would help future retrieval. Reuse existing kinds and topics when possible.",
       "If no existing kind fits, you may propose a new short kind label. Keep kinds concise and reusable.",
@@ -300,7 +305,7 @@ export class MemoryStore {
         deliver: false,
         lane: "clawmem-memory",
         idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:memory-decision`),
-        extraSystemPrompt: "You extract durable memory updates from OpenClaw conversations. Output JSON only with save objects containing detail, optional kind, and optional topics, plus stale string ids. Keep each save item to one durable fact.",
+        extraSystemPrompt: "You extract durable memory updates from OpenClaw conversations. Output JSON only with save objects containing detail, optional title, optional kind, and optional topics, plus stale string ids. Keep each save item to one durable fact.",
       });
       const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.summaryWaitTimeoutMs });
       if (wait.status === "timeout") throw new Error("memory decision subagent timed out");
@@ -339,6 +344,35 @@ function memLabels(kind?: string, topics?: string[]): string[] {
     ...(kind ? [`kind:${kind}`] : []),
     ...((topics ?? []).map((topic) => `topic:${topic}`)),
   ];
+}
+
+function renderMemoryTitle(draft: Pick<MemoryDraft, "detail" | "title">): string {
+  const raw = typeof draft.title === "string" && draft.title.trim() ? draft.title : draft.detail;
+  const normalized = norm(raw);
+  return normalized.startsWith(MEMORY_TITLE_PREFIX) ? normalized : `${MEMORY_TITLE_PREFIX}${normalized}`;
+}
+
+function renderMemoryBody(detail: string, memoryHash: string, date: string): string {
+  return stringifyFlatYaml([["memory_hash", memoryHash], ["date", date], ["detail", norm(detail)]]);
+}
+
+function parseStoredMemoryBody(rawBody: string): { detail: string; meta: Record<string, string> } {
+  const trimmed = rawBody.trim();
+  if (!trimmed) return { detail: "", meta: {} };
+
+  const legacyYaml = parseFlatYaml(trimmed);
+  if (legacyYaml.detail?.trim()) {
+    return { detail: legacyYaml.detail.trim(), meta: legacyYaml };
+  }
+
+  const hiddenMeta = /(?:^|\n)<!--\s*clawmem-meta\s*\n([\s\S]*?)\n-->\s*$/.exec(trimmed);
+  if (!hiddenMeta) {
+    return { detail: trimmed, meta: {} };
+  }
+
+  const meta = parseFlatYaml(hiddenMeta[1] ?? "");
+  const detail = trimmed.slice(0, hiddenMeta.index).trim() || meta.detail?.trim() || "";
+  return { detail, meta };
 }
 
 function norm(v: string): string { return v.replace(/\s+/g, " ").trim(); }
@@ -429,9 +463,11 @@ export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): n
 function normalizeDraft(input: MemoryDraft): MemoryDraft {
   const detail = norm(input.detail);
   if (!detail) throw new Error("memory detail is empty");
+  const title = typeof input.title === "string" && input.title.trim() ? norm(input.title) : undefined;
   const kind = normalizeLabelValue(input.kind, "kind:");
   const topics = uniqueNormalized((input.topics ?? []).map((topic) => normalizeLabelValue(topic, "topic:")).filter(Boolean) as string[]);
   return {
+    ...(title ? { title } : {}),
     detail,
     ...(kind ? { kind } : {}),
     ...(topics.length > 0 ? { topics } : {}),
@@ -490,12 +526,13 @@ function parseSaveItem(value: unknown): MemoryDraft | null {
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
+  const title = typeof record.title === "string" ? record.title : undefined;
   const detail = typeof record.detail === "string" ? norm(record.detail) : "";
   if (!detail) return null;
   const kind = typeof record.kind === "string" ? record.kind : undefined;
   const topics = Array.isArray(record.topics) ? record.topics.filter((v): v is string => typeof v === "string") : undefined;
   try {
-    return normalizeDraft({ detail, ...(kind ? { kind } : {}), ...(topics ? { topics } : {}) });
+    return normalizeDraft({ ...(title ? { title } : {}), detail, ...(kind ? { kind } : {}), ...(topics ? { topics } : {}) });
   } catch {
     return null;
   }

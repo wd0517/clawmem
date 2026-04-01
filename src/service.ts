@@ -306,6 +306,7 @@ class ClawMemService {
         type: "object",
         additionalProperties: false,
         properties: {
+          title: { type: "string", minLength: 1, description: "Optional human-readable memory title. Defaults to the full detail text when omitted." },
           detail: { type: "string", minLength: 1, description: "The durable fact, lesson, decision, or preference to remember." },
           kind: { type: "string", minLength: 1, description: "Optional schema kind, for example lesson, convention, skill, or task." },
           topics: {
@@ -322,6 +323,7 @@ class ClawMemService {
       },
       execute: async (_id: string, params: unknown) => {
         const p = asRecord(params);
+        const title = typeof p.title === "string" ? p.title.trim() : "";
         const detail = typeof p.detail === "string" ? p.detail.trim() : "";
         if (!detail) return toolText("Detail is empty.");
         const agentId = this.resolveToolAgentId(p.agentId);
@@ -330,6 +332,7 @@ class ClawMemService {
         const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
         const topics = Array.isArray(p.topics) ? p.topics.filter((topic): topic is string => typeof topic === "string" && topic.trim().length > 0) : undefined;
         const result = await resolved.mem.store({
+          ...(title ? { title } : {}),
           detail,
           ...(kind ? { kind } : {}),
           ...(topics && topics.length > 0 ? { topics } : {}),
@@ -348,6 +351,7 @@ class ClawMemService {
         additionalProperties: false,
         properties: {
           memoryId: { type: "string", minLength: 1, description: "The memory id or issue number to update." },
+          title: { type: "string", minLength: 1, description: "Optional replacement title for the same memory record." },
           detail: { type: "string", minLength: 1, description: "Optional replacement detail text for the same memory record." },
           kind: { type: "string", minLength: 1, description: "Optional replacement kind label." },
           topics: {
@@ -366,16 +370,17 @@ class ClawMemService {
         const p = asRecord(params);
         const memoryId = typeof p.memoryId === "string" ? p.memoryId.trim() : "";
         if (!memoryId) return toolText("memoryId is empty.");
+        const title = typeof p.title === "string" && p.title.trim() ? p.title.trim() : undefined;
         const detail = typeof p.detail === "string" && p.detail.trim() ? p.detail.trim() : undefined;
         const kind = typeof p.kind === "string" && p.kind.trim() ? p.kind.trim() : undefined;
         const topics = Array.isArray(p.topics) ? p.topics.filter((topic): topic is string => typeof topic === "string" && topic.trim().length > 0) : undefined;
-        if (!detail && kind === undefined && topics === undefined) return toolText("Provide at least one of detail, kind, or topics.");
+        if (title === undefined && !detail && kind === undefined && topics === undefined) return toolText("Provide at least one of title, detail, kind, or topics.");
         const agentId = this.resolveToolAgentId(p.agentId);
         const resolved = await this.requireToolRoute(agentId, p.repo);
         if ("error" in resolved) return toolText(resolved.error);
         let updated;
         try {
-          updated = await resolved.mem.update(memoryId, { ...(detail ? { detail } : {}), ...(kind !== undefined ? { kind } : {}), ...(topics !== undefined ? { topics } : {}) });
+          updated = await resolved.mem.update(memoryId, { ...(title ? { title } : {}), ...(detail ? { detail } : {}), ...(kind !== undefined ? { kind } : {}), ...(topics !== undefined ? { topics } : {}) });
         } catch (error) {
           return toolText(`Unable to update memory "${memoryId}": ${String(error)}`);
         }

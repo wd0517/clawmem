@@ -50,6 +50,8 @@ On every user turn, run this loop:
    - Use `memory_update` when the same canonical fact or ongoing task should keep evolving as one node.
    - When updating an existing memory, preserve that node's current language unless the user explicitly asks for a rewrite.
    - Use `memory_store` when this is a genuinely new memory.
+   - When using `memory_store`, pass both `title` and `detail` when you can. Keep the title concise and human-readable, and keep `detail` as the full durable fact.
+   - When using `memory_update`, pass `title` as well if the existing title is too short, outdated, or less precise than the current canonical fact.
    - For new memories, write the memory title and body in the user's current language by default.
    - Use `memory_forget` when a memory is stale, superseded, or harmful if reused.
 3. Keep the user posted.
@@ -68,6 +70,8 @@ Bias toward retrieving and saving. A missed search or missed memory is worse tha
 - Project memory belongs in the relevant project repo.
 - Shared or team knowledge belongs in the shared repo for that group.
 - Memory titles and bodies default to the user's current language for new memories.
+- Prefer a short standalone title plus a fuller `detail` body instead of stuffing the whole memory into the title.
+- If you omit `title`, the plugin may derive it from `detail`, but providing an explicit title is preferred for readability in the Console.
 - When updating an existing memory, keep that node in its current language unless the user explicitly asks to rewrite it.
 - Keep schema labels and machine-oriented fields stable. Do not translate `type:*`, `kind:*`, `topic:*`, or other structural identifiers.
 - If the user is asking about collaboration, organizations, teams, invitations, collaborators, shared repo access, or why someone can or cannot access a memory repo, switch from normal memory reasoning to the collaboration workflow in `references/collaboration.md`.
