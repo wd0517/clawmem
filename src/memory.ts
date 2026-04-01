@@ -85,7 +85,7 @@ export class MemoryStore {
     const date = localDate();
     const labels = memLabels(normalized.kind, normalized.topics);
     const title = `${MEMORY_TITLE_PREFIX}${trunc(detail, 72)}`;
-    const body = stringifyFlatYaml([["memory_hash", hash], ["date", date], ["detail", detail]]);
+    const body = renderMemoryBody(detail, hash, date);
     await this.client.ensureLabels(labels);
     const issue = await this.client.createIssue({ title, body, labels });
     return {
@@ -119,7 +119,7 @@ export class MemoryStore {
     });
     if (duplicate) throw new Error(`another active memory already stores this detail as [${duplicate.memoryId}]`);
     const nextTitle = `${MEMORY_TITLE_PREFIX}${trunc(nextDetail, 72)}`;
-    const nextBody = stringifyFlatYaml([["memory_hash", nextHash], ["date", current.date], ["detail", nextDetail]]);
+    const nextBody = renderMemoryBody(nextDetail, nextHash, current.date);
     const nextLabels = memLabels(nextKind, nextTopics);
     await this.client.ensureLabels(nextLabels);
     await this.client.updateIssue(current.issueNumber, { title: nextTitle, body: nextBody });
@@ -201,16 +201,16 @@ export class MemoryStore {
     const kind = labelVal(labels, "kind:");
     const topics = labels.filter((l) => l.startsWith("topic:")).map((l) => l.slice(6).trim()).filter(Boolean);
     const rawBody = (issue.body ?? "").trim();
-    const body = rawBody ? parseFlatYaml(rawBody) : {};
-    const detail = body.detail?.trim() || rawBody;
+    const parsed = parseStoredMemoryBody(rawBody);
+    const detail = parsed.detail?.trim() || rawBody;
     const status = issue.state === "closed" || labels.includes(LABEL_MEMORY_STALE) ? "stale" : "active";
     if (!detail) return null;
     return {
       issueNumber: issue.number,
       title: issue.title?.trim() || "",
-      memoryId: body.memory_id?.trim() || String(issue.number),
-      memoryHash: body.memory_hash?.trim() || undefined,
-      date: body.date?.trim() || "1970-01-01",
+      memoryId: parsed.meta.memory_id?.trim() || String(issue.number),
+      memoryHash: parsed.meta.memory_hash?.trim() || undefined,
+      date: parsed.meta.date?.trim() || "1970-01-01",
       detail,
       ...(kind ? { kind } : {}),
       ...(topics.length > 0 ? { topics } : {}),
@@ -237,7 +237,7 @@ export class MemoryStore {
       const labels = memLabels(draft.kind, draft.topics);
       const date = localDate();
       const title = `${MEMORY_TITLE_PREFIX}${trunc(detail, 72)}`;
-      const body = stringifyFlatYaml([["memory_hash", hash], ["date", date], ["detail", detail]]);
+      const body = renderMemoryBody(detail, hash, date);
       await this.client.ensureLabels(labels);
       const issue = await this.client.createIssue({ title, body, labels });
       activeByHash.set(hash, {
@@ -339,6 +339,29 @@ function memLabels(kind?: string, topics?: string[]): string[] {
     ...(kind ? [`kind:${kind}`] : []),
     ...((topics ?? []).map((topic) => `topic:${topic}`)),
   ];
+}
+
+function renderMemoryBody(detail: string, memoryHash: string, date: string): string {
+  return stringifyFlatYaml([["memory_hash", memoryHash], ["date", date], ["detail", norm(detail)]]);
+}
+
+function parseStoredMemoryBody(rawBody: string): { detail: string; meta: Record<string, string> } {
+  const trimmed = rawBody.trim();
+  if (!trimmed) return { detail: "", meta: {} };
+
+  const legacyYaml = parseFlatYaml(trimmed);
+  if (legacyYaml.detail?.trim()) {
+    return { detail: legacyYaml.detail.trim(), meta: legacyYaml };
+  }
+
+  const hiddenMeta = /(?:^|\n)<!--\s*clawmem-meta\s*\n([\s\S]*?)\n-->\s*$/.exec(trimmed);
+  if (!hiddenMeta) {
+    return { detail: trimmed, meta: {} };
+  }
+
+  const meta = parseFlatYaml(hiddenMeta[1] ?? "");
+  const detail = trimmed.slice(0, hiddenMeta.index).trim() || meta.detail?.trim() || "";
+  return { detail, meta };
 }
 
 function norm(v: string): string { return v.replace(/\s+/g, " ").trim(); }

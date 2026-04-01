@@ -177,6 +177,8 @@ async function testStructuredStoreAndSchema(): Promise<void> {
   assert(created[0]?.labels.includes("topic:rate-limit"), "expected created labels to include normalized topic");
   assert(!created[0]?.labels.some((label) => label.startsWith("session:")), "expected manual memory_store writes to omit synthetic session labels");
   assert(!created[0]?.labels.some((label) => label.startsWith("date:")), "expected new memory labels to omit date labels");
+  assert(created[0]?.body.includes("memory_hash:"), "expected new memory body to retain metadata fields");
+  assert(created[0]?.body.includes("detail: Redis Lua scripts are required for atomic rate limiting."), "expected new memory body to store detail in YAML");
   assert(created[0]?.body.includes(`date: ${result.memory.date}`), "expected new memory body to retain logical date metadata");
   assert(ensured[0]?.includes("kind:lesson"), "expected ensureLabels to include kind label");
   assert(schema.kinds.includes("lesson"), "expected schema to expose existing kind labels");
@@ -312,6 +314,9 @@ async function testUpdateMemoryInPlace(): Promise<void> {
   assert(JSON.stringify(updated?.topics) === JSON.stringify(["preferences", "sports"]), "expected topics to be replaced");
   assert(updatedIssues.length === 1, "expected a single issue update");
   assert(updatedIssues[0]?.title !== "Memory: xiangz preferences", "expected title to refresh from updated detail");
+  assert(updatedIssues[0]?.body?.includes("memory_hash:"), "expected updated body to retain metadata");
+  assert(updatedIssues[0]?.body?.includes("detail:"), "expected updated body to store a detail field in YAML");
+  assert(updatedIssues[0]?.body?.includes("recently follows tennis"), "expected updated body to contain the updated detail text");
   assert(ensured[0]?.includes("topic:sports"), "expected new topic label to be ensured");
   assert(syncedLabels[0]?.labels.includes("kind:core-fact"), "expected existing kind label to be preserved");
 }
