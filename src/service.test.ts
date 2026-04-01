@@ -91,6 +91,25 @@ function testResolveHostVersionFromEnvFallback(): void {
   }
 }
 
+function testIgnoresNpmPackageVersionFallback(): void {
+  const previous = {
+    OPENCLAW_VERSION: process.env.OPENCLAW_VERSION,
+    OPENCLAW_SERVICE_VERSION: process.env.OPENCLAW_SERVICE_VERSION,
+    npm_package_version: process.env.npm_package_version,
+  };
+  try {
+    delete process.env.OPENCLAW_VERSION;
+    delete process.env.OPENCLAW_SERVICE_VERSION;
+    process.env.npm_package_version = "2026.3.99";
+    const version = resolveOpenClawHostVersion({ runtime: {} } as never);
+    assert(version === undefined, "expected npm_package_version to be ignored for host detection");
+  } finally {
+    process.env.OPENCLAW_VERSION = previous.OPENCLAW_VERSION;
+    process.env.OPENCLAW_SERVICE_VERSION = previous.OPENCLAW_SERVICE_VERSION;
+    process.env.npm_package_version = previous.npm_package_version;
+  }
+}
+
 function testResolvePromptHookModeModern(): void {
   const mode = resolvePromptHookMode({ runtime: { version: "2026.3.28" } } as never);
   assert(mode === "modern", "expected modern hook mode for OpenClaw 2026.3.28");
@@ -114,6 +133,7 @@ testBuildRelevantMemoriesSystemContext();
 testBuildLegacyRelevantMemoriesContext();
 testResolveHostVersionFromRuntime();
 testResolveHostVersionFromEnvFallback();
+testIgnoresNpmPackageVersionFallback();
 testResolvePromptHookModeModern();
 testResolvePromptHookModeLegacy();
 testResolvePromptHookModeLegacyForUnknownVersion();

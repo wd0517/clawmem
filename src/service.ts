@@ -1920,7 +1920,6 @@ export function resolveOpenClawHostVersion(api: Pick<OpenClawPluginApi, "runtime
   for (const candidate of [
     process.env.OPENCLAW_VERSION,
     process.env.OPENCLAW_SERVICE_VERSION,
-    process.env.npm_package_version,
   ]) {
     const trimmed = candidate?.trim();
     if (isUsableOpenClawVersion(trimmed)) return trimmed;
