@@ -17,6 +17,8 @@ type CollaborationPermission = "read" | "write" | "admin";
 type CollaborationTeamRole = "member" | "maintainer";
 
 const SESSION_MAINTENANCE_RETRY_DELAYS_MS = [5000, 30000, 120000] as const;
+const MODERN_PROMPT_HOOK_MIN_HOST_VERSION = "2026.3.7";
+type PromptHookMode = "modern" | "legacy";
 
 class ClawMemService {
   private readonly config: ClawMemPluginConfig;
@@ -36,7 +38,12 @@ class ClawMemService {
   }
 
   register(): void {
-    this.api.on("before_agent_start", async (ev, ctx) => this.handleBeforeAgentStart(ev.prompt, ctx.agentId));
+    const promptHookMode = resolvePromptHookMode(this.api);
+    if (promptHookMode === "modern") {
+      this.api.on("before_prompt_build", async (ev, ctx) => this.handleBeforePromptBuild(ev, ctx.agentId));
+    } else {
+      this.api.on("before_agent_start", async (ev, ctx) => this.handleBeforeAgentStart(ev, ctx.agentId));
+    }
     this.api.on("agent_end", (ev, ctx) => this.scheduleTurn({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, agentId: ctx.agentId, messages: ev.messages }));
     this.api.on("before_reset", (ev, ctx) => this.enqueueFinalize({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, sessionFile: ev.sessionFile, agentId: ctx.agentId, reason: ev.reason, messages: ev.messages }));
     this.api.on("session_end", (ev, ctx) => this.enqueueFinalize({ sessionId: ev.sessionId ?? ctx.sessionId, sessionKey: ev.sessionKey ?? ctx.sessionKey, agentId: ctx.agentId, reason: "session_end" }));
@@ -55,10 +62,11 @@ class ClawMemService {
           const route = resolveAgentRoute(this.config, agentId);
           return isAgentConfigured(route) && hasDefaultRepo(route);
         }).length;
+        const hostVersion = resolveOpenClawHostVersion(this.api);
         this.api.logger.info?.(
           configuredCount > 0
-            ? `clawmem: ready with ${configuredCount} configured agent route(s); missing routes will provision on first use via ${this.config.baseUrl}`
-            : `clawmem: ready; agent routes will provision on first use via ${this.config.baseUrl}`,
+            ? `clawmem: ready with ${configuredCount} configured agent route(s); prompt hook mode=${promptHookMode}${hostVersion ? ` for OpenClaw ${hostVersion}` : ""}; missing routes will provision on first use via ${this.config.baseUrl}`
+            : `clawmem: ready; prompt hook mode=${promptHookMode}${hostVersion ? ` for OpenClaw ${hostVersion}` : ""}; agent routes will provision on first use via ${this.config.baseUrl}`,
         );
       },
       stop: async () => {
@@ -1293,17 +1301,31 @@ class ClawMemService {
     });
   }
 
-  private async handleBeforeAgentStart(prompt: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
+  private async handleBeforePromptBuild(event: unknown, agentId?: string): Promise<{ prependSystemContext: string } | void> {
     const routeAgentId = normalizeAgentId(agentId);
     if (!(await this.ensureDefaultRepoConfigured(routeAgentId))) return;
     this.scheduleRecentSessionMaintenance(routeAgentId);
+    const prompt = extractPromptTextForRecall(event);
     if (typeof prompt !== "string" || prompt.trim().length < 5) return;
     try {
       const { mem } = this.getServices(routeAgentId);
       const memories = await mem.search(prompt, this.config.memoryAutoRecallLimit);
       if (memories.length === 0) return;
-      const text = memories.map((m) => `- ${formatInjectedMemory(m)}`).join("\n");
-      return { prependContext: `<relevant-memories>\nThe following active memories may be relevant to this conversation:\n${text}\n</relevant-memories>` };
+      return { prependSystemContext: buildRelevantMemoriesSystemContext(memories) };
+    } catch (error) { this.api.logger.warn(`clawmem: memory recall failed: ${String(error)}`); }
+  }
+
+  private async handleBeforeAgentStart(event: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
+    const routeAgentId = normalizeAgentId(agentId);
+    if (!(await this.ensureDefaultRepoConfigured(routeAgentId))) return;
+    this.scheduleRecentSessionMaintenance(routeAgentId);
+    const prompt = extractPromptTextForRecall(event);
+    if (typeof prompt !== "string" || prompt.trim().length < 5) return;
+    try {
+      const { mem } = this.getServices(routeAgentId);
+      const memories = await mem.search(prompt, this.config.memoryAutoRecallLimit);
+      if (memories.length === 0) return;
+      return { prependContext: buildLegacyRelevantMemoriesContext(memories) };
     } catch (error) { this.api.logger.warn(`clawmem: memory recall failed: ${String(error)}`); }
   }
 
@@ -1812,10 +1834,169 @@ function renderMemoryBlock(memory: {
   return lines.join("\n");
 }
 
+export function buildRelevantMemoriesSystemContext(memories: Array<{ detail: string }>): string {
+  return [
+    "ClawMem relevant memories:",
+    "Use these as background context only when they help with the current request.",
+    ...memories.map((memory) => `- ${formatInjectedMemory(memory)}`),
+  ].join("\n");
+}
+
+export function buildLegacyRelevantMemoriesContext(memories: Array<{ detail: string }>): string {
+  return [
+    "Relevant ClawMem memories for this request:",
+    ...memories.map((memory) => `- ${formatInjectedMemory(memory)}`),
+  ].join("\n");
+}
+
 function formatInjectedMemory(memory: {
   detail: string;
 }): string {
   return memory.detail;
+}
+
+export function extractPromptTextForRecall(event: unknown): string | undefined {
+  const direct = normalizePromptText(event);
+  if (direct) return direct;
+
+  const record = asRecord(event);
+  for (const candidate of [record.prompt, record.userPrompt, record.input, record.query, record.text]) {
+    const text = normalizePromptText(candidate);
+    if (text) return text;
+  }
+
+  return extractPromptTextFromMessages(record.messages) ?? extractPromptTextFromMessages(record.conversation);
+}
+
+function extractPromptTextFromMessages(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined;
+  let fallback: string | undefined;
+  for (let index = value.length - 1; index >= 0; index--) {
+    const message = value[index];
+    const record = asRecord(message);
+    const role = typeof record.role === "string" ? record.role.trim().toLowerCase() : "";
+    const text = normalizePromptText(record.text)
+      ?? normalizePromptText(record.prompt)
+      ?? normalizePromptText(record.content)
+      ?? normalizePromptText(record.message);
+    if (!text) continue;
+    if (!fallback) fallback = text;
+    if (!role || role === "user") return text;
+  }
+  return fallback;
+}
+
+function normalizePromptText(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed || undefined;
+  }
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((entry) => {
+        if (typeof entry === "string") return entry.trim();
+        const record = asRecord(entry);
+        if (record.type === "text" && typeof record.text === "string") return record.text.trim();
+        if (typeof record.text === "string") return record.text.trim();
+        return "";
+      })
+      .filter(Boolean);
+    return parts.length > 0 ? parts.join("\n") : undefined;
+  }
+  return undefined;
+}
+
+export function resolvePromptHookMode(api: Pick<OpenClawPluginApi, "runtime">): PromptHookMode {
+  const hostVersion = resolveOpenClawHostVersion(api);
+  if (!hostVersion) return "legacy";
+  const comparison = compareOpenClawVersions(hostVersion, MODERN_PROMPT_HOOK_MIN_HOST_VERSION);
+  if (comparison === null) return "legacy";
+  return comparison >= 0 ? "modern" : "legacy";
+}
+
+export function resolveOpenClawHostVersion(api: Pick<OpenClawPluginApi, "runtime">): string | undefined {
+  const runtimeVersion = typeof api.runtime?.version === "string" ? api.runtime.version.trim() : "";
+  if (isUsableOpenClawVersion(runtimeVersion)) return runtimeVersion;
+  for (const candidate of [
+    process.env.OPENCLAW_VERSION,
+    process.env.OPENCLAW_SERVICE_VERSION,
+    process.env.npm_package_version,
+  ]) {
+    const trimmed = candidate?.trim();
+    if (isUsableOpenClawVersion(trimmed)) return trimmed;
+  }
+  return undefined;
+}
+
+function isUsableOpenClawVersion(version: string | undefined): version is string {
+  return Boolean(version && version !== "0.0.0" && version !== "unknown");
+}
+
+function compareOpenClawVersions(left: string, right: string): number | null {
+  const leftSemver = parseComparableSemver(left);
+  const rightSemver = parseComparableSemver(right);
+  if (!leftSemver || !rightSemver) return null;
+  if (leftSemver.major !== rightSemver.major) return leftSemver.major < rightSemver.major ? -1 : 1;
+  if (leftSemver.minor !== rightSemver.minor) return leftSemver.minor < rightSemver.minor ? -1 : 1;
+  if (leftSemver.patch !== rightSemver.patch) return leftSemver.patch < rightSemver.patch ? -1 : 1;
+  return comparePrereleaseIdentifiers(leftSemver.prerelease, rightSemver.prerelease);
+}
+
+type ComparableSemver = {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string[] | null;
+};
+
+function parseComparableSemver(version: string | undefined): ComparableSemver | null {
+  if (!version) return null;
+  const normalized = normalizeLegacyDotBetaVersion(version);
+  const match = /^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(normalized);
+  if (!match) return null;
+  const [, major, minor, patch, prereleaseRaw] = match;
+  if (!major || !minor || !patch) return null;
+  return {
+    major: Number.parseInt(major, 10),
+    minor: Number.parseInt(minor, 10),
+    patch: Number.parseInt(patch, 10),
+    prerelease: prereleaseRaw ? prereleaseRaw.split(".").filter(Boolean) : null,
+  };
+}
+
+function normalizeLegacyDotBetaVersion(version: string): string {
+  const trimmed = version.trim();
+  const dotBetaMatch = /^([vV]?[0-9]+\.[0-9]+\.[0-9]+)\.beta(?:\.([0-9A-Za-z.-]+))?$/.exec(trimmed);
+  if (!dotBetaMatch) return trimmed;
+  const base = dotBetaMatch[1];
+  const suffix = dotBetaMatch[2];
+  return suffix ? `${base}-beta.${suffix}` : `${base}-beta`;
+}
+
+function comparePrereleaseIdentifiers(a: string[] | null, b: string[] | null): number {
+  if (!a?.length && !b?.length) return 0;
+  if (!a?.length) return 1;
+  if (!b?.length) return -1;
+  const max = Math.max(a.length, b.length);
+  for (let index = 0; index < max; index += 1) {
+    const left = a[index];
+    const right = b[index];
+    if (left == null && right == null) return 0;
+    if (left == null) return -1;
+    if (right == null) return 1;
+    if (left === right) continue;
+    const leftNumeric = /^[0-9]+$/.test(left);
+    const rightNumeric = /^[0-9]+$/.test(right);
+    if (leftNumeric && rightNumeric) {
+      const leftNumber = Number.parseInt(left, 10);
+      const rightNumber = Number.parseInt(right, 10);
+      return leftNumber < rightNumber ? -1 : 1;
+    }
+    if (leftNumeric && !rightNumeric) return -1;
+    if (!leftNumeric && rightNumeric) return 1;
+    return left < right ? -1 : 1;
+  }
+  return 0;
 }
 
 function renderOrgLine(org: { login?: string; name?: string; default_repository_permission?: string; description?: string }): string {

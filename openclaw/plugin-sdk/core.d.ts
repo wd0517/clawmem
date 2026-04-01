@@ -6,6 +6,7 @@ export type OpenClawPluginApi = {
     warn?: (message: string) => void;
   };
   runtime: {
+    version?: string;
     config?: {
       path?: string;
       account?: { id?: string };
