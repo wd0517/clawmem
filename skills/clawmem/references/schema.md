@@ -61,6 +61,8 @@ If you create a curated memory manually, include:
 ## Storage language
 
 - For new memory nodes, write the human-readable title and body in the user's current language by default.
+- When using plugin tools, prefer passing an explicit short `title` plus a fuller `detail` body.
+- Do not treat the title as the only durable content. The body detail should still contain the full reusable fact.
 - When updating an existing memory node, preserve that node's current language unless the user explicitly asks for a rewrite.
 - Do not translate schema or routing markers such as `type:*`, `kind:*`, `topic:*`, or other machine-oriented field names.
 

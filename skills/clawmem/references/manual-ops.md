@@ -76,6 +76,7 @@ Do not export `GH_HOST` or `GH_ENTERPRISE_TOKEN` globally for unrelated github.c
 Use the tool path first. If raw issue control is required:
 
 - For new memories, write the issue title and body in the user's current language.
+- Prefer a concise standalone title and keep the full durable fact in the body.
 - When manually updating an existing memory, preserve that memory's current language unless the user explicitly asks for a rewrite.
 - Keep labels and schema markers such as `type:*`, `kind:*`, and `topic:*` in their fixed machine-readable form.
 
