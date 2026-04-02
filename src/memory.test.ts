@@ -50,7 +50,7 @@ function testConfig(): never {
   } as never;
 }
 
-async function testBackendSearchBuildsCompactVariants(): Promise<void> {
+async function testBackendSearchBuildsSingleCleanedQuery(): Promise<void> {
   const queries: string[] = [];
   const client = {
     repo: () => "owner/main-memory",
@@ -61,18 +61,22 @@ async function testBackendSearchBuildsCompactVariants(): Promise<void> {
   };
   const store = new MemoryStore(client as never, {} as never, testConfig());
   await store.search([
+    "<clawmem-context>",
+    "- [11] Previous memory that should be stripped",
+    "</clawmem-context>",
     "Please help debug the Redis rate limiting path.",
-    "```ts",
+    "See https://example.com/debug for more context.",
     "throw new TimeoutError('lua script timeout')",
-    "```",
     "at RateLimiter.check (/srv/app/rate-limit.ts:42:9)",
   ].join("\n"), 5);
 
-  assert(queries.length >= 2 && queries.length <= 3, "expected a small number of backend query variants");
-  assert(queries.every((query) => query.includes("repo:owner/main-memory")), "expected every variant to stay scoped to the repo");
-  assert(queries.every((query) => query.includes('label:"type:memory"')), "expected every variant to filter memory issues");
-  assert(queries.every((query) => query.length <= 430), "expected backend search variants to stay compact");
-  assert(queries[0]?.toLowerCase().includes("redis"), "expected the primary query variant to retain key terms");
+  assert(queries.length === 1, "expected a single backend search query");
+  assert(queries[0]?.includes("repo:owner/main-memory"), "expected the backend query to stay scoped to the repo");
+  assert(queries[0]?.includes('label:"type:memory"'), "expected the backend query to filter memory issues");
+  assert((queries[0] ?? "").length <= 430, "expected the backend search query to stay compact");
+  assert(queries[0]?.toLowerCase().includes("redis"), "expected the backend query to retain key terms");
+  assert(!queries[0]?.includes("<clawmem-context>"), "expected injected clawmem context to be stripped");
+  assert(!queries[0]?.includes("https://example.com/debug"), "expected URLs to be stripped from backend recall");
 }
 
 async function testBackendSearchPreferredForRecall(): Promise<void> {
@@ -437,7 +441,7 @@ async function testForgetClosesMemoryIssue(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  await testBackendSearchBuildsCompactVariants();
+  await testBackendSearchBuildsSingleCleanedQuery();
   await testBackendSearchPreferredForRecall();
   await testBackendSearchReturnsEmptyWithoutLexicalFallback();
   await testBackendSearchPropagatesErrors();
