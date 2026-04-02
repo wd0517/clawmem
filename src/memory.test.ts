@@ -64,19 +64,30 @@ async function testBackendSearchBuildsSingleCleanedQuery(): Promise<void> {
     "<clawmem-context>",
     "- [11] Previous memory that should be stripped",
     "</clawmem-context>",
-    "Please help debug the Redis rate limiting path.",
+    "Conversation info (untrusted metadata):",
+    "```json",
+    '{"channel":"slack"}',
+    "```",
+    "",
+    "[message_id: abc-123]",
+    "",
+    "[Slack 2026-04-03 09:30]: Please help debug the Redis rate limiting path.",
     "See https://example.com/debug for more context.",
     "throw new TimeoutError('lua script timeout')",
-    "at RateLimiter.check (/srv/app/rate-limit.ts:42:9)",
+    "[System: auto-translated]",
   ].join("\n"), 5);
 
   assert(queries.length === 1, "expected a single backend search query");
   assert(queries[0]?.includes("repo:owner/main-memory"), "expected the backend query to stay scoped to the repo");
   assert(queries[0]?.includes('label:"type:memory"'), "expected the backend query to filter memory issues");
-  assert((queries[0] ?? "").length <= 430, "expected the backend search query to stay compact");
+  assert((queries[0] ?? "").length <= 1610, "expected the backend search query to stay within the configured cap plus qualifiers");
   assert(queries[0]?.toLowerCase().includes("redis"), "expected the backend query to retain key terms");
   assert(!queries[0]?.includes("<clawmem-context>"), "expected injected clawmem context to be stripped");
   assert(!queries[0]?.includes("https://example.com/debug"), "expected URLs to be stripped from backend recall");
+  assert(!queries[0]?.includes("Conversation info (untrusted metadata):"), "expected inbound metadata blocks to be stripped");
+  assert(!queries[0]?.includes("[message_id:"), "expected message id hints to be stripped");
+  assert(!queries[0]?.includes("[Slack 2026-04-03 09:30]"), "expected envelope prefixes to be stripped");
+  assert(!queries[0]?.includes("[System: auto-translated]"), "expected trailing system hints to be stripped");
 }
 
 async function testBackendSearchPreferredForRecall(): Promise<void> {

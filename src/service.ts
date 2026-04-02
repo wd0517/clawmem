@@ -6,6 +6,7 @@ import { ConversationMirror } from "./conversation.js";
 import { GitHubIssueClient } from "./github-client.js";
 import { KeyedAsyncQueue } from "./keyed-async-queue.js";
 import { MemoryStore } from "./memory.js";
+import { sanitizeRecallQueryInput } from "./recall-sanitize.js";
 import { loadState, resolveStatePath, saveState } from "./state.js";
 import { readTranscriptSnapshot } from "./transcript.js";
 import type { BootstrapIdentityResponse, ClawMemPluginConfig, ClawMemResolvedRoute, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
@@ -1866,13 +1867,19 @@ export function extractPromptTextForRecall(event: unknown): string | undefined {
   if (direct) return direct;
 
   const record = asRecord(event);
+  const promptCandidates = [
+    candidatePromptText(record.prompt),
+    candidatePromptText(record.userPrompt),
+    candidatePromptText(record.input),
+    candidatePromptText(record.query),
+    candidatePromptText(record.text),
+  ];
+  const sanitizedPrompt = promptCandidates.find((candidate) => candidate.changed && candidate.text)?.text;
+  if (sanitizedPrompt) return sanitizedPrompt;
+
   return extractPromptTextFromMessages(record.messages)
     ?? extractPromptTextFromMessages(record.conversation)
-    ?? normalizePromptText(record.userPrompt)
-    ?? normalizePromptText(record.input)
-    ?? normalizePromptText(record.query)
-    ?? normalizePromptText(record.text)
-    ?? normalizePromptText(record.prompt);
+    ?? promptCandidates.find((candidate) => candidate.text)?.text;
 }
 
 function extractPromptTextFromMessages(value: unknown): string | undefined {
@@ -1895,7 +1902,7 @@ function extractPromptTextFromMessages(value: unknown): string | undefined {
 
 function normalizePromptText(value: unknown): string | undefined {
   if (typeof value === "string") {
-    const trimmed = value.trim();
+    const trimmed = sanitizeRecallQueryInput(value).trim();
     return trimmed || undefined;
   }
   if (Array.isArray(value)) {
@@ -1908,9 +1915,35 @@ function normalizePromptText(value: unknown): string | undefined {
         return "";
       })
       .filter(Boolean);
-    return parts.length > 0 ? parts.join("\n") : undefined;
+    const joined = sanitizeRecallQueryInput(parts.join("\n")).trim();
+    return joined || undefined;
   }
   return undefined;
+}
+
+function candidatePromptText(value: unknown): { text?: string; changed: boolean } {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return { changed: false };
+    const sanitized = sanitizeRecallQueryInput(trimmed).trim();
+    return { ...(sanitized ? { text: sanitized } : {}), changed: Boolean(sanitized && sanitized !== trimmed) };
+  }
+  if (Array.isArray(value)) {
+    const raw = value
+      .map((entry) => {
+        if (typeof entry === "string") return entry.trim();
+        const record = asRecord(entry);
+        if (record.type === "text" && typeof record.text === "string") return record.text.trim();
+        if (typeof record.text === "string") return record.text.trim();
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+    if (!raw) return { changed: false };
+    const sanitized = sanitizeRecallQueryInput(raw).trim();
+    return { ...(sanitized ? { text: sanitized } : {}), changed: Boolean(sanitized && sanitized !== raw) };
+  }
+  return { changed: false };
 }
 
 export function resolvePromptHookMode(api: Pick<OpenClawPluginApi, "runtime">): PromptHookMode {

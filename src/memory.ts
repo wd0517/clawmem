@@ -6,11 +6,12 @@ import { normalizeMessages } from "./transcript.js";
 import type { ClawMemPluginConfig, MemoryDraft, MemoryListOptions, MemorySchema, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { fmtTranscript, localDate, sha256, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
+import { sanitizeRecallQueryInput } from "./recall-sanitize.js";
 
 type MemoryDecision = { save: MemoryDraft[]; stale: string[] };
 type SearchIndex = { title: string; detail: string; kind?: string; topics: string[] };
 
-const MAX_BACKEND_QUERY_CHARS = 320;
+const MAX_BACKEND_QUERY_CHARS = 1500;
 
 const RECALL_INJECTED_BLOCKS = [
   /<clawmem-context>[\s\S]*?<\/clawmem-context>/gi,
@@ -419,7 +420,7 @@ function buildMemorySearchQuery(query: string, repo: string): string {
 }
 
 function buildRecallSearchText(rawQuery: string): string {
-  const cleaned = stripRecallArtifacts(rawQuery);
+  const cleaned = sanitizeRecallQueryInput(stripRecallArtifacts(rawQuery));
   return truncateRecallQuery(cleaned, MAX_BACKEND_QUERY_CHARS);
 }
 

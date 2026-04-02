@@ -13,7 +13,25 @@ function testExtractPromptFromString(): void {
   assert(extractPromptTextForRecall("  help me fix redis  ") === "help me fix redis", "expected direct string prompts to be trimmed");
 }
 
-function testExtractPromptPrefersLatestUserMessage(): void {
+function testExtractPromptPrefersSanitizedPromptField(): void {
+  const prompt = extractPromptTextForRecall({
+    prompt: [
+      "Conversation info (untrusted metadata):",
+      "```json",
+      '{"channel":"slack"}',
+      "```",
+      "",
+      "[Slack 2026-04-03 09:30]: Please fix the login bug. [System: auto-translated]",
+    ].join("\n"),
+    messages: [
+      { role: "assistant", text: "How can I help?" },
+      { role: "user", text: "继续" },
+    ],
+  });
+  assert(prompt === "Please fix the login bug.", "expected sanitized prompt text to drive auto recall when available");
+}
+
+function testExtractPromptFallsBackToLatestUserMessage(): void {
   const prompt = extractPromptTextForRecall({
     prompt: "Huge synthesized system prompt that should not drive recall.",
     messages: [
@@ -21,7 +39,7 @@ function testExtractPromptPrefersLatestUserMessage(): void {
       { role: "user", text: "Please fix the login bug." },
     ],
   });
-  assert(prompt === "Please fix the login bug.", "expected the latest user message to drive auto recall");
+  assert(prompt === "Please fix the login bug.", "expected the latest user message to remain the fallback when prompt text is not sanitized");
 }
 
 function testExtractPromptFromPromptField(): void {
@@ -116,7 +134,8 @@ function testResolvePromptHookModeLegacyForUnknownVersion(): void {
 }
 
 testExtractPromptFromString();
-testExtractPromptPrefersLatestUserMessage();
+testExtractPromptPrefersSanitizedPromptField();
+testExtractPromptFallsBackToLatestUserMessage();
 testExtractPromptFromPromptField();
 testExtractPromptFromStructuredContent();
 testBuildAutoRecallContext();
