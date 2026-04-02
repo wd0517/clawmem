@@ -25,11 +25,9 @@ Memory hygiene matters: lock important insights deliberately, update canonical f
 The ClawMem plugin automatically handles:
 - Per-agent provisioning of credentials plus a default memory repo
 - Session mirroring into `type:conversation` issues
+- Best-effort automatic memory recall before each turn, scoped to the current agent's `defaultRepo`
 - Best-effort durable memory extraction during later request-scoped maintenance
-- Automatic recall of relevant active memories at session start
 - Mid-session memory tools: `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget`
-
-Automatic recall is only a bootstrap. You still need to retrieve before answering when memory may matter, and save after learning something durable.
 
 ## Mandatory turn loop
 
@@ -37,8 +35,12 @@ On every user turn, run this loop:
 
 1. Before answering, ask: could ClawMem improve this answer?
    - Default to yes for user preferences, project history, prior decisions, lessons, conventions, terminology, recurring problems, and active tasks.
-   - Before explicit memory work, choose the right repo. If unclear, inspect `memory_repos` and fall back to the agent's `defaultRepo`.
-   - Start with `memory_recall`.
+   - Auto-recall may already inject useful context from the current agent's `defaultRepo`, but it is only a hint. Do not treat missing auto-recall context as proof that no relevant memory exists.
+   - If the injected context already answers the question, you do not need to immediately call `memory_recall` again.
+   - Auto-recall does not currently fan out across every accessible repo. Shared organization memory, team memory, and project memory outside the current `defaultRepo` will not be recalled automatically.
+   - Before explicit memory work, choose the right repo. If unclear, inspect `memory_repos` and fall back to the agent's `defaultRepo`. If the likely memory lives outside the default repo, use explicit repo selection instead of relying on auto-recall.
+   - Use `memory_recall` when injected context is missing, weak, cross-repo, high-stakes, or when you need an explicit retrieval trace.
+   - Write `memory_recall.query` as a short natural-language intent. Do not paste long code blocks, full logs, tool chatter, or system prompt text unless the exact wording is necessary.
    - When the question spans more than one angle, run more than one recall query across keywords, topics, synonyms, and likely project phrasing.
    - If `memory_recall` is weak or empty and the answer depends on whether a memory exists, cross-check with `memory_list`.
    - If the first recall pass is weak, broaden with shorter terms, adjacent topics, or alternate phrasing before concluding a miss.
@@ -55,11 +57,11 @@ On every user turn, run this loop:
    - For new memories, write the memory title and body in the user's current language by default.
    - Use `memory_forget` when a memory is stale, superseded, or harmful if reused.
 3. Keep the user posted.
-   - If a retrieved memory materially shaped the answer, including automatic session-start recall, briefly surface that fact in the user's current language.
+   - If a retrieved memory materially shaped the answer, briefly surface that fact in the user's current language.
    - Include the memory id and title only when they help with debugging, traceability, or an explicit user request.
    - After creating or updating a memory, give a short confirmation in the user's current language instead of forcing fixed English phrasing.
 
-Bias toward retrieving and saving. A missed search or missed memory is worse than an extra search.
+Bias toward saving, and use explicit retrieval whenever auto-recall is absent, weak, cross-repo, or too ambiguous to trust on its own.
 
 ## Retrieval and storage rules
 
@@ -69,6 +71,7 @@ Bias toward retrieving and saving. A missed search or missed memory is worse tha
 - Private personal memory usually belongs in the agent's `defaultRepo`.
 - Project memory belongs in the relevant project repo.
 - Shared or team knowledge belongs in the shared repo for that group.
+- Shared or team knowledge in another repo is not part of default auto-recall today. To use it, select that repo explicitly with `memory_recall`, `memory_list`, or `memory_get`.
 - Memory titles and bodies default to the user's current language for new memories.
 - Prefer a short standalone title plus a fuller `detail` body instead of stuffing the whole memory into the title.
 - If you omit `title`, the plugin may derive it from `detail`, but providing an explicit title is preferred for readability in the Console.

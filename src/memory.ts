@@ -6,9 +6,20 @@ import { normalizeMessages } from "./transcript.js";
 import type { ClawMemPluginConfig, MemoryDraft, MemoryListOptions, MemorySchema, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { fmtTranscript, localDate, sha256, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
+import { sanitizeRecallQueryInput } from "./recall-sanitize.js";
 
 type MemoryDecision = { save: MemoryDraft[]; stale: string[] };
 type SearchIndex = { title: string; detail: string; kind?: string; topics: string[] };
+
+const MAX_BACKEND_QUERY_CHARS = 1500;
+
+const RECALL_INJECTED_BLOCKS = [
+  /<clawmem-context>[\s\S]*?<\/clawmem-context>/gi,
+  /<relevant-memories>[\s\S]*?<\/relevant-memories>/gi,
+  /<memories>[\s\S]*?<\/memories>/gi,
+];
+
+const URL_RE = /https?:\/\/\S+/gi;
 
 export class MemoryStore {
   constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
@@ -16,13 +27,7 @@ export class MemoryStore {
   async search(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const q = normalizeSearch(query);
     if (!q) return [];
-    try {
-      const results = await this.searchViaBackend(query, limit);
-      if (results.length > 0) return results;
-    } catch (error) {
-      this.api.logger?.warn?.(`clawmem: backend memory search failed, falling back to local lexical ranking: ${String(error)}`);
-    }
-    return this.searchLocally(q, limit);
+    return this.searchViaBackend(query, limit);
   }
 
   async listSchema(): Promise<MemorySchema> {
@@ -180,23 +185,13 @@ export class MemoryStore {
 
   private async searchViaBackend(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const repo = this.client.repo();
-    if (!repo) return [];
+    if (!repo) throw new Error("ClawMem memory recall requires a configured repo.");
     const qualified = buildMemorySearchQuery(query, repo);
     const batch = await this.client.searchIssues(qualified, { perPage: Math.min(100, Math.max(limit * 3, 20)) });
     return batch
       .map((issue) => this.parseIssue(issue))
       .filter((memory): memory is ParsedMemoryIssue => memory !== null && memory.status === "active")
       .slice(0, limit);
-  }
-
-  private async searchLocally(normalizedQuery: string, limit: number): Promise<ParsedMemoryIssue[]> {
-    const memories = await this.listByStatus("active");
-    return memories
-      .map((m) => ({ m, score: scoreMemoryMatch(m, normalizedQuery) }))
-      .filter((e) => e.score > 0)
-      .sort((a, b) => b.score - a.score || b.m.issueNumber - a.m.issueNumber)
-      .slice(0, limit)
-      .map((e) => e.m);
   }
 
   private parseIssue(issue: { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> }): ParsedMemoryIssue | null {
@@ -420,8 +415,25 @@ function overlapRatio(left: Set<string>, right: Set<string>): number {
 }
 
 function buildMemorySearchQuery(query: string, repo: string): string {
-  const parts = [query.trim(), `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].filter(Boolean);
+  const parts = [buildRecallSearchText(query), `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].filter(Boolean);
   return parts.join(" ");
+}
+
+function buildRecallSearchText(rawQuery: string): string {
+  const cleaned = sanitizeRecallQueryInput(stripRecallArtifacts(rawQuery));
+  return truncateRecallQuery(cleaned, MAX_BACKEND_QUERY_CHARS);
+}
+
+function stripRecallArtifacts(rawQuery: string): string {
+  let text = rawQuery.replace(/\r/g, "\n").replace(URL_RE, " ");
+  for (const block of RECALL_INJECTED_BLOCKS) text = text.replace(block, " ");
+  return text;
+}
+
+function truncateRecallQuery(text: string, maxLen: number): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (!compact) return "";
+  return compact.length <= maxLen ? compact : compact.slice(0, maxLen).trimEnd();
 }
 
 export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): number {

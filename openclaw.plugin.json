@@ -1,7 +1,7 @@
 {
   "id": "clawmem",
   "name": "ClawMem",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Mirror OpenClaw sessions into GitHub-compatible issues and comments.",
   "kind": "memory",
   "skills": [
@@ -127,7 +127,7 @@
     },
     "memoryAutoRecallLimit": {
       "label": "Auto Recall Limit",
-      "help": "Maximum number of active memories injected into context before an agent starts."
+      "help": "Maximum number of active memories automatically injected before each turn."
     }
   }
 }

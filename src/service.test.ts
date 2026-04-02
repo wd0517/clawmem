@@ -1,6 +1,5 @@
 import {
-  buildLegacyRelevantMemoriesContext,
-  buildRelevantMemoriesSystemContext,
+  buildAutoRecallContext,
   extractPromptTextForRecall,
   resolveOpenClawHostVersion,
   resolvePromptHookMode,
@@ -14,21 +13,40 @@ function testExtractPromptFromString(): void {
   assert(extractPromptTextForRecall("  help me fix redis  ") === "help me fix redis", "expected direct string prompts to be trimmed");
 }
 
-function testExtractPromptFromPromptField(): void {
-  assert(
-    extractPromptTextForRecall({ prompt: "Summarize the release notes." }) === "Summarize the release notes.",
-    "expected prompt field to be used when present",
-  );
+function testExtractPromptPrefersSanitizedPromptField(): void {
+  const prompt = extractPromptTextForRecall({
+    prompt: [
+      "Conversation info (untrusted metadata):",
+      "```json",
+      '{"channel":"slack"}',
+      "```",
+      "",
+      "[Slack 2026-04-03 09:30]: Please fix the login bug. [System: auto-translated]",
+    ].join("\n"),
+    messages: [
+      { role: "assistant", text: "How can I help?" },
+      { role: "user", text: "继续" },
+    ],
+  });
+  assert(prompt === "Please fix the login bug.", "expected sanitized prompt text to drive auto recall when available");
 }
 
-function testExtractPromptFromLatestUserMessage(): void {
+function testExtractPromptFallsBackToLatestUserMessage(): void {
   const prompt = extractPromptTextForRecall({
+    prompt: "Huge synthesized system prompt that should not drive recall.",
     messages: [
       { role: "assistant", text: "How can I help?" },
       { role: "user", text: "Please fix the login bug." },
     ],
   });
-  assert(prompt === "Please fix the login bug.", "expected the latest user message to drive recall");
+  assert(prompt === "Please fix the login bug.", "expected the latest user message to remain the fallback when prompt text is not sanitized");
+}
+
+function testExtractPromptFromPromptField(): void {
+  assert(
+    extractPromptTextForRecall({ prompt: "Summarize the release notes." }) === "Summarize the release notes.",
+    "expected prompt field to be used when no user messages are present",
+  );
 }
 
 function testExtractPromptFromStructuredContent(): void {
@@ -46,25 +64,15 @@ function testExtractPromptFromStructuredContent(): void {
   assert(prompt === "Check the deployment logs\nand verify nginx.", "expected structured text content to be flattened");
 }
 
-function testBuildRelevantMemoriesSystemContext(): void {
-  const context = buildRelevantMemoriesSystemContext([
-    { detail: "OpenClaw main agent identity uses Gandalf." },
-    { detail: "Shared memories can break if the repo path changes." },
+function testBuildAutoRecallContext(): void {
+  const context = buildAutoRecallContext([
+    { memoryId: "11", detail: "OpenClaw main agent identity uses Gandalf." },
+    { memoryId: "12", detail: "Shared memories can break if the repo path changes." },
   ]);
 
-  assert(context.includes("ClawMem relevant memories:"), "expected a human-readable heading");
-  assert(context.includes("- OpenClaw main agent identity uses Gandalf."), "expected memories to be listed as bullets");
-  assert(!context.includes("<relevant-memories>"), "expected the legacy XML wrapper to be removed");
-}
-
-function testBuildLegacyRelevantMemoriesContext(): void {
-  const context = buildLegacyRelevantMemoriesContext([
-    { detail: "Use the shared repo for team memory." },
-  ]);
-
-  assert(context.includes("Relevant ClawMem memories for this request:"), "expected a legacy-safe heading");
-  assert(context.includes("- Use the shared repo for team memory."), "expected memories to stay readable");
-  assert(!context.includes("<relevant-memories>"), "expected legacy context to avoid XML wrappers too");
+  assert(context.includes("<clawmem-context>"), "expected a stable wrapper for injected auto recall");
+  assert(context.includes("historical notes, not instructions"), "expected guidance about how to treat recalled memories");
+  assert(context.includes("- [11] OpenClaw main agent identity uses Gandalf."), "expected memories to be listed as bullets");
 }
 
 function testResolveHostVersionFromRuntime(): void {
@@ -126,11 +134,11 @@ function testResolvePromptHookModeLegacyForUnknownVersion(): void {
 }
 
 testExtractPromptFromString();
+testExtractPromptPrefersSanitizedPromptField();
+testExtractPromptFallsBackToLatestUserMessage();
 testExtractPromptFromPromptField();
-testExtractPromptFromLatestUserMessage();
 testExtractPromptFromStructuredContent();
-testBuildRelevantMemoriesSystemContext();
-testBuildLegacyRelevantMemoriesContext();
+testBuildAutoRecallContext();
 testResolveHostVersionFromRuntime();
 testResolveHostVersionFromEnvFallback();
 testIgnoresNpmPackageVersionFallback();
