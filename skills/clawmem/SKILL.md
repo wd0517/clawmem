@@ -35,9 +35,11 @@ On every user turn, run this loop:
 
 1. Before answering, ask: could ClawMem improve this answer?
    - Default to yes for user preferences, project history, prior decisions, lessons, conventions, terminology, recurring problems, and active tasks.
-   - Auto-recall may already inject useful context, but it is only a hint. Do not treat missing auto-recall context as proof that no relevant memory exists.
-   - Before explicit memory work, choose the right repo. If unclear, inspect `memory_repos` and fall back to the agent's `defaultRepo`.
-   - Start with `memory_recall`.
+   - Auto-recall may already inject useful context from the current agent's `defaultRepo`, but it is only a hint. Do not treat missing auto-recall context as proof that no relevant memory exists.
+   - If the injected context already answers the question, you do not need to immediately call `memory_recall` again.
+   - Before explicit memory work, choose the right repo. If unclear, inspect `memory_repos` and fall back to the agent's `defaultRepo`. If the likely memory lives outside the default repo, use explicit repo selection instead of relying on auto-recall.
+   - Use `memory_recall` when injected context is missing, weak, cross-repo, high-stakes, or when you need an explicit retrieval trace.
+   - Write `memory_recall.query` as a short natural-language intent. Do not paste long code blocks, full logs, tool chatter, or system prompt text unless the exact wording is necessary.
    - When the question spans more than one angle, run more than one recall query across keywords, topics, synonyms, and likely project phrasing.
    - If `memory_recall` is weak or empty and the answer depends on whether a memory exists, cross-check with `memory_list`.
    - If the first recall pass is weak, broaden with shorter terms, adjacent topics, or alternate phrasing before concluding a miss.
@@ -58,7 +60,7 @@ On every user turn, run this loop:
    - Include the memory id and title only when they help with debugging, traceability, or an explicit user request.
    - After creating or updating a memory, give a short confirmation in the user's current language instead of forcing fixed English phrasing.
 
-Bias toward retrieving and saving. A missed search or missed memory is worse than an extra search.
+Bias toward saving, and use explicit retrieval whenever auto-recall is absent, weak, cross-repo, or too ambiguous to trust on its own.
 
 ## Retrieval and storage rules
 
