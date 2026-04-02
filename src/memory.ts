@@ -10,19 +10,37 @@ import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 type MemoryDecision = { save: MemoryDraft[]; stale: string[] };
 type SearchIndex = { title: string; detail: string; kind?: string; topics: string[] };
 
+const MAX_BACKEND_QUERY_CHARS = 320;
+const MAX_BACKEND_PROSE_CHARS = 180;
+const MAX_BACKEND_KEYWORD_COUNT = 6;
+const MAX_BACKEND_IDENTIFIER_COUNT = 8;
+const MAX_BACKEND_VARIANTS = 3;
+
+const RECALL_INJECTED_BLOCKS = [
+  /<clawmem-context>[\s\S]*?<\/clawmem-context>/gi,
+  /<relevant-memories>[\s\S]*?<\/relevant-memories>/gi,
+  /<memories>[\s\S]*?<\/memories>/gi,
+  /<supermemory-context>[\s\S]*?<\/supermemory-context>/gi,
+  /<supermemory-containers>[\s\S]*?<\/supermemory-containers>/gi,
+];
+
+const URL_RE = /https?:\/\/\S+/gi;
+const STACK_TRACE_LINE_RE = /^\s*at\s+\S+/;
+const DIFF_LINE_RE = /^\s*(?:\+\+\+|---|@@)\b/;
+const JSONISH_LINE_RE = /^[\[{].*[\]}]$/;
+const RECALL_STOPWORDS = new Set([
+  "a", "an", "and", "are", "assistant", "bug", "build", "can", "check", "current", "debug", "error",
+  "fix", "for", "from", "help", "how", "issue", "latest", "memory", "need", "please", "problem",
+  "query", "recall", "show", "tell", "that", "the", "this", "turn", "use", "using", "what", "with", "you",
+]);
+
 export class MemoryStore {
   constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
 
   async search(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const q = normalizeSearch(query);
     if (!q) return [];
-    try {
-      const results = await this.searchViaBackend(query, limit);
-      if (results.length > 0) return results;
-    } catch (error) {
-      this.api.logger?.warn?.(`clawmem: backend memory search failed, falling back to local lexical ranking: ${String(error)}`);
-    }
-    return this.searchLocally(q, limit);
+    return this.searchViaBackend(query, limit);
   }
 
   async listSchema(): Promise<MemorySchema> {
@@ -180,23 +198,19 @@ export class MemoryStore {
 
   private async searchViaBackend(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const repo = this.client.repo();
-    if (!repo) return [];
-    const qualified = buildMemorySearchQuery(query, repo);
-    const batch = await this.client.searchIssues(qualified, { perPage: Math.min(100, Math.max(limit * 3, 20)) });
-    return batch
-      .map((issue) => this.parseIssue(issue))
-      .filter((memory): memory is ParsedMemoryIssue => memory !== null && memory.status === "active")
-      .slice(0, limit);
-  }
-
-  private async searchLocally(normalizedQuery: string, limit: number): Promise<ParsedMemoryIssue[]> {
-    const memories = await this.listByStatus("active");
-    return memories
-      .map((m) => ({ m, score: scoreMemoryMatch(m, normalizedQuery) }))
-      .filter((e) => e.score > 0)
-      .sort((a, b) => b.score - a.score || b.m.issueNumber - a.m.issueNumber)
-      .slice(0, limit)
-      .map((e) => e.m);
+    if (!repo) throw new Error("ClawMem memory recall requires a configured repo.");
+    const batches = buildMemorySearchQueries(query, repo);
+    const found = new Map<number, ParsedMemoryIssue>();
+    for (const qualified of batches) {
+      const batch = await this.client.searchIssues(qualified, { perPage: Math.min(100, Math.max(limit * 3, 20)) });
+      for (const issue of batch) {
+        const memory = this.parseIssue(issue);
+        if (!memory || memory.status !== "active" || found.has(memory.issueNumber)) continue;
+        found.set(memory.issueNumber, memory);
+      }
+      if (found.size >= limit) break;
+    }
+    return [...found.values()].slice(0, limit);
   }
 
   private parseIssue(issue: { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> }): ParsedMemoryIssue | null {
@@ -419,9 +433,106 @@ function overlapRatio(left: Set<string>, right: Set<string>): number {
   return hits / Math.max(left.size, right.size);
 }
 
+function buildMemorySearchQueries(query: string, repo: string): string[] {
+  return buildRecallSearchVariants(query)
+    .map((variant) => buildMemorySearchQuery(variant, repo));
+}
+
 function buildMemorySearchQuery(query: string, repo: string): string {
   const parts = [query.trim(), `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].filter(Boolean);
   return parts.join(" ");
+}
+
+function buildRecallSearchVariants(rawQuery: string): string[] {
+  const cleaned = stripRecallArtifacts(rawQuery);
+  const summary = buildRecallSummary(cleaned);
+  const identifiers = extractRecallIdentifiers(cleaned).join(" ");
+  const keywords = extractRecallKeywords(cleaned);
+  const variants = dedupeRecallVariants([
+    combineRecallParts(summary, identifiers),
+    summary,
+    combineRecallParts(keywords, identifiers),
+  ]);
+  if (variants.length > 0) return variants.slice(0, MAX_BACKEND_VARIANTS);
+  const fallback = truncateRecallQuery(cleaned, MAX_BACKEND_QUERY_CHARS);
+  return fallback ? [fallback] : [];
+}
+
+function stripRecallArtifacts(rawQuery: string): string {
+  let text = rawQuery.replace(/\r/g, "\n").replace(URL_RE, " ");
+  for (const block of RECALL_INJECTED_BLOCKS) text = text.replace(block, " ");
+  return text;
+}
+
+function buildRecallSummary(text: string): string {
+  const parts: string[] = [];
+  let inFence = false;
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith("```")) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence || STACK_TRACE_LINE_RE.test(line) || DIFF_LINE_RE.test(line)) continue;
+    if (line.length > 120 && JSONISH_LINE_RE.test(line)) continue;
+    const cleaned = line.replace(/^[-*]\s+/, "").replace(/\s+/g, " ").trim();
+    if (!cleaned) continue;
+    parts.push(cleaned);
+    if (parts.length >= 2) break;
+  }
+  return truncateRecallQuery(parts.join(" "), MAX_BACKEND_PROSE_CHARS);
+}
+
+function extractRecallIdentifiers(text: string): string[] {
+  const tokens = text.match(/[A-Za-z_][A-Za-z0-9_./:-]{2,}/g) ?? [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const token of [...tokens.filter(isTechnicalIdentifier), ...tokens]) {
+    const cleaned = token.replace(/^[^A-Za-z_]+|[^A-Za-z0-9_./:-]+$/g, "");
+    const key = cleaned.toLowerCase();
+    if (!cleaned || seen.has(key) || RECALL_STOPWORDS.has(key)) continue;
+    if (!isTechnicalIdentifier(cleaned) && cleaned.length < 3) continue;
+    seen.add(key);
+    out.push(cleaned);
+    if (out.length >= MAX_BACKEND_IDENTIFIER_COUNT) break;
+  }
+  return out;
+}
+
+function isTechnicalIdentifier(token: string): boolean {
+  return /[./:_-]/.test(token) || /[A-Z]/.test(token) || /\d/.test(token);
+}
+
+function extractRecallKeywords(text: string): string {
+  const keywords = searchTokens(normalizeSearch(text))
+    .filter((token) => /[a-z0-9]/i.test(token) ? token.length >= 3 : token.length >= 2)
+    .filter((token) => !RECALL_STOPWORDS.has(token))
+    .slice(0, MAX_BACKEND_KEYWORD_COUNT);
+  return truncateRecallQuery(keywords.join(" "), MAX_BACKEND_QUERY_CHARS);
+}
+
+function combineRecallParts(...parts: string[]): string {
+  return truncateRecallQuery(parts.filter(Boolean).join(" "), MAX_BACKEND_QUERY_CHARS);
+}
+
+function dedupeRecallVariants(variants: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const variant of variants) {
+    const cleaned = truncateRecallQuery(variant, MAX_BACKEND_QUERY_CHARS);
+    const key = normalizeSearch(cleaned);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(cleaned);
+  }
+  return out;
+}
+
+function truncateRecallQuery(text: string, maxLen: number): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (!compact) return "";
+  return compact.length <= maxLen ? compact : compact.slice(0, maxLen).trimEnd();
 }
 
 export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): number {

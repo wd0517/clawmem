@@ -127,7 +127,7 @@
     },
     "memoryAutoRecallLimit": {
       "label": "Auto Recall Limit",
-      "help": "Maximum number of active memories injected into context before an agent starts."
+      "help": "Maximum number of active memories automatically injected before each turn."
     }
   }
 }

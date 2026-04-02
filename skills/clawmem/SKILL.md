@@ -25,11 +25,9 @@ Memory hygiene matters: lock important insights deliberately, update canonical f
 The ClawMem plugin automatically handles:
 - Per-agent provisioning of credentials plus a default memory repo
 - Session mirroring into `type:conversation` issues
+- Best-effort automatic memory recall before each turn
 - Best-effort durable memory extraction during later request-scoped maintenance
-- Automatic recall of relevant active memories at session start
 - Mid-session memory tools: `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget`
-
-Automatic recall is only a bootstrap. You still need to retrieve before answering when memory may matter, and save after learning something durable.
 
 ## Mandatory turn loop
 
@@ -37,6 +35,7 @@ On every user turn, run this loop:
 
 1. Before answering, ask: could ClawMem improve this answer?
    - Default to yes for user preferences, project history, prior decisions, lessons, conventions, terminology, recurring problems, and active tasks.
+   - Auto-recall may already inject useful context, but it is only a hint. Do not treat missing auto-recall context as proof that no relevant memory exists.
    - Before explicit memory work, choose the right repo. If unclear, inspect `memory_repos` and fall back to the agent's `defaultRepo`.
    - Start with `memory_recall`.
    - When the question spans more than one angle, run more than one recall query across keywords, topics, synonyms, and likely project phrasing.
@@ -55,7 +54,7 @@ On every user turn, run this loop:
    - For new memories, write the memory title and body in the user's current language by default.
    - Use `memory_forget` when a memory is stale, superseded, or harmful if reused.
 3. Keep the user posted.
-   - If a retrieved memory materially shaped the answer, including automatic session-start recall, briefly surface that fact in the user's current language.
+   - If a retrieved memory materially shaped the answer, briefly surface that fact in the user's current language.
    - Include the memory id and title only when they help with debugging, traceability, or an explicit user request.
    - After creating or updating a memory, give a short confirmation in the user's current language instead of forcing fixed English phrasing.
 

@@ -138,7 +138,7 @@ Full config with all options:
           turnCommentDelayMs: 1000,
           summaryWaitTimeoutMs: 120000,
           memoryRecallLimit: 5,
-          memoryAutoRecallLimit: 5
+          memoryAutoRecallLimit: 3
         }
       }
     }
@@ -152,8 +152,9 @@ Full config with all options:
 
 - Conversation comments exclude tool calls, tool results, system messages, and heartbeat noise.
 - Summary failures do not block finalization; the `summary` field is written as `failed: ...`.
-- Memory search and auto-injection only return open `type:memory` issues. Closed memory issues are treated as stale.
-- `memory_recall` now prefers the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`, with a simple local lexical fallback when backend search is unavailable or returns no matches.
+- Memory search and auto-recall only return open `type:memory` issues. Closed memory issues are treated as stale.
+- ClawMem automatically injects a small set of relevant memories before each turn using the agent's default repo and the backend recall API. Auto-recall is best-effort and quietly skips injection when backend recall is unavailable.
+- `memory_recall` uses the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`. When backend recall is unavailable, use `memory_list` or `memory_get` to inspect memories explicitly.
 - Durable memories are extracted best-effort during later request-scoped maintenance, not by background subagent work after a request has already ended.
 - The plugin exposes `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
 - Route resolution is now: agent identity supplies credentials, `defaultRepo` is the fallback memory space, and explicit tool calls may override repo per operation.

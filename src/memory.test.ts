@@ -44,46 +44,38 @@ function assert(condition: unknown, message: string): void {
 function testConfig(): never {
   return {
     memoryRecallLimit: 5,
-    memoryAutoRecallLimit: 5,
+    memoryAutoRecallLimit: 3,
     turnCommentDelayMs: 1000,
     summaryWaitTimeoutMs: 120000,
   } as never;
 }
 
-async function testSearchRanking(): Promise<void> {
-  const issues = [
-    issueFromMemory(memory({
-      issueNumber: 1,
-      title: "Memory: Redis rate limit tuning",
-      detail: "Distributed Redis rate limiting must use Lua scripts to stay atomic.",
-      kind: "lesson",
-      topics: ["redis", "rate-limiting"],
-    })),
-    issueFromMemory(memory({
-      issueNumber: 2,
-      title: "Memory: Generic backend notes",
-      detail: "We use Redis in several services, but this one is not about rate limiting.",
-      topics: ["backend"],
-    })),
-  ];
+async function testBackendSearchBuildsCompactVariants(): Promise<void> {
+  const queries: string[] = [];
   const client = {
-    listIssues: async () => issues,
+    repo: () => "owner/main-memory",
+    searchIssues: async (query: string) => {
+      queries.push(query);
+      return [] as IssueRecord[];
+    },
   };
   const store = new MemoryStore(client as never, {} as never, testConfig());
-  const found = await store.search("redis rate limiting", 5);
-  assert(found.length === 2, "expected both memories to match");
-  assert(found[0]?.issueNumber === 1, "expected the more specific Redis rate limiting memory to rank first");
+  await store.search([
+    "Please help debug the Redis rate limiting path.",
+    "```ts",
+    "throw new TimeoutError('lua script timeout')",
+    "```",
+    "at RateLimiter.check (/srv/app/rate-limit.ts:42:9)",
+  ].join("\n"), 5);
+
+  assert(queries.length >= 2 && queries.length <= 3, "expected a small number of backend query variants");
+  assert(queries.every((query) => query.includes("repo:owner/main-memory")), "expected every variant to stay scoped to the repo");
+  assert(queries.every((query) => query.includes('label:"type:memory"')), "expected every variant to filter memory issues");
+  assert(queries.every((query) => query.length <= 430), "expected backend search variants to stay compact");
+  assert(queries[0]?.toLowerCase().includes("redis"), "expected the primary query variant to retain key terms");
 }
 
 async function testBackendSearchPreferredForRecall(): Promise<void> {
-  const listed = [
-    issueFromMemory(memory({
-      issueNumber: 1,
-      title: "Memory: lexical decoy",
-      detail: "redis rate limiting checklist",
-      kind: "lesson",
-    })),
-  ];
   const searched = [
     issueFromMemory(memory({
       issueNumber: 2,
@@ -96,14 +88,13 @@ async function testBackendSearchPreferredForRecall(): Promise<void> {
   const queries: string[] = [];
   const client = {
     repo: () => "owner/main-memory",
-    listIssues: async () => listed,
     searchIssues: async (query: string) => {
       queries.push(query);
       return searched;
     },
   };
   const store = new MemoryStore(client as never, {} as never, testConfig());
-  const found = await store.search("redis rate limiting", 5);
+  const found = await store.search("redis rate limiting", 1);
 
   assert(queries.length === 1, "expected backend search to be called once");
   assert(queries[0]?.includes('repo:owner/main-memory'), "expected backend query to scope to the current repo");
@@ -111,7 +102,7 @@ async function testBackendSearchPreferredForRecall(): Promise<void> {
   assert(found.length === 1 && found[0]?.issueNumber === 2, "expected backend search results to be preferred");
 }
 
-async function testBackendSearchFallsBackToLocalLexical(): Promise<void> {
+async function testBackendSearchReturnsEmptyWithoutLexicalFallback(): Promise<void> {
   const issues = [
     issueFromMemory(memory({
       issueNumber: 3,
@@ -124,12 +115,28 @@ async function testBackendSearchFallsBackToLocalLexical(): Promise<void> {
   const client = {
     repo: () => "owner/main-memory",
     listIssues: async () => issues,
-    searchIssues: async () => { throw new Error("search unavailable"); },
+    searchIssues: async () => [] as IssueRecord[],
   };
-  const store = new MemoryStore(client as never, { logger: { warn: () => {} } } as never, testConfig());
+  const store = new MemoryStore(client as never, {} as never, testConfig());
   const found = await store.search("redis rate limiting", 5);
 
-  assert(found.length === 1 && found[0]?.issueNumber === 3, "expected lexical fallback when backend search fails");
+  assert(found.length === 0, "expected backend-only recall to return no results when the backend finds nothing");
+}
+
+async function testBackendSearchPropagatesErrors(): Promise<void> {
+  const client = {
+    repo: () => "owner/main-memory",
+    searchIssues: async () => { throw new Error("search unavailable"); },
+  };
+  const store = new MemoryStore(client as never, {} as never, testConfig());
+  let message = "";
+  try {
+    await store.search("redis rate limiting", 5);
+  } catch (error) {
+    message = String(error);
+  }
+
+  assert(message.includes("search unavailable"), "expected backend failures to propagate instead of falling back locally");
 }
 
 function testCjkScoring(): void {
@@ -265,6 +272,7 @@ async function testLegacyMemoriesWithoutSessionOrDate(): Promise<void> {
     },
   ];
   const client = {
+    repo: () => "owner/main-memory",
     listIssues: async (params?: { labels?: string[]; state?: "open" | "closed" | "all" }) => {
       const labels = params?.labels ?? [];
       const state = params?.state ?? "open";
@@ -275,6 +283,7 @@ async function testLegacyMemoriesWithoutSessionOrDate(): Promise<void> {
         return (issue.state ?? "open") === state;
       });
     },
+    searchIssues: async () => issues,
   };
   const store = new MemoryStore(client as never, {} as never, testConfig());
   const exact = await store.get("4");
@@ -428,9 +437,10 @@ async function testForgetClosesMemoryIssue(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  await testSearchRanking();
+  await testBackendSearchBuildsCompactVariants();
   await testBackendSearchPreferredForRecall();
-  await testBackendSearchFallsBackToLocalLexical();
+  await testBackendSearchReturnsEmptyWithoutLexicalFallback();
+  await testBackendSearchPropagatesErrors();
   testCjkScoring();
   await testStructuredStoreAndSchema();
   await testStoreKeepsFullAutoTitleAndSupportsExplicitTitle();
