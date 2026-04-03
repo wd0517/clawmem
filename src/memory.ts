@@ -654,7 +654,7 @@ function parseDecision(raw: string): MemoryDecision {
   })();
 }
 
-function parseCandidates(raw: string): MemoryCandidate[] {
+export function parseCandidates(raw: string): MemoryCandidate[] {
   const tryParse = (s: string): MemoryCandidate[] | null => {
     try {
       const payload = JSON.parse(s) as Record<string, unknown>;

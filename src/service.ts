@@ -1735,8 +1735,64 @@ class ClawMemService {
     };
     const mirroredCount = Math.min(session.lastMirroredCount, snap.messages.length);
     if (mirroredCount <= 0) return;
+    const canCombineDeltaDerivation = this.needsDigest(session)
+      && this.needsMemoryExtract(session)
+      && derived.digest.cursor === derived.memory.extractCursor;
 
-    if (this.needsDigest(session)) {
+    if (canCombineDeltaDerivation) {
+      const deriveTarget = mirroredCount;
+      const deriveFromCursor = Math.min(derived.digest.cursor, deriveTarget);
+      const deriveSnapshot: TranscriptSnapshot = { ...snap, messages: snap.messages.slice(0, deriveTarget) };
+      const startedAt = new Date().toISOString();
+      derived.digest.status = "running";
+      derived.digest.updatedAt = startedAt;
+      derived.memory.extractStatus = "running";
+      derived.memory.updatedAt = startedAt;
+      await updateLegacyAndPersist();
+      try {
+        const result = await conv.deriveDelta(session, deriveSnapshot, deriveFromCursor, derived.digest.text);
+        derived.digest.text = result.digest.trim();
+        derived.digest.title = result.title?.trim() || derived.digest.title;
+        derived.digest.cursor = deriveTarget;
+        derived.digest.status = deriveTarget < session.lastMirroredCount ? "pending" : "complete";
+        derived.digest.attempt = 0;
+        derived.digest.lastError = undefined;
+        derived.digest.updatedAt = new Date().toISOString();
+        if (result.title?.trim() && session.issueNumber) {
+          await client.updateIssue(session.issueNumber, { title: result.title.trim() });
+          session.issueTitle = result.title.trim();
+          session.titleSource = "digest";
+        }
+
+        derived.memory.pendingCandidates = mergeMemoryCandidates(derived.memory.pendingCandidates, result.candidates);
+        derived.memory.extractCursor = deriveTarget;
+        derived.memory.extractStatus = deriveTarget < session.lastMirroredCount ? "pending" : "complete";
+        derived.memory.attempt = 0;
+        derived.memory.lastError = undefined;
+        derived.memory.updatedAt = new Date().toISOString();
+        if (derived.memory.pendingCandidates.length === 0) {
+          derived.memory.appliedCursor = Math.max(derived.memory.appliedCursor, deriveTarget);
+          derived.memory.reconcileStatus = "complete";
+        } else {
+          derived.memory.reconcileStatus = "pending";
+        }
+      } catch (error) {
+        const failedAt = new Date().toISOString();
+        derived.digest.status = "error";
+        derived.digest.attempt += 1;
+        derived.digest.lastError = String(error);
+        derived.digest.updatedAt = failedAt;
+        derived.memory.extractStatus = "error";
+        derived.memory.attempt += 1;
+        derived.memory.lastError = String(error);
+        derived.memory.updatedAt = failedAt;
+        retryNeeded = true;
+        this.warn(`background derive delta for ${session.sessionId}`, error);
+      }
+      await updateLegacyAndPersist();
+    }
+
+    if (!canCombineDeltaDerivation && this.needsDigest(session)) {
       const digestTarget = mirroredCount;
       const digestFromCursor = Math.min(derived.digest.cursor, digestTarget);
       const digestSnapshot: TranscriptSnapshot = { ...snap, messages: snap.messages.slice(0, digestTarget) };
@@ -1798,7 +1854,7 @@ class ClawMemService {
       await updateLegacyAndPersist();
     }
 
-    if (this.needsMemoryExtract(session)) {
+    if (!canCombineDeltaDerivation && this.needsMemoryExtract(session)) {
       const extractTarget = Math.min(session.lastMirroredCount, snap.messages.length);
       const extractFromCursor = Math.min(derived.memory.extractCursor, extractTarget);
       const extractSnapshot: TranscriptSnapshot = { ...snap, messages: snap.messages.slice(0, extractTarget) };

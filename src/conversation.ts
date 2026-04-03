@@ -4,8 +4,9 @@ import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { AGENT_LABEL_PREFIX, DEFAULT_LABELS, SESSION_TITLE_PREFIX, extractLabelNames } from "./config.js";
 import type { GitHubIssueClient } from "./github-client.js";
+import { parseCandidates } from "./memory.js";
 import { normalizeMessages, readTranscriptSnapshot } from "./transcript.js";
-import type { ClawMemPluginConfig, NormalizedMessage, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import type { ClawMemPluginConfig, MemoryCandidate, NormalizedMessage, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { fmtTranscript, fmtTranscriptFrom, localDate, localDateTime, sha256, sliceTranscriptDelta, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 
@@ -142,6 +143,68 @@ export class ConversationMirror {
       const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
       if (!text) throw new Error("digest subagent returned no assistant text");
       return parseDigestAndTitle(text);
+    } finally {
+      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
+    }
+  }
+
+  async deriveDelta(
+    session: SessionMirrorState,
+    snapshot: TranscriptSnapshot,
+    fromCursor: number,
+    previousDigest?: string,
+  ): Promise<{ digest: string; title?: string; candidates: MemoryCandidate[] }> {
+    const { anchorStart, deltaStart, anchorMessages, deltaMessages } = sliceTranscriptDelta(snapshot.messages, fromCursor, 2);
+    if (deltaMessages.length === 0) {
+      return { digest: previousDigest?.trim() || "", candidates: [] };
+    }
+    const subagent = this.api.runtime.subagent;
+    const sessionKey = subKey(session, "derive-delta");
+    const message = [
+      "Maintain a rolling digest and extract atomic durable memory candidates from the conversation delta below.",
+      'Return valid JSON only in the form {"digest":"...","title":"...","candidates":[{"title":"...","detail":"...","kind":"...","topics":["..."],"evidence":"..."}]}.',
+      "Update the digest so it accurately represents the conversation so far in 4-8 concise factual sentences.",
+      "Focus the digest on decisions, constraints, preferences, open workstreams, and concrete outcomes worth carrying forward.",
+      "Extract only durable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
+      "Use the anchor messages only for context resolution. The new messages are the only source that may add new candidates now.",
+      "Each candidate must represent one durable fact. Split independent facts into separate candidates.",
+      "Do not extract temporary requests, tool chatter, startup boilerplate, or summaries about internal helper sessions.",
+      "Kind and topics are optional. Keep them short, reusable, and low-cardinality.",
+      "Evidence is optional. If present, keep it short and quote-free.",
+      "Title is optional. If provided, keep it under 50 characters and accurately describe the overall conversation.",
+      "Prefer an empty candidates array when nothing durable was added.",
+      "",
+      "<previous-digest>",
+      previousDigest?.trim() || "None.",
+      "</previous-digest>",
+      "",
+      "<anchor-messages>",
+      anchorMessages.length > 0 ? fmtTranscriptFrom(anchorMessages, anchorStart) : "None.",
+      "</anchor-messages>",
+      "",
+      "<new-messages>",
+      fmtTranscriptFrom(deltaMessages, deltaStart),
+      "</new-messages>",
+    ].join("\n");
+    try {
+      const run = await subagent.run({
+        sessionKey,
+        message,
+        deliver: false,
+        lane: "clawmem-derive-delta",
+        idempotencyKey: sha256(`${session.sessionId}:${fromCursor}:${snapshot.messages.length}:derive-delta-v1`),
+        extraSystemPrompt: "You maintain rolling conversation digests and extract atomic durable memory candidates for ClawMem. Output JSON only with digest, optional title, and candidates.",
+      });
+      const wait = await subagent.waitForRun({
+        runId: run.runId,
+        timeoutMs: Math.max(this.config.digestWaitTimeoutMs, this.config.memoryExtractWaitTimeoutMs),
+      });
+      if (wait.status === "timeout") throw new Error("derive delta subagent timed out");
+      if (wait.status === "error") throw new Error(wait.error || "derive delta subagent failed");
+      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
+      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
+      if (!text) throw new Error("derive delta subagent returned no assistant text");
+      return parseDerivedDelta(text);
     } finally {
       subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
     }
@@ -507,6 +570,16 @@ function parseDigestAndTitle(raw: string): { digest: string; title?: string } {
     if (nested) return nested;
   }
   return { digest: t };
+}
+
+function parseDerivedDelta(raw: string): { digest: string; title?: string; candidates: MemoryCandidate[] } {
+  const parsedDigest = parseDigestAndTitle(raw);
+  const candidates = parseCandidates(raw);
+  return {
+    digest: parsedDigest.digest,
+    ...(parsedDigest.title ? { title: parsedDigest.title } : {}),
+    candidates,
+  };
 }
 
 function parseTitle(raw: string): string | undefined {
