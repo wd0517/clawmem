@@ -26,7 +26,7 @@ The ClawMem plugin automatically handles:
 - Per-agent provisioning of credentials plus a default memory repo
 - Session mirroring into `type:conversation` issues
 - Best-effort automatic memory recall before each turn, scoped to the current agent's `defaultRepo`
-- Best-effort durable memory extraction during later request-scoped maintenance
+- Best-effort durable memory extraction after mirrored turns, with background recovery retries if extract/reconcile work fails
 - Mid-session memory tools: `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget`
 
 ## Mandatory turn loop
