@@ -5,11 +5,11 @@ import { filterDirectCollaborators, listRepoAccessTeams, resolveOrgInvitationRol
 import { ConversationMirror } from "./conversation.js";
 import { GitHubIssueClient } from "./github-client.js";
 import { KeyedAsyncQueue } from "./keyed-async-queue.js";
-import { MemoryStore } from "./memory.js";
+import { MemoryStore, mergeMemoryCandidates } from "./memory.js";
 import { sanitizeRecallQueryInput } from "./recall-sanitize.js";
 import { loadState, resolveStatePath, saveState } from "./state.js";
 import { readTranscriptSnapshot } from "./transcript.js";
-import type { BootstrapIdentityResponse, ClawMemPluginConfig, ClawMemResolvedRoute, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import type { BootstrapIdentityResponse, ClawMemPluginConfig, ClawMemResolvedRoute, PluginState, SessionDerivedState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { buildAgentBootstrapRegistration, inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
 
 type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; messages: unknown[] };
@@ -1392,6 +1392,7 @@ class ClawMemService {
     await conv.syncLabels(s, snap, false);
     const next = snap.messages.slice(s.lastMirroredCount);
     if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; }
+    this.markPostMirrorTasks(s);
     await this.persistState();
     this.scheduleRecentSessionMaintenance(agentId);
   }
@@ -1423,8 +1424,9 @@ class ClawMemService {
     if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; allOk = n === next.length; }
     await conv.syncLabels(s, snap, true);
     await conv.syncBody(s, snap, "pending", true);
-    s.summaryStatus = "pending";
     if (allOk) s.finalizedAt = new Date().toISOString();
+    this.markPostMirrorTasks(s);
+    this.markSummaryPending(s);
     await this.persistState();
     this.scheduleSessionMaintenance(scopeKey, agentId, { reason: p.reason ?? "finalize" });
   }
@@ -1453,11 +1455,89 @@ class ClawMemService {
       agentId: normalizeAgentId(agentId),
       lastMirroredCount: 0,
       turnCount: 0,
+      derived: {
+        digest: { cursor: 0, status: "idle", attempt: 0 },
+        summary: { basedOnCursor: 0, status: "idle" },
+        memory: {
+          extractCursor: 0,
+          appliedCursor: 0,
+          extractStatus: "idle",
+          reconcileStatus: "idle",
+          attempt: 0,
+          pendingCandidates: [],
+        },
+      },
       createdAt: now,
       updatedAt: now,
     };
     this.state.sessions[scopeKey] = s;
     return s;
+  }
+
+  private ensureDerived(session: SessionMirrorState): SessionDerivedState {
+    if (!session.derived) {
+      session.derived = {
+        digest: { cursor: 0, status: "idle", attempt: 0 },
+        summary: { basedOnCursor: 0, status: "idle" },
+        memory: {
+          extractCursor: 0,
+          appliedCursor: session.lastMemorySyncCount ?? 0,
+          extractStatus: "idle",
+          reconcileStatus: "idle",
+          attempt: 0,
+          pendingCandidates: [],
+        },
+      };
+    }
+    return session.derived;
+  }
+
+  private syncLegacyTaskFields(session: SessionMirrorState): void {
+    const derived = this.ensureDerived(session);
+    session.summaryStatus = derived.summary.status === "complete" ? "complete" : session.finalizedAt ? "pending" : undefined;
+    session.lastMemorySyncCount = derived.memory.appliedCursor;
+  }
+
+  private hasMeaningfulTranscript(session: SessionMirrorState): boolean {
+    return Math.max(session.lastMirroredCount, session.turnCount) >= 2;
+  }
+
+  private needsDigest(session: SessionMirrorState): boolean {
+    if (!this.hasMeaningfulTranscript(session)) return false;
+    const derived = this.ensureDerived(session);
+    return derived.digest.cursor < session.lastMirroredCount;
+  }
+
+  private needsFinalSummary(session: SessionMirrorState): boolean {
+    if (!session.finalizedAt || !this.hasMeaningfulTranscript(session)) return false;
+    const derived = this.ensureDerived(session);
+    return derived.summary.status !== "complete" || derived.summary.basedOnCursor < session.lastMirroredCount;
+  }
+
+  private needsMemoryExtract(session: SessionMirrorState): boolean {
+    if (!this.hasMeaningfulTranscript(session)) return false;
+    const derived = this.ensureDerived(session);
+    return derived.memory.extractCursor < session.lastMirroredCount;
+  }
+
+  private needsMemoryReconcile(session: SessionMirrorState): boolean {
+    if (!this.hasMeaningfulTranscript(session)) return false;
+    const derived = this.ensureDerived(session);
+    return derived.memory.pendingCandidates.length > 0 || derived.memory.appliedCursor < derived.memory.extractCursor;
+  }
+
+  private markPostMirrorTasks(session: SessionMirrorState): void {
+    const derived = this.ensureDerived(session);
+    if (this.needsDigest(session)) derived.digest.status = "pending";
+    if (this.needsMemoryExtract(session)) derived.memory.extractStatus = "pending";
+    if (this.needsMemoryReconcile(session)) derived.memory.reconcileStatus = "pending";
+    this.syncLegacyTaskFields(session);
+  }
+
+  private markSummaryPending(session: SessionMirrorState): void {
+    const derived = this.ensureDerived(session);
+    derived.summary.status = "pending";
+    this.syncLegacyTaskFields(session);
   }
   private resolveTranscriptAgentId(sessionId: string, sessionFile: string): string | null {
     const fromPath = inferAgentIdFromTranscriptPath(sessionFile);
@@ -1621,21 +1701,70 @@ class ClawMemService {
     const session = this.state.sessions[scopeKey];
     if (!session || !this.sessionNeedsMaintenance(session)) return;
     if (!(await this.ensureDefaultRepoConfigured(agentId))) return;
-    const { conv, mem } = this.getServices(agentId);
+    const { conv, mem, client } = this.getServices(agentId);
     const snap = await conv.loadSnapshot(session, []);
     if (!conv.shouldMirror(session.sessionId, snap.messages) || snap.messages.length === 0) return;
     let changed = false;
     let retryNeeded = false;
+    const derived = this.ensureDerived(session);
     if (!session.issueNumber) {
       await conv.ensureIssue(session, snap);
       changed = true;
     }
-    if (session.summaryStatus === "pending") {
+    if (session.issueNumber && snap.messages.length > session.lastMirroredCount) {
+      const next = snap.messages.slice(session.lastMirroredCount);
+      const appended = await conv.appendComments(session.issueNumber, next);
+      if (appended > 0) {
+        session.lastMirroredCount += appended;
+        session.turnCount += appended;
+        this.markPostMirrorTasks(session);
+        changed = true;
+      }
+      if (!session.finalizedAt && session.summaryStatus === "pending" && session.lastMirroredCount >= snap.messages.length) {
+        session.finalizedAt = new Date().toISOString();
+        changed = true;
+      }
+    }
+    const mirroredCount = Math.min(session.lastMirroredCount || snap.messages.length, snap.messages.length);
+    const mirroredSnapshot: TranscriptSnapshot = { ...snap, messages: snap.messages.slice(0, mirroredCount) };
+    if (this.needsDigest(session)) {
+      derived.digest.status = "running";
       try {
-        const result = await conv.generateSummaryAndTitle(session, snap);
-        await conv.syncLabels(session, snap, true);
-        await conv.syncBody(session, snap, result.summary, true, result.title);
-        session.summaryStatus = "complete";
+        const result = await conv.generateRollingDigest(session, mirroredSnapshot, derived.digest.cursor, derived.digest.text);
+        derived.digest.text = result.digest.trim();
+        derived.digest.title = result.title?.trim() || derived.digest.title;
+        derived.digest.cursor = session.lastMirroredCount;
+        derived.digest.status = "complete";
+        derived.digest.attempt = 0;
+        derived.digest.lastError = undefined;
+        derived.digest.updatedAt = new Date().toISOString();
+        if (result.title?.trim() && session.issueNumber) {
+          await client.updateIssue(session.issueNumber, { title: result.title.trim() });
+          session.issueTitle = result.title.trim();
+          session.titleSource = "digest";
+        }
+        changed = true;
+      } catch (error) {
+        derived.digest.status = "error";
+        derived.digest.attempt += 1;
+        derived.digest.lastError = String(error);
+        derived.digest.updatedAt = new Date().toISOString();
+        changed = true;
+        retryNeeded = true;
+        this.warn(`background digest sync for ${session.sessionId}`, error);
+      }
+    }
+    if (this.needsFinalSummary(session) && derived.digest.cursor >= session.lastMirroredCount) {
+      derived.summary.status = "running";
+      try {
+        const result = await conv.generateFinalSummaryFromDigest(session, mirroredSnapshot, derived.digest.text ?? "");
+        await conv.syncLabels(session, mirroredSnapshot, true);
+        await conv.syncBody(session, mirroredSnapshot, result.summary, true, result.title);
+        derived.summary.text = result.summary;
+        derived.summary.status = "complete";
+        derived.summary.basedOnCursor = session.lastMirroredCount;
+        derived.summary.lastError = undefined;
+        derived.summary.updatedAt = new Date().toISOString();
         if (result.title?.trim()) {
           session.issueTitle = result.title.trim();
           session.titleSource = "llm";
@@ -1643,28 +1772,75 @@ class ClawMemService {
         this.maybeAutoNameRepo(agentId, result.summary, result.title);
         changed = true;
       } catch (error) {
+        derived.summary.status = "error";
+        derived.summary.lastError = String(error);
+        derived.summary.updatedAt = new Date().toISOString();
+        changed = true;
         retryNeeded = true;
         this.warn(`background summary sync for ${session.sessionId}`, error);
       }
     }
-    if (session.titleSource !== "llm" && snap.messages.length >= 2) {
+    if (this.needsMemoryExtract(session)) {
+      derived.memory.extractStatus = "running";
       try {
-        await conv.syncTitle(session, snap);
+        const candidates = await mem.extractCandidates(session, mirroredSnapshot, derived.memory.extractCursor, derived.digest.text);
+        derived.memory.pendingCandidates = mergeMemoryCandidates(derived.memory.pendingCandidates, candidates);
+        derived.memory.extractCursor = session.lastMirroredCount;
+        derived.memory.extractStatus = "complete";
+        derived.memory.attempt = 0;
+        derived.memory.lastError = undefined;
+        derived.memory.updatedAt = new Date().toISOString();
+        if (derived.memory.pendingCandidates.length === 0) {
+          derived.memory.appliedCursor = derived.memory.extractCursor;
+          derived.memory.reconcileStatus = "complete";
+        } else {
+          derived.memory.reconcileStatus = "pending";
+        }
         changed = true;
       } catch (error) {
+        derived.memory.extractStatus = "error";
+        derived.memory.attempt += 1;
+        derived.memory.lastError = String(error);
+        derived.memory.updatedAt = new Date().toISOString();
+        changed = true;
         retryNeeded = true;
-        this.warn(`background title sync for ${session.sessionId}`, error);
+        this.warn(`background memory extract for ${session.sessionId}`, error);
       }
     }
-    if (snap.messages.length >= 2 && snap.messages.length > (session.lastMemorySyncCount ?? 0)) {
-      const ok = await mem.syncFromConversation(session, snap);
-      if (ok) {
-        session.lastMemorySyncCount = snap.messages.length;
+    if (this.needsMemoryReconcile(session)) {
+      if (derived.memory.pendingCandidates.length === 0) {
+        derived.memory.appliedCursor = derived.memory.extractCursor;
+        derived.memory.reconcileStatus = "complete";
         changed = true;
       } else {
-        retryNeeded = true;
+        derived.memory.reconcileStatus = "running";
+        try {
+          const decision = await mem.reconcileCandidates(session, derived.memory.pendingCandidates);
+          const { savedCount, staledCount } = await mem.applyReconciledDecision(decision);
+          if (savedCount > 0 || staledCount > 0) {
+            this.api.logger.info?.(
+              `clawmem: synced memories for ${session.sessionId} (saved=${savedCount}, stale=${staledCount})`,
+            );
+          }
+          derived.memory.pendingCandidates = [];
+          derived.memory.appliedCursor = derived.memory.extractCursor;
+          derived.memory.reconcileStatus = "complete";
+          derived.memory.attempt = 0;
+          derived.memory.lastError = undefined;
+          derived.memory.updatedAt = new Date().toISOString();
+          changed = true;
+        } catch (error) {
+          derived.memory.reconcileStatus = "error";
+          derived.memory.attempt += 1;
+          derived.memory.lastError = String(error);
+          derived.memory.updatedAt = new Date().toISOString();
+          changed = true;
+          retryNeeded = true;
+          this.warn(`background memory reconcile for ${session.sessionId}`, error);
+        }
       }
     }
+    this.syncLegacyTaskFields(session);
     if (changed) await this.persistState();
     if (!retryNeeded || !this.sessionNeedsMaintenance(session)) return;
     if (attempt < SESSION_MAINTENANCE_RETRY_DELAYS_MS.length) {
@@ -1681,11 +1857,10 @@ class ClawMemService {
   }
 
   private sessionNeedsMaintenance(session: SessionMirrorState): boolean {
-    if (session.summaryStatus === "pending") return true;
-    const hasMeaningfulTranscript = Math.max(session.lastMirroredCount, session.turnCount) >= 2;
-    if (!hasMeaningfulTranscript) return false;
-    if (session.titleSource !== "llm") return true;
-    return (session.lastMemorySyncCount ?? 0) < session.lastMirroredCount;
+    return this.needsDigest(session)
+      || this.needsFinalSummary(session)
+      || this.needsMemoryExtract(session)
+      || this.needsMemoryReconcile(session);
   }
 
   private getServices(agentId?: string, repo?: string): { route: ClawMemResolvedRoute; conv: ConversationMirror; mem: MemoryStore; client: GitHubIssueClient } {

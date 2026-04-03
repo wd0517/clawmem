@@ -17,7 +17,10 @@ export type ClawMemPluginConfig = {
   memoryRecallLimit: number;
   memoryAutoRecallLimit: number;
   turnCommentDelayMs: number;
+  digestWaitTimeoutMs: number;
   summaryWaitTimeoutMs: number;
+  memoryExtractWaitTimeoutMs: number;
+  memoryReconcileWaitTimeoutMs: number;
 };
 
 export type ClawMemResolvedRoute = {
@@ -32,16 +35,57 @@ export type ClawMemResolvedRoute = {
 export type BootstrapIdentityResponse = { token: string; repo_full_name: string };
 export type AgentRegistrationResponse = BootstrapIdentityResponse & { login: string };
 export type AnonymousSessionResponse = BootstrapIdentityResponse & { owner_login: string; repo_name: string };
+export type SessionTaskStatus = "idle" | "pending" | "running" | "complete" | "error";
+export type MemoryCandidate = {
+  candidateId: string;
+  detail: string;
+  title?: string;
+  kind?: string;
+  topics?: string[];
+  evidence?: string;
+};
+export type SessionDigestState = {
+  cursor: number;
+  status: SessionTaskStatus;
+  attempt: number;
+  text?: string;
+  title?: string;
+  lastError?: string;
+  updatedAt?: string;
+};
+export type SessionSummaryState = {
+  basedOnCursor: number;
+  status: SessionTaskStatus;
+  text?: string;
+  lastError?: string;
+  updatedAt?: string;
+};
+export type SessionMemoryState = {
+  extractCursor: number;
+  appliedCursor: number;
+  extractStatus: SessionTaskStatus;
+  reconcileStatus: SessionTaskStatus;
+  attempt: number;
+  pendingCandidates: MemoryCandidate[];
+  lastError?: string;
+  updatedAt?: string;
+};
+export type SessionDerivedState = {
+  digest: SessionDigestState;
+  summary: SessionSummaryState;
+  memory: SessionMemoryState;
+};
 export type SessionMirrorState = {
   sessionId: string; sessionKey?: string; sessionFile?: string; agentId?: string;
-  issueNumber?: number; issueTitle?: string; titleSource?: "placeholder" | "llm";
+  issueNumber?: number; issueTitle?: string; titleSource?: "placeholder" | "digest" | "llm";
   lastMirroredCount: number; turnCount: number; lastAssistantText?: string;
   lastMemorySyncCount?: number;
   summaryStatus?: "pending" | "complete";
   finalizedAt?: string; lastSummaryHash?: string; lastTurnHash?: string;
+  derived?: SessionDerivedState;
   createdAt?: string; updatedAt?: string;
 };
-export type PluginState = { version: 2; sessions: Record<string, SessionMirrorState>; migrations?: Record<string, string> };
+export type PluginState = { version: 3; sessions: Record<string, SessionMirrorState>; migrations?: Record<string, string> };
 export type NormalizedMessage = { role: string; text: string; toolName?: string; timestamp?: string; stopReason?: string };
 export type TranscriptSnapshot = { sessionId?: string; messages: NormalizedMessage[] };
 export type MemoryDraft = { title?: string; detail: string; kind?: string; topics?: string[] };

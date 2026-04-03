@@ -1,4 +1,4 @@
-import { MemoryStore, scoreMemoryMatch } from "./memory.js";
+import { MemoryStore, mergeMemoryCandidates, scoreMemoryMatch } from "./memory.js";
 import type { ParsedMemoryIssue } from "./types.js";
 import { stringifyFlatYaml } from "./yaml.js";
 
@@ -46,7 +46,10 @@ function testConfig(): never {
     memoryRecallLimit: 5,
     memoryAutoRecallLimit: 3,
     turnCommentDelayMs: 1000,
+    digestWaitTimeoutMs: 30000,
     summaryWaitTimeoutMs: 120000,
+    memoryExtractWaitTimeoutMs: 45000,
+    memoryReconcileWaitTimeoutMs: 45000,
   } as never;
 }
 
@@ -171,6 +174,32 @@ function testCjkScoring(): void {
   const unrelatedScore = scoreMemoryMatch(unrelated, "账单 webhook");
   assert(billingScore > unrelatedScore, "expected Chinese query scoring to prefer the billing memory");
   assert(billingScore > 0, "expected Chinese query to produce a positive match score");
+}
+
+function testMergeMemoryCandidates(): void {
+  const merged = mergeMemoryCandidates(
+    [
+      {
+        candidateId: "abc",
+        detail: "Redis Lua scripts keep rate limiting atomic.",
+        topics: ["redis"],
+      },
+    ],
+    [
+      {
+        candidateId: "abc",
+        detail: "Redis Lua scripts keep rate limiting atomic.",
+        kind: "lesson",
+        topics: ["rate-limit"],
+        evidence: "User confirmed the production path uses Lua.",
+      },
+    ],
+  );
+
+  assert(merged.length === 1, "expected duplicate candidates to merge by candidateId");
+  assert(merged[0]?.kind === "lesson", "expected merged candidates to preserve new schema hints");
+  assert(JSON.stringify(merged[0]?.topics) === JSON.stringify(["rate-limit", "redis"]), "expected merged candidates to union topics");
+  assert(merged[0]?.evidence === "User confirmed the production path uses Lua.", "expected merged candidates to preserve evidence");
 }
 
 async function testStructuredStoreAndSchema(): Promise<void> {
@@ -456,8 +485,9 @@ async function main(): Promise<void> {
   await testBackendSearchPreferredForRecall();
   await testBackendSearchReturnsEmptyWithoutLexicalFallback();
   await testBackendSearchPropagatesErrors();
-  testCjkScoring();
-  await testStructuredStoreAndSchema();
+testCjkScoring();
+testMergeMemoryCandidates();
+await testStructuredStoreAndSchema();
   await testStoreKeepsFullAutoTitleAndSupportsExplicitTitle();
   await testGetAndListMemories();
   await testLegacyMemoriesWithoutSessionOrDate();
