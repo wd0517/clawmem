@@ -1,9 +1,19 @@
 {
   "name": "@clawmem-ai/clawmem",
   "version": "0.1.16",
-  "description": "Mirror OpenClaw sessions into GitHub-compatible issues and comments.",
+  "description": "Repo-backed long-term memory plugin for OpenClaw with auto recall, durable memory capture, and conversation mirroring.",
   "type": "module",
   "license": "MIT",
+  "keywords": [
+    "openclaw",
+    "clawmem",
+    "memory",
+    "long-term-memory",
+    "auto-recall",
+    "conversation-memory",
+    "github-compatible",
+    "plugin"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/clawmem-ai/clawmem-openclaw-plugin.git"
