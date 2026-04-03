@@ -136,7 +136,10 @@ Full config with all options:
             }
           },
           turnCommentDelayMs: 1000,
+          digestWaitTimeoutMs: 30000,
           summaryWaitTimeoutMs: 120000,
+          memoryExtractWaitTimeoutMs: 45000,
+          memoryReconcileWaitTimeoutMs: 45000,
           memoryRecallLimit: 5,
           memoryAutoRecallLimit: 3
         }
@@ -151,11 +154,12 @@ Full config with all options:
 ## Notes
 
 - Conversation comments exclude tool calls, tool results, system messages, and heartbeat noise.
-- Summary failures do not block finalization; the `summary` field is written as `failed: ...`.
+- Finalization now uses a staged pipeline: rolling digest updates during the session, then a final issue summary/title after finalize, plus a separate extract/reconcile memory pipeline.
+- Summary failures do not block finalization; the conversation issue remains finalized with `summary: pending`, and ClawMem retries the final summary through background recovery scheduling.
 - Memory search and auto-recall only return open `type:memory` issues. Closed memory issues are treated as stale.
 - ClawMem automatically injects a small set of relevant memories before each turn using the agent's default repo and the backend recall API. Auto-recall is best-effort and quietly skips injection when backend recall is unavailable.
 - `memory_recall` uses the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`. When backend recall is unavailable, use `memory_list` or `memory_get` to inspect memories explicitly.
-- Durable memories are extracted best-effort during later request-scoped maintenance, not by background subagent work after a request has already ended.
+- Durable memories are captured in two stages after each mirrored turn: extract atomic candidates from new conversation deltas, then reconcile them against existing memories before writing durable updates. If either stage fails, ClawMem retries it through background recovery scheduling rather than the request-start path.
 - The plugin exposes `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
 - Route resolution is now: agent identity supplies credentials, `defaultRepo` is the fallback memory space, and explicit tool calls may override repo per operation.
 - `memory_store` accepts optional schema hints such as kind and topics; the plugin normalizes them into managed `kind:*` and `topic:*` labels.
