@@ -11,6 +11,7 @@ import { loadState, resolveStatePath, saveState } from "./state.js";
 import { readTranscriptSnapshot } from "./transcript.js";
 import type { BootstrapIdentityResponse, ClawMemPluginConfig, ClawMemResolvedRoute, PluginState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { buildAgentBootstrapRegistration, inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
+import { getOpenClawAgentIdFromEnv, getOpenClawHostVersionFromEnv } from "./runtime-env.js";
 
 type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; messages: unknown[] };
 type FinalizePayload = { sessionId?: string; sessionKey?: string; sessionFile?: string; agentId?: string; reason?: string; messages?: unknown[] };
@@ -1699,7 +1700,7 @@ class ClawMemService {
     };
   }
   private resolveToolAgentId(agentId: unknown): string {
-    return normalizeAgentId(typeof agentId === "string" && agentId.trim() ? agentId : process.env.OPENCLAW_AGENT_ID);
+    return normalizeAgentId(typeof agentId === "string" && agentId.trim() ? agentId : getOpenClawAgentIdFromEnv());
   }
   private resolveToolRepo(repo: unknown): { repo?: string; error?: string } {
     if (repo === undefined || repo === null || repo === "") return {};
@@ -1957,13 +1958,8 @@ export function resolvePromptHookMode(api: Pick<OpenClawPluginApi, "runtime">): 
 export function resolveOpenClawHostVersion(api: Pick<OpenClawPluginApi, "runtime">): string | undefined {
   const runtimeVersion = typeof api.runtime?.version === "string" ? api.runtime.version.trim() : "";
   if (isUsableOpenClawVersion(runtimeVersion)) return runtimeVersion;
-  for (const candidate of [
-    process.env.OPENCLAW_VERSION,
-    process.env.OPENCLAW_SERVICE_VERSION,
-  ]) {
-    const trimmed = candidate?.trim();
-    if (isUsableOpenClawVersion(trimmed)) return trimmed;
-  }
+  const envVersion = getOpenClawHostVersionFromEnv();
+  if (isUsableOpenClawVersion(envVersion)) return envVersion;
   return undefined;
 }
 
