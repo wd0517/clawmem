@@ -6,7 +6,7 @@ import { AGENT_LABEL_PREFIX, DEFAULT_LABELS, SESSION_TITLE_PREFIX, extractLabelN
 import type { GitHubIssueClient } from "./github-client.js";
 import { normalizeMessages, readTranscriptSnapshot } from "./transcript.js";
 import type { ClawMemPluginConfig, NormalizedMessage, SessionMirrorState, TranscriptSnapshot } from "./types.js";
-import { fmtTranscript, localDate, localDateTime, sha256, subKey } from "./utils.js";
+import { fmtTranscript, fmtTranscriptFrom, localDate, localDateTime, sha256, sliceTranscriptDelta, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 
 export class ConversationMirror {
@@ -18,6 +18,10 @@ export class ConversationMirror {
     if (first.includes("generate a short 1-2 word filename slug") && first.includes("Reply with ONLY the slug")) return false;
     if (first.includes("Summarize the following conversation.") && first.includes('Return valid JSON only in the form {"summary":"..."}')) return false;
     if (first.includes("Extract durable memories from the conversation below.") && first.includes('Return JSON only in the form {"save":')) return false;
+    if (first.includes("Maintain a rolling digest of the conversation below.") && first.includes('Return valid JSON only in the form {"digest":"...","title":"..."}')) return false;
+    if (first.includes("Write the final issue summary for the conversation below.") && first.includes('Return valid JSON only in the form {"summary":"...","title":"..."}')) return false;
+    if (first.includes("Extract atomic durable memory candidates from the conversation delta below.")) return false;
+    if (first.includes("Reconcile extracted durable memory candidates against existing memories.")) return false;
     return true;
   }
 
@@ -88,6 +92,111 @@ export class ConversationMirror {
       catch (error) { this.api.logger.warn(`clawmem: conversation comment failed: ${String(error)}`); break; }
     }
     return count;
+  }
+
+  async generateRollingDigest(
+    session: SessionMirrorState,
+    snapshot: TranscriptSnapshot,
+    fromCursor: number,
+    previousDigest?: string,
+  ): Promise<{ digest: string; title?: string }> {
+    const { anchorStart, deltaStart, anchorMessages, deltaMessages } = sliceTranscriptDelta(snapshot.messages, fromCursor, 2);
+    if (deltaMessages.length === 0) {
+      return { digest: previousDigest?.trim() || "" };
+    }
+    const subagent = this.api.runtime.subagent;
+    const sessionKey = subKey(session, "digest");
+    const message = [
+      "Maintain a rolling digest of the conversation below.",
+      'Return valid JSON only in the form {"digest":"...","title":"..."}',
+      "Update the digest so it accurately represents the conversation so far in 4-8 concise factual sentences.",
+      "Focus on decisions, constraints, preferences, open workstreams, and concrete outcomes worth carrying forward.",
+      "Use the anchor messages only for context resolution. The new messages are the only part that must be incorporated now.",
+      "Title is optional. If provided, keep it under 50 characters and accurately describe the overall conversation.",
+      "",
+      "<previous-digest>",
+      previousDigest?.trim() || "None.",
+      "</previous-digest>",
+      "",
+      "<anchor-messages>",
+      anchorMessages.length > 0 ? fmtTranscriptFrom(anchorMessages, anchorStart) : "None.",
+      "</anchor-messages>",
+      "",
+      "<new-messages>",
+      fmtTranscriptFrom(deltaMessages, deltaStart),
+      "</new-messages>",
+    ].join("\n");
+    try {
+      const run = await subagent.run({
+        sessionKey,
+        message,
+        deliver: false,
+        lane: "clawmem-digest",
+        idempotencyKey: sha256(`${session.sessionId}:${fromCursor}:${snapshot.messages.length}:digest-v1`),
+        extraSystemPrompt: "You maintain rolling conversation digests for ClawMem. Output JSON only with string fields digest and optional title.",
+      });
+      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.digestWaitTimeoutMs });
+      if (wait.status === "timeout") throw new Error("digest subagent timed out");
+      if (wait.status === "error") throw new Error(wait.error || "digest subagent failed");
+      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
+      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
+      if (!text) throw new Error("digest subagent returned no assistant text");
+      return parseDigestAndTitle(text);
+    } finally {
+      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
+    }
+  }
+
+  async generateFinalSummaryFromDigest(
+    session: SessionMirrorState,
+    snapshot: TranscriptSnapshot,
+    digestText: string,
+  ): Promise<{ summary: string; title?: string }> {
+    if (!digestText.trim() && snapshot.messages.length === 0) throw new Error("no conversation content to summarize");
+    const tailStart = Math.max(0, snapshot.messages.length - 6);
+    const tailMessages = snapshot.messages.slice(tailStart);
+    const subagent = this.api.runtime.subagent;
+    const sessionKey = subKey(session, "summary-final");
+    const message = [
+      "Write the final issue summary for the conversation below.",
+      'Return valid JSON only in the form {"summary":"...","title":"..."}',
+      "The summary should be concise, factual, and written in 2-4 sentences.",
+      "Use the rolling digest as the primary source of truth, and use the recent tail only to preserve freshness and wording accuracy.",
+      "Do not include markdown, bullet points, or analysis.",
+      "",
+      "Title rules:",
+      "- Under 50 characters, accurately describe the main topic or task.",
+      "- Should let someone immediately know what the conversation is about.",
+      "- Must be in the same language as the majority of the conversation content.",
+      "- Good: precise, descriptive, specific. Bad: vague, overly creative, generic.",
+      "",
+      "<rolling-digest>",
+      digestText.trim() || "None.",
+      "</rolling-digest>",
+      "",
+      "<recent-tail>",
+      tailMessages.length > 0 ? fmtTranscriptFrom(tailMessages, tailStart) : "None.",
+      "</recent-tail>",
+    ].join("\n");
+    try {
+      const run = await subagent.run({
+        sessionKey,
+        message,
+        deliver: false,
+        lane: "clawmem-summary",
+        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:summary-final-v1`),
+        extraSystemPrompt: "You write final conversation issue summaries for ClawMem. Output JSON only with string fields summary and title.",
+      });
+      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.summaryWaitTimeoutMs });
+      if (wait.status === "timeout") throw new Error("summary subagent timed out");
+      if (wait.status === "error") throw new Error(wait.error || "summary subagent failed");
+      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
+      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
+      if (!text) throw new Error("summary subagent returned no assistant text");
+      return parseSummaryAndTitle(text);
+    } finally {
+      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
+    }
   }
 
   async generateSummaryAndTitle(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<{ summary: string; title?: string }> {
@@ -365,6 +474,39 @@ function parseSummaryAndTitle(raw: string): { summary: string; title?: string } 
   const f = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(t);
   if (f?.[1]) { const nested = tryParse(f[1].trim()); if (nested) return nested; }
   return { summary: t };
+}
+
+function parseDigestAndTitle(raw: string): { digest: string; title?: string } {
+  const tryParse = (s: string): { digest: string; title?: string } | null => {
+    try {
+      const p = JSON.parse(s) as { digest?: unknown; title?: unknown };
+      const digest = typeof p?.digest === "string" && p.digest.trim() ? p.digest.trim() : null;
+      if (!digest) return null;
+      const title = typeof p?.title === "string" && p.title.trim() ? p.title.trim() : undefined;
+      return { digest, title };
+    } catch {
+      const i = s.indexOf("{"), j = s.lastIndexOf("}");
+      if (i >= 0 && j > i) {
+        try {
+          const p = JSON.parse(s.slice(i, j + 1)) as { digest?: unknown; title?: unknown };
+          const digest = typeof p?.digest === "string" && p.digest.trim() ? p.digest.trim() : null;
+          if (!digest) return null;
+          const title = typeof p?.title === "string" && p.title.trim() ? p.title.trim() : undefined;
+          return { digest, title };
+        } catch { return null; }
+      }
+      return null;
+    }
+  };
+  const t = raw.trim();
+  const direct = tryParse(t);
+  if (direct) return direct;
+  const f = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(t);
+  if (f?.[1]) {
+    const nested = tryParse(f[1].trim());
+    if (nested) return nested;
+  }
+  return { digest: t };
 }
 
 function parseTitle(raw: string): string | undefined {

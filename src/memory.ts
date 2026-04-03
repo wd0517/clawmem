@@ -3,8 +3,8 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { LABEL_MEMORY_STALE, MEMORY_TITLE_PREFIX, extractLabelNames, labelVal } from "./config.js";
 import type { GitHubIssueClient } from "./github-client.js";
 import { normalizeMessages } from "./transcript.js";
-import type { ClawMemPluginConfig, MemoryDraft, MemoryListOptions, MemorySchema, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
-import { fmtTranscript, localDate, sha256, subKey } from "./utils.js";
+import type { ClawMemPluginConfig, MemoryCandidate, MemoryDraft, MemoryListOptions, MemorySchema, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import { fmtTranscript, fmtTranscriptFrom, localDate, sha256, sliceTranscriptDelta, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 import { sanitizeRecallQueryInput } from "./recall-sanitize.js";
 
@@ -12,6 +12,7 @@ type MemoryDecision = { save: MemoryDraft[]; stale: string[] };
 type SearchIndex = { title: string; detail: string; kind?: string; topics: string[] };
 
 const MAX_BACKEND_QUERY_CHARS = 1500;
+const MEMORY_RECONCILE_RECALL_LIMIT = 5;
 
 const RECALL_INJECTED_BLOCKS = [
   /<clawmem-context>[\s\S]*?<\/clawmem-context>/gi,
@@ -163,6 +164,128 @@ export class MemoryStore {
     } catch (error) {
       this.api.logger.warn(`clawmem: memory capture failed: ${String(error)}`);
       return false;
+    }
+  }
+
+  async applyReconciledDecision(decision: { save: MemoryDraft[]; stale: string[] }): Promise<{ savedCount: number; staledCount: number }> {
+    return this.applyDecision(decision);
+  }
+
+  async extractCandidates(
+    session: SessionMirrorState,
+    snapshot: TranscriptSnapshot,
+    fromCursor: number,
+    digestText?: string,
+  ): Promise<MemoryCandidate[]> {
+    const { anchorStart, deltaStart, anchorMessages, deltaMessages } = sliceTranscriptDelta(snapshot.messages, fromCursor, 2);
+    if (deltaMessages.length === 0) return [];
+    const subagent = this.api.runtime.subagent;
+    const sessionKey = subKey(session, "memory-extract");
+    const message = [
+      "Extract atomic durable memory candidates from the conversation delta below.",
+      'Return JSON only in the form {"candidates":[{"title":"...","detail":"...","kind":"...","topics":["..."],"evidence":"..."}]}.',
+      "Only extract durable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
+      "Use the anchor messages and rolling digest only for context resolution. The new messages are the only source that may add new candidates now.",
+      "Each candidate must represent one durable fact. Split independent facts into separate candidates.",
+      "Do not extract temporary requests, tool chatter, startup boilerplate, or summaries about internal helper sessions.",
+      "Kind and topics are optional. Keep them short, reusable, and low-cardinality.",
+      "Evidence is optional. If present, keep it short and quote-free.",
+      "Prefer an empty candidates array when nothing durable was added.",
+      "",
+      "<rolling-digest>",
+      digestText?.trim() || "None.",
+      "</rolling-digest>",
+      "",
+      "<anchor-messages>",
+      anchorMessages.length > 0 ? fmtTranscriptFrom(anchorMessages, anchorStart) : "None.",
+      "</anchor-messages>",
+      "",
+      "<new-messages>",
+      fmtTranscriptFrom(deltaMessages, deltaStart),
+      "</new-messages>",
+    ].join("\n");
+    try {
+      const run = await subagent.run({
+        sessionKey,
+        message,
+        deliver: false,
+        lane: "clawmem-memory-extract",
+        idempotencyKey: sha256(`${session.sessionId}:${fromCursor}:${snapshot.messages.length}:memory-extract-v1`),
+        extraSystemPrompt: "You extract atomic durable memory candidates for ClawMem. Output JSON only with an array field candidates.",
+      });
+      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.memoryExtractWaitTimeoutMs });
+      if (wait.status === "timeout") throw new Error("memory extraction subagent timed out");
+      if (wait.status === "error") throw new Error(wait.error || "memory extraction subagent failed");
+      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
+      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
+      if (!text) throw new Error("memory extraction subagent returned no assistant text");
+      return parseCandidates(text);
+    } finally {
+      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
+    }
+  }
+
+  async reconcileCandidates(session: SessionMirrorState, candidates: MemoryCandidate[]): Promise<MemoryDecision> {
+    const pending = mergeMemoryCandidates([], candidates);
+    if (pending.length === 0) return { save: [], stale: [] };
+    const existingByCandidate = await Promise.all(pending.map(async (candidate) => ({
+      candidate,
+      matches: await this.searchViaBackend(candidate.detail, MEMORY_RECONCILE_RECALL_LIMIT),
+    })));
+    const candidateBlock = pending.map((candidate) => [
+      `[${candidate.candidateId}] ${candidate.title ? `${candidate.title} | ` : ""}${candidate.detail}`,
+      ...(candidate.kind ? [`kind=${candidate.kind}`] : []),
+      ...(candidate.topics && candidate.topics.length > 0 ? [`topics=${candidate.topics.join(", ")}`] : []),
+      ...(candidate.evidence ? [`evidence=${candidate.evidence}`] : []),
+    ].join("\n")).join("\n\n");
+    const existingBlock = existingByCandidate.map(({ candidate, matches }) => {
+      const lines = matches.length > 0
+        ? matches.map((memory) => {
+            const schema = [memory.kind ? `kind=${memory.kind}` : "", ...(memory.topics ?? []).map((topic) => `topic=${topic}`)]
+              .filter(Boolean)
+              .join(", ");
+            return `- [${memory.memoryId}] ${schema ? `${schema} | ` : ""}${memory.detail}`;
+          })
+        : ["- None."];
+      return [`Candidate [${candidate.candidateId}] matches:`, ...lines].join("\n");
+    }).join("\n\n");
+    const subagent = this.api.runtime.subagent;
+    const sessionKey = subKey(session, "memory-reconcile");
+    const message = [
+      "Reconcile extracted durable memory candidates against existing memories.",
+      'Return JSON only in the form {"save":[{"title":"...","detail":"...","kind":"...","topics":["..."]}],"stale":["memory-id"]}.',
+      "Use save only for candidates that should become durable memories after comparing them with existing memories.",
+      "If a candidate is already fully covered by an existing memory, omit it from save.",
+      "Use stale only when a candidate clearly supersedes or invalidates an existing memory.",
+      "Do not stale memories just because they overlap or are related. Prefer keeping both when they can coexist.",
+      "Keep each save item atomic and durable.",
+      "",
+      "<candidates>",
+      candidateBlock,
+      "</candidates>",
+      "",
+      "<matching-existing-memories>",
+      existingBlock,
+      "</matching-existing-memories>",
+    ].join("\n");
+    try {
+      const run = await subagent.run({
+        sessionKey,
+        message,
+        deliver: false,
+        lane: "clawmem-memory-reconcile",
+        idempotencyKey: sha256(`${session.sessionId}:${pending.map((candidate) => candidate.candidateId).join(",")}:memory-reconcile-v1`),
+        extraSystemPrompt: "You reconcile extracted durable memory candidates for ClawMem. Output JSON only with save memory drafts and stale memory ids.",
+      });
+      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.memoryReconcileWaitTimeoutMs });
+      if (wait.status === "timeout") throw new Error("memory reconcile subagent timed out");
+      if (wait.status === "error") throw new Error(wait.error || "memory reconcile subagent failed");
+      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
+      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
+      if (!text) throw new Error("memory reconcile subagent returned no assistant text");
+      return parseDecision(text);
+    } finally {
+      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
     }
   }
 
@@ -531,6 +654,29 @@ function parseDecision(raw: string): MemoryDecision {
   })();
 }
 
+function parseCandidates(raw: string): MemoryCandidate[] {
+  const tryParse = (s: string): MemoryCandidate[] | null => {
+    try {
+      const payload = JSON.parse(s) as Record<string, unknown>;
+      const candidates = Array.isArray(payload.candidates)
+        ? payload.candidates.map(parseCandidateItem).filter((candidate): candidate is MemoryCandidate => Boolean(candidate))
+        : [];
+      return mergeMemoryCandidates([], candidates);
+    } catch {
+      return null;
+    }
+  };
+  const trimmed = raw.trim();
+  const direct = tryParse(trimmed);
+  if (direct) return direct;
+  const fenced = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(trimmed);
+  if (fenced?.[1]) {
+    const nested = tryParse(fenced[1].trim());
+    if (nested) return nested;
+  }
+  throw new Error("memory extraction subagent returned invalid JSON");
+}
+
 function parseSaveItem(value: unknown): MemoryDraft | null {
   if (typeof value === "string") {
     const detail = norm(value);
@@ -548,4 +694,62 @@ function parseSaveItem(value: unknown): MemoryDraft | null {
   } catch {
     return null;
   }
+}
+
+function parseCandidateItem(value: unknown): MemoryCandidate | null {
+  if (typeof value === "string") {
+    const detail = norm(value);
+    return detail ? { candidateId: sha256(detail), detail } : null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const detail = typeof record.detail === "string" ? norm(record.detail) : "";
+  if (!detail) return null;
+  const title = typeof record.title === "string" ? record.title : undefined;
+  const kind = typeof record.kind === "string" ? record.kind : undefined;
+  const topics = Array.isArray(record.topics) ? record.topics.filter((topic): topic is string => typeof topic === "string") : undefined;
+  const evidence = typeof record.evidence === "string" ? norm(record.evidence) : undefined;
+  try {
+    const draft = normalizeDraft({
+      ...(title ? { title } : {}),
+      detail,
+      ...(kind ? { kind } : {}),
+      ...(topics ? { topics } : {}),
+    });
+    return {
+      candidateId: sha256(draft.detail),
+      detail: draft.detail,
+      ...(draft.title ? { title: draft.title } : {}),
+      ...(draft.kind ? { kind: draft.kind } : {}),
+      ...(draft.topics ? { topics: draft.topics } : {}),
+      ...(evidence ? { evidence } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function mergeMemoryCandidates(base: MemoryCandidate[], next: MemoryCandidate[]): MemoryCandidate[] {
+  const out = new Map<string, MemoryCandidate>();
+  for (const candidate of [...base, ...next]) {
+    const existing = out.get(candidate.candidateId);
+    if (!existing) {
+      out.set(candidate.candidateId, {
+        ...candidate,
+        ...(candidate.topics ? { topics: uniqueNormalized(candidate.topics) } : {}),
+      });
+      continue;
+    }
+    out.set(candidate.candidateId, {
+      candidateId: candidate.candidateId,
+      detail: candidate.detail || existing.detail,
+      ...(candidate.title || existing.title ? { title: candidate.title || existing.title } : {}),
+      ...(candidate.kind || existing.kind ? { kind: candidate.kind || existing.kind } : {}),
+      ...((candidate.topics || existing.topics)
+        ? { topics: uniqueNormalized([...(existing.topics ?? []), ...(candidate.topics ?? [])]) }
+        : {}),
+      ...(candidate.evidence || existing.evidence ? { evidence: candidate.evidence || existing.evidence } : {}),
+    });
+  }
+  return [...out.values()];
 }

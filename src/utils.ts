@@ -46,6 +46,25 @@ export function fmtTranscript(msgs: NormalizedMessage[]): string {
   return msgs.map((m, i) => `${i + 1}. ${m.role === "assistant" ? "assistant" : "user"}: ${m.text}`).join("\n\n");
 }
 
+export function fmtTranscriptFrom(msgs: NormalizedMessage[], startIndex: number): string {
+  return msgs.map((m, i) => `${startIndex + i + 1}. ${m.role === "assistant" ? "assistant" : "user"}: ${m.text}`).join("\n\n");
+}
+
+export function sliceTranscriptDelta(
+  msgs: NormalizedMessage[],
+  fromIndex: number,
+  anchorCount = 2,
+): { anchorStart: number; deltaStart: number; anchorMessages: NormalizedMessage[]; deltaMessages: NormalizedMessage[] } {
+  const deltaStart = Math.min(Math.max(0, Math.floor(fromIndex)), msgs.length);
+  const anchorStart = Math.max(0, deltaStart - Math.max(0, Math.floor(anchorCount)));
+  return {
+    anchorStart,
+    deltaStart,
+    anchorMessages: msgs.slice(anchorStart, deltaStart),
+    deltaMessages: msgs.slice(deltaStart),
+  };
+}
+
 export function localDate(d: Date = new Date()): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
