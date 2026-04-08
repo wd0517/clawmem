@@ -4,7 +4,7 @@ import { LABEL_MEMORY_STALE, MEMORY_TITLE_PREFIX, extractLabelNames, labelVal } 
 import type { GitHubIssueClient } from "./github-client.js";
 import { normalizeMessages } from "./transcript.js";
 import type { ClawMemPluginConfig, MemoryCandidate, MemoryDraft, MemoryListOptions, MemorySchema, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
-import { fmtTranscript, fmtTranscriptFrom, localDate, sha256, sliceTranscriptDelta, subKey } from "./utils.js";
+import { fmtTranscriptFrom, localDate, sha256, sliceTranscriptDelta, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 import { sanitizeRecallQueryInput } from "./recall-sanitize.js";
 
@@ -49,17 +49,13 @@ export class MemoryStore {
       }
       if (batch.length < 100) break;
     }
-    for (const memory of await this.listByStatus("all")) {
-      if (memory.kind) kinds.add(memory.kind);
-      for (const topic of memory.topics ?? []) topics.add(topic);
-    }
     return { kinds: [...kinds].sort(), topics: [...topics].sort() };
   }
 
   async get(memoryId: string, status: "active" | "stale" | "all" = "all"): Promise<ParsedMemoryIssue | null> {
     const id = memoryId.trim();
     if (!id) throw new Error("memoryId is empty");
-    return (await this.listByStatus(status)).find((m) => m.memoryId === id || String(m.issueNumber) === id) ?? null;
+    return this.findByRef(id, status);
   }
 
   async listMemories(options: MemoryListOptions = {}): Promise<ParsedMemoryIssue[]> {
@@ -67,22 +63,28 @@ export class MemoryStore {
     const kind = normalizeOptionalLabelValue(options.kind, "kind:");
     const topic = normalizeOptionalLabelValue(options.topic, "topic:");
     const limit = Math.min(200, Math.max(1, options.limit ?? 20));
-    return (await this.listByStatus(status))
-      .filter((memory) => {
-        if (kind && memory.kind !== kind) return false;
-        if (topic && !(memory.topics ?? []).includes(topic)) return false;
-        return true;
-      })
-      .sort((a, b) => b.issueNumber - a.issueNumber)
-      .slice(0, limit);
+    const labels = ["type:memory", ...(kind ? [`kind:${kind}`] : []), ...(topic ? [`topic:${topic}`] : [])];
+    const state = status === "active" ? "open" : "all";
+    const out: ParsedMemoryIssue[] = [];
+    for (let page = 1; page <= 20 && out.length < limit; page++) {
+      const batch = await this.client.listIssues({ labels, state, page, perPage: Math.min(100, limit) });
+      for (const issue of batch) {
+        const memory = this.parseIssue(issue);
+        if (!memory) continue;
+        if (status !== "all" && memory.status !== status) continue;
+        out.push(memory);
+        if (out.length >= limit) break;
+      }
+      if (batch.length < Math.min(100, limit)) break;
+    }
+    return out.sort((a, b) => b.issueNumber - a.issueNumber).slice(0, limit);
   }
 
   async store(draft: MemoryDraft): Promise<{ created: boolean; memory: ParsedMemoryIssue }> {
     const normalized = normalizeDraft(draft);
     const detail = norm(normalized.detail);
-    const allActive = await this.listByStatus("active");
     const hash = sha256(detail);
-    const existing = allActive.find((m) => (m.memoryHash || sha256(norm(m.detail))) === hash);
+    const existing = await this.findActiveByHash(hash);
     if (existing) {
       const memory = await this.mergeSchema(existing, normalized);
       return { created: false, memory };
@@ -124,11 +126,12 @@ export class MemoryStore {
       ? uniqueNormalized(patch.topics.map((topic) => normalizeLabelValue(topic, "topic:")).filter(Boolean) as string[])
       : uniqueNormalized(current.topics ?? []);
     const nextHash = sha256(nextDetail);
-    const duplicate = (await this.listByStatus("active")).find((memory) => {
-      if (memory.issueNumber === current.issueNumber) return false;
-      return (memory.memoryHash || sha256(norm(memory.detail))) === nextHash;
-    });
-    if (duplicate) throw new Error(`another active memory already stores this detail as [${duplicate.memoryId}]`);
+    const duplicate = await this.findActiveByHash(nextHash);
+    if (duplicate?.issueNumber === current.issueNumber) {
+      // Updating schema/title without changing the underlying detail is always safe.
+    } else if (duplicate) {
+      throw new Error(`another active memory already stores this detail as [${duplicate.memoryId}]`);
+    }
     const nextBody = renderMemoryBody(nextDetail, nextHash, current.date);
     const nextLabels = memLabels(nextKind, nextTopics);
     await this.client.ensureLabels(nextLabels);
@@ -152,19 +155,6 @@ export class MemoryStore {
     await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.kind, mem.topics));
     await this.client.updateIssue(mem.issueNumber, { state: "closed" });
     return { ...mem, status: "stale" };
-  }
-
-  async syncFromConversation(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<boolean> {
-    try {
-      const decision = await this.generateDecision(session, snapshot);
-      const { savedCount, staledCount } = await this.applyDecision(decision);
-      if (savedCount > 0 || staledCount > 0)
-        this.api.logger.info?.(`clawmem: synced memories for ${session.sessionId} (saved=${savedCount}, stale=${staledCount})`);
-      return true;
-    } catch (error) {
-      this.api.logger.warn(`clawmem: memory capture failed: ${String(error)}`);
-      return false;
-    }
   }
 
   async applyReconciledDecision(decision: { save: MemoryDraft[]; stale: string[] }): Promise<{ savedCount: number; staledCount: number }> {
@@ -289,23 +279,6 @@ export class MemoryStore {
     }
   }
 
-  private async listByStatus(status: "active" | "stale" | "all"): Promise<ParsedMemoryIssue[]> {
-    const labels = ["type:memory"];
-    const state = status === "active" ? "open" : "all";
-    const out: ParsedMemoryIssue[] = [];
-    for (let page = 1; page <= 20; page++) {
-      const batch = await this.client.listIssues({ labels, state, page, perPage: 100 });
-      for (const issue of batch) {
-        const parsed = this.parseIssue(issue);
-        if (!parsed) continue;
-        if (status !== "all" && parsed.status !== status) continue;
-        out.push(parsed);
-      }
-      if (batch.length < 100) break;
-    }
-    return out;
-  }
-
   private async searchViaBackend(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const repo = this.client.repo();
     if (!repo) throw new Error("ClawMem memory recall requires a configured repo.");
@@ -315,6 +288,46 @@ export class MemoryStore {
       .map((issue) => this.parseIssue(issue))
       .filter((memory): memory is ParsedMemoryIssue => memory !== null && memory.status === "active")
       .slice(0, limit);
+  }
+
+  private async findActiveByHash(hash: string): Promise<ParsedMemoryIssue | null> {
+    const repo = this.client.repo?.();
+    if (!repo) return null;
+    const query = buildMemoryHashSearchQuery(hash, repo);
+    const batch = await this.client.searchIssues(query, { perPage: 10 });
+    return batch
+      .map((issue) => this.parseIssue(issue))
+      .find((memory): memory is ParsedMemoryIssue =>
+        memory !== null && memory.status === "active" && (memory.memoryHash || sha256(norm(memory.detail))) === hash,
+      ) ?? null;
+  }
+
+  private async findByRef(id: string, status: "active" | "stale" | "all"): Promise<ParsedMemoryIssue | null> {
+    const trimmed = id.trim();
+    if (!trimmed) return null;
+    if (/^\d+$/.test(trimmed)) {
+      try {
+        const issue = await this.client.getIssue(Number(trimmed));
+        const parsed = this.parseIssue(issue);
+        if (!parsed) return null;
+        if (status !== "all" && parsed.status !== status) return null;
+        return parsed;
+      } catch {
+        // Fall through to memory-id search for nonstandard repos that expose custom memory ids.
+      }
+    }
+    const repo = this.client.repo?.();
+    if (!repo) return null;
+    const batch = await this.client.searchIssues(buildMemoryRefSearchQuery(trimmed, repo, status), { perPage: 10 });
+    return batch
+      .map((issue) => this.parseIssue(issue))
+      .find((memory): memory is ParsedMemoryIssue =>
+        memory !== null && (status === "all" || memory.status === status) && (memory.memoryId === trimmed || String(memory.issueNumber) === trimmed),
+      ) ?? null;
+  }
+
+  private async findActiveByRef(id: string): Promise<ParsedMemoryIssue | null> {
+    return this.findByRef(id, "active");
   }
 
   private parseIssue(issue: { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> }): ParsedMemoryIssue | null {
@@ -341,16 +354,19 @@ export class MemoryStore {
   }
 
   private async applyDecision(decision: MemoryDecision): Promise<{ savedCount: number; staledCount: number }> {
-    const allActive = await this.listByStatus("active");
-    const activeById = new Map(allActive.map((m) => [m.memoryId, m]));
-    const activeByHash = new Map(allActive.map((m) => [m.memoryHash || sha256(norm(m.detail)), m]));
+    const activeByHash = new Map<string, ParsedMemoryIssue | null>();
+    const activeById = new Map<string, ParsedMemoryIssue | null>();
     let savedCount = 0;
     for (const raw of decision.save) {
       const draft = normalizeDraft(raw);
       const detail = norm(draft.detail);
       if (!detail) continue;
       const hash = sha256(detail);
-      const existing = activeByHash.get(hash);
+      let existing = activeByHash.get(hash);
+      if (existing === undefined) {
+        existing = await this.findActiveByHash(hash);
+        activeByHash.set(hash, existing);
+      }
       if (existing) {
         const merged = await this.mergeSchema(existing, draft);
         activeByHash.set(hash, merged);
@@ -377,64 +393,17 @@ export class MemoryStore {
     }
     let staledCount = 0;
     for (const id of [...new Set(decision.stale.map((s) => s.trim()).filter(Boolean))]) {
-      const mem = activeById.get(id);
+      let mem = activeById.get(id);
+      if (mem === undefined) {
+        mem = await this.findActiveByRef(id);
+        activeById.set(id, mem);
+      }
       if (!mem) continue;
       await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.kind, mem.topics));
       await this.client.updateIssue(mem.issueNumber, { state: "closed" });
       staledCount++;
     }
     return { savedCount, staledCount };
-  }
-
-  private async generateDecision(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<MemoryDecision> {
-    if (snapshot.messages.length === 0) return { save: [], stale: [] };
-    const recent = (await this.listByStatus("active")).sort((a, b) => b.issueNumber - a.issueNumber).slice(0, 20);
-    const existingBlock = recent.length === 0 ? "None." : recent.map((m) => {
-      const schema = [m.kind ? `kind=${m.kind}` : "", ...(m.topics ?? []).map((topic) => `topic=${topic}`)].filter(Boolean).join(", ");
-      return `[${m.memoryId}] ${schema ? `${schema} | ` : ""}${m.detail}`;
-    }).join("\n");
-    const schema = await this.listSchema();
-    const schemaBlock = [
-      `Existing kinds: ${schema.kinds.length > 0 ? schema.kinds.join(", ") : "None."}`,
-      `Existing topics: ${schema.topics.length > 0 ? schema.topics.join(", ") : "None."}`,
-    ].join("\n");
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = subKey(session, "memory");
-    const message = [
-      "Extract durable memories from the conversation below.",
-      'Return JSON only in the form {"save":[{"title":"...","detail":"...","kind":"...","topics":["..."]}],"stale":["memory-id"]}.',
-      "Each save item must contain one durable fact. If a turn contains several independent facts, save them separately instead of bundling them into one summary memory.",
-      "Use save for stable, reusable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
-      "Title is optional. If you provide one, make it concise and human-readable.",
-      "Use stale for existing memory IDs only when the conversation clearly supersedes or invalidates them.",
-      "Infer kind and topics when they would help future retrieval. Reuse existing kinds and topics when possible.",
-      "If no existing kind fits, you may propose a new short kind label. Keep kinds concise and reusable.",
-      "Topics should be short reusable tags, not sentences. Prefer 0-3 topics per memory.",
-      "Do not save temporary requests, startup boilerplate, tool chatter, summaries about internal helper sessions, or one-off operational details.",
-      "Prefer empty arrays when nothing durable should be remembered.",
-      "", "<existing-schema>", schemaBlock, "</existing-schema>",
-      "", "<existing-active-memories>", existingBlock, "</existing-active-memories>",
-      "", "<conversation>", fmtTranscript(snapshot.messages), "</conversation>",
-    ].join("\n");
-    try {
-      const run = await subagent.run({
-        sessionKey,
-        message,
-        deliver: false,
-        lane: "clawmem-memory",
-        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:memory-decision`),
-        extraSystemPrompt: "You extract durable memory updates from OpenClaw conversations. Output JSON only with save objects containing detail, optional title, optional kind, and optional topics, plus stale string ids. Keep each save item to one durable fact.",
-      });
-      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.summaryWaitTimeoutMs });
-      if (wait.status === "timeout") throw new Error("memory decision subagent timed out");
-      if (wait.status === "error") throw new Error(wait.error || "memory decision subagent failed");
-      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
-      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!text) throw new Error("memory decision subagent returned no assistant text");
-      return parseDecision(text);
-    } finally {
-      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
-    }
   }
 
   private async mergeSchema(memory: ParsedMemoryIssue, draft: MemoryDraft): Promise<ParsedMemoryIssue> {
@@ -539,6 +508,21 @@ function overlapRatio(left: Set<string>, right: Set<string>): number {
 
 function buildMemorySearchQuery(query: string, repo: string): string {
   const parts = [buildRecallSearchText(query), `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].filter(Boolean);
+  return parts.join(" ");
+}
+
+function buildMemoryHashSearchQuery(hash: string, repo: string): string {
+  const needle = hash.trim();
+  if (!needle) return "";
+  return [`"${needle}"`, `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].join(" ");
+}
+
+function buildMemoryRefSearchQuery(memoryId: string, repo: string, status: "active" | "stale" | "all"): string {
+  const needle = memoryId.trim();
+  if (!needle) return "";
+  const parts = [`"${needle}"`, `repo:${repo}`, "is:issue", 'label:"type:memory"'];
+  if (status === "active") parts.push("state:open");
+  if (status === "stale") parts.push("state:closed");
   return parts.join(" ");
 }
 
