@@ -508,6 +508,147 @@ class ClawMemService {
     });
 
     this.api.registerTool({
+      name: "collaboration_org_members",
+      description: "List visible members in an organization, optionally filtering to admins only.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          role: { type: "string", enum: ["admin"], description: "Optional role filter. Use admin to show org owners only." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        if (!org) return toolText("org is empty.");
+        const role = p.role === "admin" ? "admin" : undefined;
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const members = await resolved.client.listOrgMembers(org, role);
+          if (members.length === 0) {
+            return toolText(role === "admin"
+              ? `No org admins are visible in "${org}".`
+              : `No org members are visible in "${org}".`);
+          }
+          return toolText([
+            role === "admin" ? `Org admins in "${org}":` : `Org members in "${org}":`,
+            ...members.map((member) => `- ${renderCollaboratorLine(member)}`),
+          ].join("\n"));
+        } catch (error) {
+          return toolText(`Unable to list members for org "${org}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_org_membership",
+      description: "Inspect one user's organization membership state, including active versus pending invitation state.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          username: { type: "string", minLength: 1, description: "Username to inspect." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "username"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const username = typeof p.username === "string" ? p.username.trim() : "";
+        if (!org || !username) return toolText("org and username are required.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const membership = await resolved.client.getOrgMembership(org, username);
+          return toolText(`Organization membership in "${org}":\n- ${renderOrganizationMembershipLine(membership)}`);
+        } catch (error) {
+          if (isHttpStatusError(error, 404)) {
+            return toolText(`No active or pending organization membership was found for ${username} in "${org}".`);
+          }
+          return toolText(`Unable to inspect organization membership for ${username} in "${org}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_org_member_remove",
+      description: "Remove an active organization member. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          username: { type: "string", minLength: 1, description: "Active org member to remove." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "username"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "remove an organization member");
+        if (blocked) return toolText(blocked);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const username = typeof p.username === "string" ? p.username.trim() : "";
+        if (!org || !username) return toolText("org and username are required.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          await resolved.client.removeOrgMember(org, username);
+          return toolText(`Removed active organization member ${username} from "${org}". Server-side org-scoped team memberships were cleaned up as part of the removal.`);
+        } catch (error) {
+          return toolText(`Unable to remove ${username} from org "${org}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_org_membership_remove",
+      description: "Remove an active organization membership or revoke a pending org invitation for that user. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          username: { type: "string", minLength: 1, description: "Username whose active membership or pending invite should be removed." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "username"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "remove an organization membership");
+        if (blocked) return toolText(blocked);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const username = typeof p.username === "string" ? p.username.trim() : "";
+        if (!org || !username) return toolText("org and username are required.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          await resolved.client.removeOrgMembership(org, username);
+          return toolText(`Removed organization membership state for ${username} in "${org}". This deletes an active membership or revokes a pending org invitation, depending on current state.`);
+        } catch (error) {
+          return toolText(`Unable to remove organization membership state for ${username} in "${org}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
       name: "collaboration_teams",
       description: "List teams in an organization before granting repo access or managing membership.",
       required: true,
@@ -536,6 +677,37 @@ class ClawMemService {
           ].join("\n"));
         } catch (error) {
           return toolText(`Unable to list teams for org "${org}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_team",
+      description: "Inspect one organization team by slug.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          teamSlug: { type: "string", minLength: 1, description: "Team slug." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "teamSlug"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
+        if (!org || !teamSlug) return toolText("org and teamSlug are required.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const team = await resolved.client.getTeam(org, teamSlug);
+          return toolText(`Team in "${org}":\n- ${renderTeamLine(team)}`);
+        } catch (error) {
+          return toolText(`Unable to inspect team ${org}/${teamSlug}: ${String(error)}`);
         }
       },
     });
@@ -577,6 +749,122 @@ class ClawMemService {
           return toolText(`Created team in "${org}": ${renderTeamLine(team)}.`);
         } catch (error) {
           return toolText(`Unable to create team "${name}" in org "${org}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_team_update",
+      description: "Update a team's name, description, or privacy. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          teamSlug: { type: "string", minLength: 1, description: "Current team slug." },
+          name: { type: "string", minLength: 1, description: "Optional new team display name." },
+          description: { type: "string", minLength: 1, description: "Optional new team description." },
+          privacy: { type: "string", enum: ["closed", "secret"], description: "Optional team privacy." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "teamSlug"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "update a team");
+        if (blocked) return toolText(blocked);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
+        if (!org || !teamSlug) return toolText("org and teamSlug are required.");
+        const name = typeof p.name === "string" && p.name.trim() ? p.name.trim() : undefined;
+        const description = typeof p.description === "string" && p.description.trim() ? p.description.trim() : undefined;
+        const privacy = p.privacy === "secret" ? "secret" : p.privacy === "closed" ? "closed" : undefined;
+        if (!name && !description && !privacy) {
+          return toolText("Provide at least one of name, description, or privacy when updating a team.");
+        }
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const updated = await resolved.client.updateTeam(org, teamSlug, {
+            ...(name ? { name } : {}),
+            ...(description ? { description } : {}),
+            ...(privacy ? { privacy } : {}),
+          });
+          return toolText(`Updated team in "${org}": ${renderTeamLine(updated)}.`);
+        } catch (error) {
+          return toolText(`Unable to update team ${org}/${teamSlug}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_team_delete",
+      description: "Delete a team. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          teamSlug: { type: "string", minLength: 1, description: "Team slug." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "teamSlug"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "delete a team");
+        if (blocked) return toolText(blocked);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
+        if (!org || !teamSlug) return toolText("org and teamSlug are required.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          await resolved.client.deleteTeam(org, teamSlug);
+          return toolText(`Deleted team ${org}/${teamSlug}.`);
+        } catch (error) {
+          return toolText(`Unable to delete team ${org}/${teamSlug}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_team_members",
+      description: "List members of an organization team.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          teamSlug: { type: "string", minLength: 1, description: "Team slug." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "teamSlug"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
+        if (!org || !teamSlug) return toolText("org and teamSlug are required.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const members = await resolved.client.listTeamMembers(org, teamSlug);
+          if (members.length === 0) return toolText(`No members found in ${org}/${teamSlug}.`);
+          return toolText([
+            `Members of ${org}/${teamSlug}:`,
+            ...members.map((member) => `- ${renderCollaboratorLine(member)}`),
+          ].join("\n"));
+        } catch (error) {
+          return toolText(`Unable to list members for ${org}/${teamSlug}: ${String(error)}`);
         }
       },
     });
@@ -759,6 +1047,40 @@ class ClawMemService {
           return toolText(`Removed team grant ${org}/${teamSlug} from ${target.fullName}.`);
         } catch (error) {
           return toolText(`Unable to remove ${org}/${teamSlug} from ${target.fullName}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_repo_transfer",
+      description: "Transfer a repository to a new owner, commonly used to move a personal memory repo into an existing org. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          repo: { type: "string", minLength: 3, description: "Optional source repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          newOwner: { type: "string", minLength: 1, description: "Destination owner login, often an organization login." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["newOwner"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "transfer a repository");
+        if (blocked) return toolText(blocked);
+        const newOwner = typeof p.newOwner === "string" ? p.newOwner.trim() : "";
+        if (!newOwner) return toolText("newOwner is empty.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const target = await this.requireCollaborationRepo(agentId, p.repo);
+        if ("error" in target) return toolText(target.error);
+        try {
+          const transferred = await target.client.transferRepo(target.owner, target.repo, newOwner);
+          const nextFullName = repoSummaryFullName(transferred) || `${newOwner}/${target.repo}`;
+          return toolText(`Transferred ${target.fullName} to ${nextFullName}. If this repo was your configured defaultRepo, retarget future memory operations to ${nextFullName} explicitly until config is updated.`);
+        } catch (error) {
+          return toolText(`Unable to transfer ${target.fullName} to ${newOwner}: ${String(error)}`);
         }
       },
     });
@@ -1089,6 +1411,41 @@ class ClawMemService {
     });
 
     this.api.registerTool({
+      name: "collaboration_org_invitation_revoke",
+      description: "Revoke a pending organization invitation from the org side. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          invitationId: { type: "integer", minimum: 1, description: "Pending organization invitation id." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "invitationId"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "revoke an organization invitation");
+        if (blocked) return toolText(blocked);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        if (!org) return toolText("org is empty.");
+        const invitationId = this.resolvePositiveInteger(p.invitationId, "invitationId");
+        if ("error" in invitationId) return toolText(invitationId.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          await resolved.client.revokeOrgInvitation(org, invitationId.value);
+          return toolText(`Revoked organization invitation ${invitationId.value} in "${org}".`);
+        } catch (error) {
+          return toolText(`Unable to revoke organization invitation ${invitationId.value} in "${org}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
       name: "collaboration_user_org_invitations",
       description: "List pending organization invitations for the current ClawMem identity before concluding that no shared org access is available.",
       required: true,
@@ -1234,6 +1591,7 @@ class ClawMemService {
         additionalProperties: false,
         properties: {
           repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          username: { type: "string", minLength: 1, description: "Optional username to inspect for org-level base permission and membership state on org-owned repos." },
           agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
         },
       },
@@ -1246,7 +1604,10 @@ class ClawMemService {
         try {
           const lines = [`Repo access inspection for ${target.fullName}:`];
           const notes: string[] = [];
+          const username = typeof p.username === "string" ? p.username.trim() : "";
           let orgName: string | undefined;
+          let orgDefaultPermission: "none" | CollaborationPermission | undefined;
+          let orgContextAvailable = false;
 
           try {
             const repo = await target.client.getRepo(target.owner, target.repo);
@@ -1259,10 +1620,47 @@ class ClawMemService {
           }
 
           try {
-            const org = await target.client.getOrg(orgName);
-            lines.push(`- Org default repository permission: ${org.default_repository_permission?.trim() || "unknown"}`);
+            const ownerOrg = orgName || target.owner;
+            const org = await target.client.getOrg(ownerOrg);
+            orgContextAvailable = true;
+            orgDefaultPermission = normalizePermissionAlias(org.default_repository_permission);
+            lines.push(`- Org default repository permission: ${orgDefaultPermission || "unknown"}`);
           } catch (error) {
             notes.push(`Org metadata unavailable for "${orgName}": ${String(error)}`);
+          }
+
+          if (username) {
+            lines.push("");
+            lines.push(`Org membership for "${username}" in "${orgName}":`);
+            if (!orgName || !orgContextAvailable) {
+              lines.push("- Not applicable because the owner org could not be resolved.");
+            } else {
+              try {
+                const membership = await target.client.getOrgMembership(orgName, username);
+                lines.push(`- ${renderOrganizationMembershipLine(membership)}`);
+                if (membership.state === "active") {
+                  if (orgDefaultPermission && orgDefaultPermission !== "none") {
+                    lines.push(`- Org base repo access is active via default permission "${orgDefaultPermission}".`);
+                    notes.push(`Because ${username} is an active org member and "${orgName}" default repository permission is ${orgDefaultPermission}, removing direct collaborators or team grants alone may not remove repo access.`);
+                  } else {
+                    lines.push("- No org base repo access is visible because the org default permission is none.");
+                  }
+                } else {
+                  lines.push("- Org base repo access is not active yet because the org membership is still pending.");
+                }
+              } catch (error) {
+                if (isHttpStatusError(error, 404)) {
+                  lines.push("- No active or pending org membership was found.");
+                  if (orgDefaultPermission && orgDefaultPermission !== "none") {
+                    lines.push("- Org base repo access does not apply unless the user becomes an org member.");
+                  }
+                } else {
+                  notes.push(`Org membership lookup failed for "${username}" in "${orgName}": ${String(error)}`);
+                }
+              }
+            }
+          } else if (orgDefaultPermission && orgDefaultPermission !== "none") {
+            notes.push(`Any active org member can still inherit ${orgDefaultPermission} access from "${orgName}" even after direct collaborator or team grants are removed.`);
           }
 
           try {
@@ -1299,7 +1697,8 @@ class ClawMemService {
           }
 
           try {
-            const outside = await target.client.listOrgOutsideCollaborators(orgName);
+            const ownerOrg = orgName || target.owner;
+            const outside = await target.client.listOrgOutsideCollaborators(ownerOrg);
             lines.push("");
             lines.push(`Outside collaborators in owner org "${orgName}":`);
             if (outside.length === 0) lines.push("- None visible");
@@ -2377,6 +2776,20 @@ function renderUserOrganizationInvitationLine(invitation: { id?: number; role?: 
   return `${org} [role:${role}${idText}${created}${expires}${teamsText}${inviter}]`;
 }
 
+function renderOrganizationMembershipLine(membership: {
+  state?: string;
+  role?: string;
+  organization?: { login?: string };
+  user?: { login?: string; name?: string };
+}): string {
+  const login = membership.user?.login?.trim() || membership.user?.name?.trim() || "unknown-user";
+  const name = membership.user?.name?.trim() && membership.user?.name?.trim() !== login ? ` (${membership.user.name.trim()})` : "";
+  const state = membership.state?.trim() || "unknown";
+  const role = membership.role?.trim() || "unknown";
+  const org = membership.organization?.login?.trim();
+  return `${login}${name} [state:${state} role:${role}${org ? ` org:${org}` : ""}]`;
+}
+
 function canonicalPermission(permissions?: Record<string, boolean | undefined>, explicit?: string): string {
   const direct = normalizePermissionAlias(explicit);
   if (direct) return direct;
@@ -2396,6 +2809,11 @@ function normalizePermissionAlias(value: unknown): "none" | CollaborationPermiss
   if (normalized === "write" || normalized === "push" || normalized === "maintain") return "write";
   if (normalized === "admin") return "admin";
   return undefined;
+}
+
+function isHttpStatusError(error: unknown, status: number): boolean {
+  const value = String(error);
+  return value.includes(`HTTP ${status}:`);
 }
 
 export function createClawMemPlugin(api: OpenClawPluginApi): void { new ClawMemService(api).register(); }

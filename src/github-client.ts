@@ -52,6 +52,12 @@ type RepositoryInvitationResponse = {
   inviter?: { login?: string; name?: string };
 };
 type TeamMembershipResponse = { state?: string; role?: string };
+type OrganizationMembershipResponse = {
+  state?: string;
+  role?: string;
+  organization?: OrgResponse;
+  user?: CollaboratorResponse;
+};
 type InvitationResponse = {
   id?: number;
   role?: string;
@@ -145,8 +151,29 @@ export class GitHubIssueClient {
   async getOrg(org: string): Promise<OrgResponse> {
     return this.req<OrgResponse>(`orgs/${encodeURIComponent(org)}`, { method: "GET" });
   }
+  async listOrgMembers(org: string, role?: "admin"): Promise<CollaboratorResponse[]> {
+    const q = new URLSearchParams();
+    if (role) q.set("role", role);
+    const suffix = q.toString();
+    return this.req<CollaboratorResponse[]>(`orgs/${encodeURIComponent(org)}/members${suffix ? `?${suffix}` : ""}`, { method: "GET" });
+  }
+  async getOrgMembership(org: string, username: string): Promise<OrganizationMembershipResponse> {
+    return this.req<OrganizationMembershipResponse>(
+      `orgs/${encodeURIComponent(org)}/memberships/${encodeURIComponent(username)}`,
+      { method: "GET" },
+    );
+  }
+  async removeOrgMember(org: string, username: string): Promise<void> {
+    await this.req(`orgs/${encodeURIComponent(org)}/members/${encodeURIComponent(username)}`, { method: "DELETE" });
+  }
+  async removeOrgMembership(org: string, username: string): Promise<void> {
+    await this.req(`orgs/${encodeURIComponent(org)}/memberships/${encodeURIComponent(username)}`, { method: "DELETE" });
+  }
   async listOrgTeams(org: string): Promise<TeamResponse[]> {
     return this.req<TeamResponse[]>(`orgs/${encodeURIComponent(org)}/teams`, { method: "GET" });
+  }
+  async getTeam(org: string, teamSlug: string): Promise<TeamResponse> {
+    return this.req<TeamResponse>(`orgs/${encodeURIComponent(org)}/teams/${encodeURIComponent(teamSlug)}`, { method: "GET" });
   }
   async createOrgTeam(org: string, params: { name: string; description?: string; privacy?: "closed" | "secret" }): Promise<TeamResponse> {
     return this.req<TeamResponse>(`orgs/${encodeURIComponent(org)}/teams`, {
@@ -157,6 +184,29 @@ export class GitHubIssueClient {
         privacy: params.privacy ?? "closed",
       }),
     });
+  }
+  async updateTeam(
+    org: string,
+    teamSlug: string,
+    params: { name?: string; description?: string; privacy?: "closed" | "secret" },
+  ): Promise<TeamResponse> {
+    return this.req<TeamResponse>(`orgs/${encodeURIComponent(org)}/teams/${encodeURIComponent(teamSlug)}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        ...(params.name ? { name: params.name } : {}),
+        ...(params.description ? { description: params.description } : {}),
+        ...(params.privacy ? { privacy: params.privacy } : {}),
+      }),
+    });
+  }
+  async deleteTeam(org: string, teamSlug: string): Promise<void> {
+    await this.req(`orgs/${encodeURIComponent(org)}/teams/${encodeURIComponent(teamSlug)}`, { method: "DELETE" });
+  }
+  async listTeamMembers(org: string, teamSlug: string): Promise<CollaboratorResponse[]> {
+    return this.req<CollaboratorResponse[]>(
+      `orgs/${encodeURIComponent(org)}/teams/${encodeURIComponent(teamSlug)}/members`,
+      { method: "GET" },
+    );
   }
   async setTeamMembership(org: string, teamSlug: string, username: string, role: "member" | "maintainer"): Promise<TeamMembershipResponse> {
     return this.req<TeamMembershipResponse>(
@@ -238,6 +288,9 @@ export class GitHubIssueClient {
       }),
     });
   }
+  async revokeOrgInvitation(org: string, invitationId: number): Promise<void> {
+    await this.req(`orgs/${encodeURIComponent(org)}/invitations/${invitationId}`, { method: "DELETE" });
+  }
   async listOrgOutsideCollaborators(org: string): Promise<CollaboratorResponse[]> {
     return this.req<CollaboratorResponse[]>(`orgs/${encodeURIComponent(org)}/outside_collaborators`, { method: "GET" });
   }
@@ -249,6 +302,12 @@ export class GitHubIssueClient {
   }
   async declineUserOrgInvitation(invitationId: number): Promise<void> {
     await this.req(`user/organization_invitations/${invitationId}`, { method: "DELETE" });
+  }
+  async transferRepo(owner: string, repo: string, newOwner: string): Promise<RepoResponse> {
+    return this.req<RepoResponse>(`repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/transfer`, {
+      method: "POST",
+      body: JSON.stringify({ new_owner: newOwner }),
+    });
   }
   async ensureLabels(labels: string[]): Promise<void> {
     for (const label of labels) {
