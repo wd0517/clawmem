@@ -156,6 +156,7 @@ Full config with all options:
 - Summary or memory-capture failures do not block finalization; the conversation issue still closes, and the mirrored transcript remains the durable source of truth for manual follow-up.
 - Memory search and auto-recall only return open `type:memory` issues. Closed memory issues are treated as stale.
 - ClawMem automatically injects a small set of relevant memories before each turn using the agent's default repo and the backend recall API. Auto-recall is best-effort and quietly skips injection when backend recall is unavailable.
+- Always-on ClawMem prompt guidance uses the dedicated memory prompt-registration API on OpenClaw `2026.3.22+`. On `2026.3.7` through `2026.3.21`, ClawMem falls back to `before_prompt_build` `prependSystemContext`. Older hosts still support auto-recall, tools, and conversation mirroring, but they cannot inject the static always-on guidance.
 - `memory_recall` uses the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`. When backend recall is unavailable, use `memory_list` or `memory_get` to inspect memories explicitly.
 - Automatic durable capture happens when the session resets or ends. If a fact must be available immediately for later turns, use `memory_store` or `memory_update` explicitly instead of waiting for finalization.
 - The plugin exposes `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.

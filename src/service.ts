@@ -19,8 +19,21 @@ type CollaborationPermission = "read" | "write" | "admin";
 type CollaborationTeamRole = "member" | "maintainer";
 type MemoryPromptBuilder = NonNullable<MemoryPluginCapability["promptBuilder"]>;
 type MemoryPromptBuilderParams = Parameters<MemoryPromptBuilder>[0];
+type PromptBuildInjection = { prependContext?: string; prependSystemContext?: string };
 
 const MODERN_PROMPT_HOOK_MIN_HOST_VERSION = "2026.3.7";
+const MEMORY_PROMPT_REGISTRATION_MIN_HOST_VERSION = "2026.3.22";
+const CLAWMEM_PROMPT_GUIDANCE_TOOL_NAMES = [
+  "memory_repos",
+  "memory_repo_create",
+  "memory_list",
+  "memory_labels",
+  "memory_recall",
+  "memory_get",
+  "memory_store",
+  "memory_update",
+  "memory_forget",
+] as const;
 type PromptHookMode = "modern" | "legacy";
 
 class ClawMemService {
@@ -34,6 +47,7 @@ class ClawMemService {
   private unsubTranscript?: () => void;
   private loadPromise: Promise<void> | null = null;
   private readonly configPromises = new Map<string, Promise<boolean>>();
+  private injectPromptGuidanceViaSystemContext = false;
 
   constructor(private readonly api: OpenClawPluginApi) {
     this.config = resolvePluginConfig(api);
@@ -41,7 +55,7 @@ class ClawMemService {
 
   register(): void {
     const promptHookMode = resolvePromptHookMode(this.api);
-    this.registerMemoryPromptGuidance();
+    this.registerMemoryPromptGuidance(promptHookMode);
     if (promptHookMode === "modern") {
       this.api.on("before_prompt_build", async (ev, ctx) => this.handleBeforePromptBuild(ev, ctx.agentId));
     } else {
@@ -97,7 +111,7 @@ class ClawMemService {
     });
   }
 
-  private registerMemoryPromptGuidance(): void {
+  private registerMemoryPromptGuidance(promptHookMode: PromptHookMode): void {
     if (!this.isSelectedMemoryPlugin()) return;
 
     const api = this.api as OpenClawPluginApi & {
@@ -115,7 +129,37 @@ class ClawMemService {
       return;
     }
 
-    this.api.logger.warn?.("clawmem: host does not expose memory prompt registration; always-on prompt guidance is disabled");
+    const hostVersion = resolveOpenClawHostVersion(this.api);
+    const comparison = hostVersion ? compareOpenClawVersions(hostVersion, MEMORY_PROMPT_REGISTRATION_MIN_HOST_VERSION) : null;
+    if (promptHookMode === "modern") {
+      this.injectPromptGuidanceViaSystemContext = true;
+      if (comparison !== null && comparison < 0) {
+        this.api.logger.info?.(
+          `clawmem: OpenClaw ${hostVersion} predates memory prompt registration (requires ${MEMORY_PROMPT_REGISTRATION_MIN_HOST_VERSION}+); falling back to before_prompt_build prependSystemContext for always-on prompt guidance`,
+        );
+        return;
+      }
+
+      this.api.logger.warn?.(
+        hostVersion
+          ? `clawmem: OpenClaw ${hostVersion} does not expose memory prompt registration; falling back to before_prompt_build prependSystemContext for always-on prompt guidance`
+          : "clawmem: host does not expose memory prompt registration; falling back to before_prompt_build prependSystemContext for always-on prompt guidance",
+      );
+      return;
+    }
+
+    if (comparison !== null && comparison < 0) {
+      this.api.logger.info?.(
+        `clawmem: OpenClaw ${hostVersion} predates memory prompt registration and prompt-level system-context fallback; always-on prompt guidance is unavailable on this host`,
+      );
+      return;
+    }
+
+    this.api.logger.warn?.(
+      hostVersion
+        ? `clawmem: OpenClaw ${hostVersion} does not expose memory prompt registration; always-on prompt guidance is disabled`
+        : "clawmem: host does not expose memory prompt registration; always-on prompt guidance is disabled",
+    );
   }
 
   private isSelectedMemoryPlugin(): boolean {
@@ -1766,12 +1810,17 @@ class ClawMemService {
     });
   }
 
-  private async handleBeforePromptBuild(event: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
+  private async handleBeforePromptBuild(event: unknown, agentId?: string): Promise<PromptBuildInjection | void> {
     const context = await this.collectAutoRecallContext(event, agentId);
+    const systemContext = this.injectPromptGuidanceViaSystemContext ? buildFallbackPromptGuidanceText(event) : undefined;
     // Auto-recall is per-turn dynamic context, so keep it out of the system prompt.
     // OpenClaw documents dynamic context on `prependContext`: https://github.com/maweibin/openclaw/blob/d9a2869ad69db9449336a2e2846bd9de0e647ac6/docs/concepts/agent-loop.md?plain=1#L85
     // Changing the system prompt can defeat provider prefix caching.
-    return context ? { prependContext: context } : undefined;
+    if (!context && !systemContext) return undefined;
+    return {
+      ...(systemContext ? { prependSystemContext: systemContext } : {}),
+      ...(context ? { prependContext: context } : {}),
+    };
   }
 
   private async handleBeforeAgentStart(event: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
@@ -2389,6 +2438,14 @@ export function buildClawMemPromptSection(params: MemoryPromptBuilderParams): st
   return lines;
 }
 
+function buildFallbackPromptGuidanceText(event: unknown): string | undefined {
+  const record = asRecord(event);
+  const availableTools = resolvePromptGuidanceAvailableTools(record.availableTools);
+  const citationsMode = typeof record.citationsMode === "string" ? record.citationsMode.trim() || undefined : undefined;
+  const text = buildClawMemPromptSection({ availableTools, ...(citationsMode ? { citationsMode } : {}) }).join("\n").trim();
+  return text || undefined;
+}
+
 export function extractPromptTextForRecall(event: unknown): string | undefined {
   const direct = normalizePromptText(event);
   if (direct) return direct;
@@ -2414,6 +2471,25 @@ function joinNaturalLanguageList(items: string[]): string {
   if (items.length === 1) return items[0]!;
   if (items.length === 2) return `${items[0]} and ${items[1]}`;
   return `${items.slice(0, -1).join(", ")}, and ${items[items.length - 1]}`;
+}
+
+function resolvePromptGuidanceAvailableTools(value: unknown): Set<string> {
+  const names = collectToolNames(value);
+  return names.size > 0 ? names : new Set(CLAWMEM_PROMPT_GUIDANCE_TOOL_NAMES);
+}
+
+function collectToolNames(value: unknown): Set<string> {
+  const names = new Set<string>();
+  const values = value instanceof Set ? [...value] : Array.isArray(value) ? value : [];
+  for (const entry of values) {
+    if (typeof entry === "string" && entry.trim()) {
+      names.add(entry.trim());
+      continue;
+    }
+    const record = asRecord(entry);
+    if (typeof record.name === "string" && record.name.trim()) names.add(record.name.trim());
+  }
+  return names;
 }
 
 function extractPromptTextFromMessages(value: unknown): string | undefined {
