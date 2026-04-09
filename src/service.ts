@@ -1,5 +1,5 @@
 // Thin orchestrator: wires conversation mirroring, memory store, and plugin lifecycle.
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
+import type { MemoryPluginCapability, OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { hasDefaultRepo, isAgentConfigured, resolveAgentRoute, resolvePluginConfig } from "./config.js";
 import { filterDirectCollaborators, listRepoAccessTeams, resolveOrgInvitationRole } from "./collaboration.js";
 import { ConversationMirror } from "./conversation.js";
@@ -17,6 +17,8 @@ type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; 
 type FinalizePayload = { sessionId?: string; sessionKey?: string; sessionFile?: string; agentId?: string; reason?: string; messages?: unknown[] };
 type CollaborationPermission = "read" | "write" | "admin";
 type CollaborationTeamRole = "member" | "maintainer";
+type MemoryPromptBuilder = NonNullable<MemoryPluginCapability["promptBuilder"]>;
+type MemoryPromptBuilderParams = Parameters<MemoryPromptBuilder>[0];
 
 const DERIVED_WORK_RECOVERY_DELAYS_MS = [5000, 30000, 120000] as const;
 const MODERN_PROMPT_HOOK_MIN_HOST_VERSION = "2026.3.7";
@@ -43,6 +45,7 @@ class ClawMemService {
 
   register(): void {
     const promptHookMode = resolvePromptHookMode(this.api);
+    this.registerMemoryPromptGuidance();
     if (promptHookMode === "modern") {
       this.api.on("before_prompt_build", async (ev, ctx) => this.handleBeforePromptBuild(ev, ctx.agentId));
     } else {
@@ -83,6 +86,39 @@ class ClawMemService {
         await Promise.allSettled([...this.pending]);
       },
     });
+  }
+
+  private registerMemoryPromptGuidance(): void {
+    if (!this.isSelectedMemoryPlugin()) return;
+
+    const api = this.api as OpenClawPluginApi & {
+      registerMemoryCapability?: OpenClawPluginApi["registerMemoryCapability"];
+      registerMemoryPromptSection?: OpenClawPluginApi["registerMemoryPromptSection"];
+    };
+
+    if (typeof api.registerMemoryCapability === "function") {
+      api.registerMemoryCapability({ promptBuilder: buildClawMemPromptSection });
+      return;
+    }
+
+    if (typeof api.registerMemoryPromptSection === "function") {
+      api.registerMemoryPromptSection(buildClawMemPromptSection);
+      return;
+    }
+
+    this.api.logger.warn?.("clawmem: host does not expose memory prompt registration; always-on prompt guidance is disabled");
+  }
+
+  private isSelectedMemoryPlugin(): boolean {
+    try {
+      const root = this.api.runtime.config.loadConfig();
+      const plugins = asRecord(root.plugins);
+      const slots = asRecord(plugins.slots);
+      const slot = typeof slots.memory === "string" ? String(slots.memory).trim() : "";
+      return slot === this.api.id;
+    } catch {
+      return false;
+    }
   }
 
   private registerTools(): void {
@@ -2123,6 +2159,37 @@ export function buildAutoRecallContext(memories: Array<{
   ].join("\n");
 }
 
+export function buildClawMemPromptSection(params: MemoryPromptBuilderParams): string[] {
+  const hasTool = (name: string) => params.availableTools.has(name);
+  const retrievalTools = [
+    hasTool("memory_recall") ? "`memory_recall`" : "",
+    hasTool("memory_list") ? "`memory_list`" : "",
+    hasTool("memory_get") ? "`memory_get`" : "",
+  ].filter(Boolean);
+  const routingTools = [hasTool("memory_repos") ? "`memory_repos`" : ""].filter(Boolean);
+  const writeTools = [
+    hasTool("memory_store") ? "`memory_store`" : "",
+    hasTool("memory_update") ? "`memory_update`" : "",
+  ].filter(Boolean);
+  const hasForgetTool = hasTool("memory_forget");
+
+  const lines = [
+    "## ClawMem",
+    "ClawMem is the active long-term memory system for this OpenClaw installation.",
+    "Core loop:",
+    "- Before answering, ask whether prior memory could improve the answer. Default to yes for preferences, project history, decisions, lessons, workflows, conventions, recurring problems, and active tasks.",
+    `- Treat auto-injected ClawMem context as a hint, not proof of absence.${retrievalTools.length > 0 ? ` If relevant memory may exist and the hint is weak or missing, retrieve explicitly with ${joinNaturalLanguageList(retrievalTools)}.` : ""}`,
+    `${routingTools.length > 0 ? `- Before explicit memory work, choose the right repo. If unclear, inspect ${joinNaturalLanguageList(routingTools)} and then fall back to the agent's default repo.` : "- Before explicit memory work, choose the right repo instead of assuming every memory belongs in the default repo."}`,
+    `${writeTools.length > 0 || hasForgetTool
+      ? `- After answering, ask whether this turn created durable knowledge. If yes or unsure, write it now${writeTools.length > 0 ? ` with ${joinNaturalLanguageList(writeTools)}` : ""}${hasForgetTool ? `${writeTools.length > 0 ? "; " : " "}use \`memory_forget\` for stale or superseded memories` : ""} instead of waiting for background extraction.`
+      : "- After answering, ask whether this turn created durable knowledge and save it immediately instead of waiting for background extraction."}`,
+    "- Use the bundled `clawmem` skill for detailed routing, schema, collaboration, communication, and manual repo-backed workflows.",
+    "",
+  ];
+
+  return lines;
+}
+
 export function extractPromptTextForRecall(event: unknown): string | undefined {
   const direct = normalizePromptText(event);
   if (direct) return direct;
@@ -2141,6 +2208,13 @@ export function extractPromptTextForRecall(event: unknown): string | undefined {
   return extractPromptTextFromMessages(record.messages)
     ?? extractPromptTextFromMessages(record.conversation)
     ?? promptCandidates.find((candidate) => candidate.text)?.text;
+}
+
+function joinNaturalLanguageList(items: string[]): string {
+  if (items.length === 0) return "";
+  if (items.length === 1) return items[0]!;
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(", ")}, and ${items[items.length - 1]}`;
 }
 
 function extractPromptTextFromMessages(value: unknown): string | undefined {
