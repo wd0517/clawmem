@@ -1321,9 +1321,11 @@ class ClawMemService {
     });
   }
 
-  private async handleBeforePromptBuild(event: unknown, agentId?: string): Promise<{ prependSystemContext: string } | void> {
+  private async handleBeforePromptBuild(event: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
     const context = await this.collectAutoRecallContext(event, agentId);
-    return context ? { prependSystemContext: context } : undefined;
+    // Auto-recall is per-turn dynamic context, so keep it out of the system prompt.
+    // OpenClaw documents dynamic context on `prependContext`, and changing the system prompt can defeat provider prefix caching.
+    return context ? { prependContext: context } : undefined;
   }
 
   private async handleBeforeAgentStart(event: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
