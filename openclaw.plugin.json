@@ -1,7 +1,7 @@
 {
   "id": "clawmem",
   "name": "ClawMem",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "description": "Repo-backed long-term memory plugin for OpenClaw with auto recall, durable memory capture, and conversation mirroring.",
   "kind": "memory",
   "skills": [
