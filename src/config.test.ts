@@ -27,9 +27,9 @@ function baseConfig(): ClawMemPluginConfig {
       },
     },
     memoryRecallLimit: 5,
-    memoryAutoRecallLimit: 5,
-    turnCommentDelayMs: 1000,
+    memoryAutoRecallLimit: 3,
     summaryWaitTimeoutMs: 120000,
+    memoryExtractWaitTimeoutMs: 45000,
   };
 }
 

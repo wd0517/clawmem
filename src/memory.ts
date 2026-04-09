@@ -1,28 +1,28 @@
-// Memory CRUD, sha256 dedup, and AI-driven memory extraction.
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
+// Memory CRUD, recall search helpers, and candidate parsing.
 import { LABEL_MEMORY_STALE, MEMORY_TITLE_PREFIX, extractLabelNames, labelVal } from "./config.js";
 import type { GitHubIssueClient } from "./github-client.js";
-import { normalizeMessages } from "./transcript.js";
-import type { ClawMemPluginConfig, MemoryDraft, MemoryListOptions, MemorySchema, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
-import { fmtTranscript, localDate, sha256, subKey } from "./utils.js";
+import type { MemoryCandidate, MemoryDraft, MemoryListOptions, MemorySchema, ParsedMemoryIssue } from "./types.js";
+import { localDate, sha256 } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
+import { sanitizeRecallQueryInput } from "./recall-sanitize.js";
 
-type MemoryDecision = { save: MemoryDraft[]; stale: string[] };
-type SearchIndex = { title: string; detail: string; kind?: string; topics: string[] };
+const MAX_BACKEND_QUERY_CHARS = 1500;
+
+const RECALL_INJECTED_BLOCKS = [
+  /<clawmem-context>[\s\S]*?<\/clawmem-context>/gi,
+  /<relevant-memories>[\s\S]*?<\/relevant-memories>/gi,
+  /<memories>[\s\S]*?<\/memories>/gi,
+];
+
+const URL_RE = /https?:\/\/\S+/gi;
 
 export class MemoryStore {
-  constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
+  constructor(private readonly client: GitHubIssueClient) {}
 
   async search(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const q = normalizeSearch(query);
     if (!q) return [];
-    try {
-      const results = await this.searchViaBackend(query, limit);
-      if (results.length > 0) return results;
-    } catch (error) {
-      this.api.logger?.warn?.(`clawmem: backend memory search failed, falling back to local lexical ranking: ${String(error)}`);
-    }
-    return this.searchLocally(q, limit);
+    return this.searchViaBackend(query, limit);
   }
 
   async listSchema(): Promise<MemorySchema> {
@@ -43,17 +43,13 @@ export class MemoryStore {
       }
       if (batch.length < 100) break;
     }
-    for (const memory of await this.listByStatus("all")) {
-      if (memory.kind) kinds.add(memory.kind);
-      for (const topic of memory.topics ?? []) topics.add(topic);
-    }
     return { kinds: [...kinds].sort(), topics: [...topics].sort() };
   }
 
   async get(memoryId: string, status: "active" | "stale" | "all" = "all"): Promise<ParsedMemoryIssue | null> {
     const id = memoryId.trim();
     if (!id) throw new Error("memoryId is empty");
-    return (await this.listByStatus(status)).find((m) => m.memoryId === id || String(m.issueNumber) === id) ?? null;
+    return this.findByRef(id, status);
   }
 
   async listMemories(options: MemoryListOptions = {}): Promise<ParsedMemoryIssue[]> {
@@ -61,22 +57,28 @@ export class MemoryStore {
     const kind = normalizeOptionalLabelValue(options.kind, "kind:");
     const topic = normalizeOptionalLabelValue(options.topic, "topic:");
     const limit = Math.min(200, Math.max(1, options.limit ?? 20));
-    return (await this.listByStatus(status))
-      .filter((memory) => {
-        if (kind && memory.kind !== kind) return false;
-        if (topic && !(memory.topics ?? []).includes(topic)) return false;
-        return true;
-      })
-      .sort((a, b) => b.issueNumber - a.issueNumber)
-      .slice(0, limit);
+    const labels = ["type:memory", ...(kind ? [`kind:${kind}`] : []), ...(topic ? [`topic:${topic}`] : [])];
+    const state = status === "active" ? "open" : "all";
+    const out: ParsedMemoryIssue[] = [];
+    for (let page = 1; page <= 20 && out.length < limit; page++) {
+      const batch = await this.client.listIssues({ labels, state, page, perPage: Math.min(100, limit) });
+      for (const issue of batch) {
+        const memory = this.parseIssue(issue);
+        if (!memory) continue;
+        if (status !== "all" && memory.status !== status) continue;
+        out.push(memory);
+        if (out.length >= limit) break;
+      }
+      if (batch.length < Math.min(100, limit)) break;
+    }
+    return out.sort((a, b) => b.issueNumber - a.issueNumber).slice(0, limit);
   }
 
   async store(draft: MemoryDraft): Promise<{ created: boolean; memory: ParsedMemoryIssue }> {
     const normalized = normalizeDraft(draft);
     const detail = norm(normalized.detail);
-    const allActive = await this.listByStatus("active");
     const hash = sha256(detail);
-    const existing = allActive.find((m) => (m.memoryHash || sha256(norm(m.detail))) === hash);
+    const existing = await this.findActiveByHash(hash);
     if (existing) {
       const memory = await this.mergeSchema(existing, normalized);
       return { created: false, memory };
@@ -84,8 +86,8 @@ export class MemoryStore {
 
     const date = localDate();
     const labels = memLabels(normalized.kind, normalized.topics);
-    const title = `${MEMORY_TITLE_PREFIX}${trunc(detail, 72)}`;
-    const body = stringifyFlatYaml([["memory_hash", hash], ["date", date], ["detail", detail]]);
+    const title = renderMemoryTitle(normalized);
+    const body = renderMemoryBody(detail, hash, date);
     await this.client.ensureLabels(labels);
     const issue = await this.client.createIssue({ title, body, labels });
     return {
@@ -104,22 +106,27 @@ export class MemoryStore {
     };
   }
 
-  async update(memoryId: string, patch: { detail?: string; kind?: string; topics?: string[] }): Promise<ParsedMemoryIssue | null> {
+  async update(memoryId: string, patch: { title?: string; detail?: string; kind?: string; topics?: string[] }): Promise<ParsedMemoryIssue | null> {
     const current = await this.get(memoryId, "all");
     if (!current) return null;
     const nextDetail = typeof patch.detail === "string" && patch.detail.trim() ? norm(patch.detail) : current.detail;
+    const nextTitle = typeof patch.title === "string" && patch.title.trim()
+      ? renderMemoryTitle({ title: patch.title.trim(), detail: nextDetail })
+      : patch.detail !== undefined
+        ? renderMemoryTitle({ detail: nextDetail })
+        : current.title || renderMemoryTitle({ detail: nextDetail });
     const nextKind = patch.kind !== undefined ? normalizeLabelValue(patch.kind, "kind:") : current.kind;
     const nextTopics = patch.topics !== undefined
       ? uniqueNormalized(patch.topics.map((topic) => normalizeLabelValue(topic, "topic:")).filter(Boolean) as string[])
       : uniqueNormalized(current.topics ?? []);
     const nextHash = sha256(nextDetail);
-    const duplicate = (await this.listByStatus("active")).find((memory) => {
-      if (memory.issueNumber === current.issueNumber) return false;
-      return (memory.memoryHash || sha256(norm(memory.detail))) === nextHash;
-    });
-    if (duplicate) throw new Error(`another active memory already stores this detail as [${duplicate.memoryId}]`);
-    const nextTitle = `${MEMORY_TITLE_PREFIX}${trunc(nextDetail, 72)}`;
-    const nextBody = stringifyFlatYaml([["memory_hash", nextHash], ["date", current.date], ["detail", nextDetail]]);
+    const duplicate = await this.findActiveByHash(nextHash);
+    if (duplicate?.issueNumber === current.issueNumber) {
+      // Updating schema/title without changing the underlying detail is always safe.
+    } else if (duplicate) {
+      throw new Error(`another active memory already stores this detail as [${duplicate.memoryId}]`);
+    }
+    const nextBody = renderMemoryBody(nextDetail, nextHash, current.date);
     const nextLabels = memLabels(nextKind, nextTopics);
     await this.client.ensureLabels(nextLabels);
     await this.client.updateIssue(current.issueNumber, { title: nextTitle, body: nextBody });
@@ -144,39 +151,9 @@ export class MemoryStore {
     return { ...mem, status: "stale" };
   }
 
-  async syncFromConversation(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<boolean> {
-    try {
-      const decision = await this.generateDecision(session, snapshot);
-      const { savedCount, staledCount } = await this.applyDecision(decision);
-      if (savedCount > 0 || staledCount > 0)
-        this.api.logger.info?.(`clawmem: synced memories for ${session.sessionId} (saved=${savedCount}, stale=${staledCount})`);
-      return true;
-    } catch (error) {
-      this.api.logger.warn(`clawmem: memory capture failed: ${String(error)}`);
-      return false;
-    }
-  }
-
-  private async listByStatus(status: "active" | "stale" | "all"): Promise<ParsedMemoryIssue[]> {
-    const labels = ["type:memory"];
-    const state = status === "active" ? "open" : "all";
-    const out: ParsedMemoryIssue[] = [];
-    for (let page = 1; page <= 20; page++) {
-      const batch = await this.client.listIssues({ labels, state, page, perPage: 100 });
-      for (const issue of batch) {
-        const parsed = this.parseIssue(issue);
-        if (!parsed) continue;
-        if (status !== "all" && parsed.status !== status) continue;
-        out.push(parsed);
-      }
-      if (batch.length < 100) break;
-    }
-    return out;
-  }
-
   private async searchViaBackend(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const repo = this.client.repo();
-    if (!repo) return [];
+    if (!repo) throw new Error("ClawMem memory recall requires a configured repo.");
     const qualified = buildMemorySearchQuery(query, repo);
     const batch = await this.client.searchIssues(qualified, { perPage: Math.min(100, Math.max(limit * 3, 20)) });
     return batch
@@ -185,14 +162,44 @@ export class MemoryStore {
       .slice(0, limit);
   }
 
-  private async searchLocally(normalizedQuery: string, limit: number): Promise<ParsedMemoryIssue[]> {
-    const memories = await this.listByStatus("active");
-    return memories
-      .map((m) => ({ m, score: scoreMemoryMatch(m, normalizedQuery) }))
-      .filter((e) => e.score > 0)
-      .sort((a, b) => b.score - a.score || b.m.issueNumber - a.m.issueNumber)
-      .slice(0, limit)
-      .map((e) => e.m);
+  private async findActiveByHash(hash: string): Promise<ParsedMemoryIssue | null> {
+    const repo = this.client.repo?.();
+    if (!repo) return null;
+    const query = buildMemoryHashSearchQuery(hash, repo);
+    const batch = await this.client.searchIssues(query, { perPage: 10 });
+    return batch
+      .map((issue) => this.parseIssue(issue))
+      .find((memory): memory is ParsedMemoryIssue =>
+        memory !== null && memory.status === "active" && (memory.memoryHash || sha256(norm(memory.detail))) === hash,
+      ) ?? null;
+  }
+
+  private async findByRef(id: string, status: "active" | "stale" | "all"): Promise<ParsedMemoryIssue | null> {
+    const trimmed = id.trim();
+    if (!trimmed) return null;
+    if (/^\d+$/.test(trimmed)) {
+      try {
+        const issue = await this.client.getIssue(Number(trimmed));
+        const parsed = this.parseIssue(issue);
+        if (!parsed) return null;
+        if (status !== "all" && parsed.status !== status) return null;
+        return parsed;
+      } catch {
+        // Fall through to memory-id search for nonstandard repos that expose custom memory ids.
+      }
+    }
+    const repo = this.client.repo?.();
+    if (!repo) return null;
+    const batch = await this.client.searchIssues(buildMemoryRefSearchQuery(trimmed, repo, status), { perPage: 10 });
+    return batch
+      .map((issue) => this.parseIssue(issue))
+      .find((memory): memory is ParsedMemoryIssue =>
+        memory !== null && (status === "all" || memory.status === status) && (memory.memoryId === trimmed || String(memory.issueNumber) === trimmed),
+      ) ?? null;
+  }
+
+  private async findActiveByRef(id: string): Promise<ParsedMemoryIssue | null> {
+    return this.findByRef(id, "active");
   }
 
   private parseIssue(issue: { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> }): ParsedMemoryIssue | null {
@@ -201,117 +208,21 @@ export class MemoryStore {
     const kind = labelVal(labels, "kind:");
     const topics = labels.filter((l) => l.startsWith("topic:")).map((l) => l.slice(6).trim()).filter(Boolean);
     const rawBody = (issue.body ?? "").trim();
-    const body = rawBody ? parseFlatYaml(rawBody) : {};
-    const detail = body.detail?.trim() || rawBody;
+    const parsed = parseStoredMemoryBody(rawBody);
+    const detail = parsed.detail?.trim() || rawBody;
     const status = issue.state === "closed" || labels.includes(LABEL_MEMORY_STALE) ? "stale" : "active";
     if (!detail) return null;
     return {
       issueNumber: issue.number,
       title: issue.title?.trim() || "",
-      memoryId: body.memory_id?.trim() || String(issue.number),
-      memoryHash: body.memory_hash?.trim() || undefined,
-      date: body.date?.trim() || "1970-01-01",
+      memoryId: parsed.meta.memory_id?.trim() || String(issue.number),
+      memoryHash: parsed.meta.memory_hash?.trim() || undefined,
+      date: parsed.meta.date?.trim() || "1970-01-01",
       detail,
       ...(kind ? { kind } : {}),
       ...(topics.length > 0 ? { topics } : {}),
       status,
     };
-  }
-
-  private async applyDecision(decision: MemoryDecision): Promise<{ savedCount: number; staledCount: number }> {
-    const allActive = await this.listByStatus("active");
-    const activeById = new Map(allActive.map((m) => [m.memoryId, m]));
-    const activeByHash = new Map(allActive.map((m) => [m.memoryHash || sha256(norm(m.detail)), m]));
-    let savedCount = 0;
-    for (const raw of decision.save) {
-      const draft = normalizeDraft(raw);
-      const detail = norm(draft.detail);
-      if (!detail) continue;
-      const hash = sha256(detail);
-      const existing = activeByHash.get(hash);
-      if (existing) {
-        const merged = await this.mergeSchema(existing, draft);
-        activeByHash.set(hash, merged);
-        continue;
-      }
-      const labels = memLabels(draft.kind, draft.topics);
-      const date = localDate();
-      const title = `${MEMORY_TITLE_PREFIX}${trunc(detail, 72)}`;
-      const body = stringifyFlatYaml([["memory_hash", hash], ["date", date], ["detail", detail]]);
-      await this.client.ensureLabels(labels);
-      const issue = await this.client.createIssue({ title, body, labels });
-      activeByHash.set(hash, {
-        issueNumber: issue.number,
-        title,
-        memoryId: String(issue.number),
-        memoryHash: hash,
-        date,
-        detail,
-        ...(draft.kind ? { kind: draft.kind } : {}),
-        ...(draft.topics && draft.topics.length > 0 ? { topics: draft.topics } : {}),
-        status: "active",
-      });
-      savedCount++;
-    }
-    let staledCount = 0;
-    for (const id of [...new Set(decision.stale.map((s) => s.trim()).filter(Boolean))]) {
-      const mem = activeById.get(id);
-      if (!mem) continue;
-      await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.kind, mem.topics));
-      await this.client.updateIssue(mem.issueNumber, { state: "closed" });
-      staledCount++;
-    }
-    return { savedCount, staledCount };
-  }
-
-  private async generateDecision(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<MemoryDecision> {
-    if (snapshot.messages.length === 0) return { save: [], stale: [] };
-    const recent = (await this.listByStatus("active")).sort((a, b) => b.issueNumber - a.issueNumber).slice(0, 20);
-    const existingBlock = recent.length === 0 ? "None." : recent.map((m) => {
-      const schema = [m.kind ? `kind=${m.kind}` : "", ...(m.topics ?? []).map((topic) => `topic=${topic}`)].filter(Boolean).join(", ");
-      return `[${m.memoryId}] ${schema ? `${schema} | ` : ""}${m.detail}`;
-    }).join("\n");
-    const schema = await this.listSchema();
-    const schemaBlock = [
-      `Existing kinds: ${schema.kinds.length > 0 ? schema.kinds.join(", ") : "None."}`,
-      `Existing topics: ${schema.topics.length > 0 ? schema.topics.join(", ") : "None."}`,
-    ].join("\n");
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = subKey(session, "memory");
-    const message = [
-      "Extract durable memories from the conversation below.",
-      'Return JSON only in the form {"save":[{"detail":"...","kind":"...","topics":["..."]}],"stale":["memory-id"]}.',
-      "Each save item must contain one durable fact. If a turn contains several independent facts, save them separately instead of bundling them into one summary memory.",
-      "Use save for stable, reusable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
-      "Use stale for existing memory IDs only when the conversation clearly supersedes or invalidates them.",
-      "Infer kind and topics when they would help future retrieval. Reuse existing kinds and topics when possible.",
-      "If no existing kind fits, you may propose a new short kind label. Keep kinds concise and reusable.",
-      "Topics should be short reusable tags, not sentences. Prefer 0-3 topics per memory.",
-      "Do not save temporary requests, startup boilerplate, tool chatter, summaries about internal helper sessions, or one-off operational details.",
-      "Prefer empty arrays when nothing durable should be remembered.",
-      "", "<existing-schema>", schemaBlock, "</existing-schema>",
-      "", "<existing-active-memories>", existingBlock, "</existing-active-memories>",
-      "", "<conversation>", fmtTranscript(snapshot.messages), "</conversation>",
-    ].join("\n");
-    try {
-      const run = await subagent.run({
-        sessionKey,
-        message,
-        deliver: false,
-        lane: "clawmem-memory",
-        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:memory-decision`),
-        extraSystemPrompt: "You extract durable memory updates from OpenClaw conversations. Output JSON only with save objects containing detail, optional kind, and optional topics, plus stale string ids. Keep each save item to one durable fact.",
-      });
-      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.summaryWaitTimeoutMs });
-      if (wait.status === "timeout") throw new Error("memory decision subagent timed out");
-      if (wait.status === "error") throw new Error(wait.error || "memory decision subagent failed");
-      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
-      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!text) throw new Error("memory decision subagent returned no assistant text");
-      return parseDecision(text);
-    } finally {
-      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
-    }
   }
 
   private async mergeSchema(memory: ParsedMemoryIssue, draft: MemoryDraft): Promise<ParsedMemoryIssue> {
@@ -341,97 +252,86 @@ function memLabels(kind?: string, topics?: string[]): string[] {
   ];
 }
 
+function renderMemoryTitle(draft: Pick<MemoryDraft, "detail" | "title">): string {
+  const raw = typeof draft.title === "string" && draft.title.trim() ? draft.title : draft.detail;
+  const normalized = norm(raw);
+  return normalized.startsWith(MEMORY_TITLE_PREFIX) ? normalized : `${MEMORY_TITLE_PREFIX}${normalized}`;
+}
+
+function renderMemoryBody(detail: string, memoryHash: string, date: string): string {
+  return stringifyFlatYaml([["memory_hash", memoryHash], ["date", date], ["detail", norm(detail)]]);
+}
+
+function parseStoredMemoryBody(rawBody: string): { detail: string; meta: Record<string, string> } {
+  const trimmed = rawBody.trim();
+  if (!trimmed) return { detail: "", meta: {} };
+
+  const legacyYaml = parseFlatYaml(trimmed);
+  if (legacyYaml.detail?.trim()) {
+    return { detail: legacyYaml.detail.trim(), meta: legacyYaml };
+  }
+
+  const hiddenMeta = /(?:^|\n)<!--\s*clawmem-meta\s*\n([\s\S]*?)\n-->\s*$/.exec(trimmed);
+  if (!hiddenMeta) {
+    return { detail: trimmed, meta: {} };
+  }
+
+  const meta = parseFlatYaml(hiddenMeta[1] ?? "");
+  const detail = trimmed.slice(0, hiddenMeta.index).trim() || meta.detail?.trim() || "";
+  return { detail, meta };
+}
+
 function norm(v: string): string { return v.replace(/\s+/g, " ").trim(); }
 function trunc(v: string, max: number): string { const s = norm(v); return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`; }
 function normalizeSearch(v: string): string {
   return v.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-function buildSearchIndex(memory: ParsedMemoryIssue): SearchIndex {
-  return {
-    title: normalizeSearch(memory.title),
-    detail: normalizeSearch(memory.detail),
-    ...(memory.kind ? { kind: normalizeSearch(memory.kind) } : {}),
-    topics: (memory.topics ?? []).map(normalizeSearch).filter(Boolean),
-  };
-}
-
-function searchTokens(v: string): string[] {
-  const seen = new Set<string>();
-  for (const token of v.split(/[^0-9\p{L}]+/u)) {
-    if (token.length > 1) seen.add(token);
-  }
-  for (const chunk of v.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]{2,}/gu) ?? []) {
-    for (let i = 0; i < chunk.length; i++) {
-      seen.add(chunk[i]!);
-      if (i + 1 < chunk.length) seen.add(chunk.slice(i, i + 2));
-    }
-  }
-  return [...seen];
-}
-
-function charBigrams(v: string): Set<string> {
-  const compact = v.replace(/\s+/g, "");
-  if (compact.length < 2) return new Set(compact ? [compact] : []);
-  const out = new Set<string>();
-  for (let i = 0; i < compact.length - 1; i++) out.add(compact.slice(i, i + 2));
-  return out;
-}
-
-function overlapRatio(left: Set<string>, right: Set<string>): number {
-  if (left.size === 0 || right.size === 0) return 0;
-  let hits = 0;
-  for (const token of left) if (right.has(token)) hits++;
-  return hits / Math.max(left.size, right.size);
-}
-
 function buildMemorySearchQuery(query: string, repo: string): string {
-  const parts = [query.trim(), `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].filter(Boolean);
+  const parts = [buildRecallSearchText(query), `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].filter(Boolean);
   return parts.join(" ");
 }
 
-export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): number {
-  const query = normalizeSearch(rawQuery);
-  if (!query) return 0;
-  const idx = buildSearchIndex(memory);
-  const tokens = searchTokens(query);
-  const queryTokenSet = new Set(tokens);
-  const titleTokenSet = new Set(searchTokens(idx.title));
-  const detailTokenSet = new Set(searchTokens(idx.detail));
-  const kindTokenSet = new Set(searchTokens(idx.kind ?? ""));
-  const topicTokenSet = new Set(idx.topics.flatMap(searchTokens));
-  let score = 0;
+function buildMemoryHashSearchQuery(hash: string, repo: string): string {
+  const needle = hash.trim();
+  if (!needle) return "";
+  return [`"${needle}"`, `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].join(" ");
+}
 
-  if (idx.title.includes(query)) score += 18;
-  if (idx.detail.includes(query)) score += 12;
-  if (idx.kind?.includes(query)) score += 8;
-  for (const topic of idx.topics) if (topic.includes(query)) score += 10;
+function buildMemoryRefSearchQuery(memoryId: string, repo: string, status: "active" | "stale" | "all"): string {
+  const needle = memoryId.trim();
+  if (!needle) return "";
+  const parts = [`"${needle}"`, `repo:${repo}`, "is:issue", 'label:"type:memory"'];
+  if (status === "active") parts.push("state:open");
+  if (status === "stale") parts.push("state:closed");
+  return parts.join(" ");
+}
 
-  for (const token of tokens) {
-    if (idx.title.includes(token)) score += 4;
-    if (idx.detail.includes(token)) score += 2;
-    if (idx.kind?.includes(token)) score += 3;
-    if (idx.topics.some((topic) => topic.includes(token))) score += 3;
-  }
+function buildRecallSearchText(rawQuery: string): string {
+  const cleaned = sanitizeRecallQueryInput(stripRecallArtifacts(rawQuery));
+  return truncateRecallQuery(cleaned, MAX_BACKEND_QUERY_CHARS);
+}
 
-  score += overlapRatio(queryTokenSet, titleTokenSet) * 10;
-  score += overlapRatio(queryTokenSet, detailTokenSet) * 6;
-  score += overlapRatio(queryTokenSet, kindTokenSet) * 6;
-  score += overlapRatio(queryTokenSet, topicTokenSet) * 8;
+function stripRecallArtifacts(rawQuery: string): string {
+  let text = rawQuery.replace(/\r/g, "\n").replace(URL_RE, " ");
+  for (const block of RECALL_INJECTED_BLOCKS) text = text.replace(block, " ");
+  return text;
+}
 
-  const queryBigrams = charBigrams(query);
-  score += overlapRatio(queryBigrams, charBigrams(idx.title)) * 6;
-  score += overlapRatio(queryBigrams, charBigrams(idx.detail)) * 3;
-
-  return score;
+function truncateRecallQuery(text: string, maxLen: number): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (!compact) return "";
+  return compact.length <= maxLen ? compact : compact.slice(0, maxLen).trimEnd();
 }
 
 function normalizeDraft(input: MemoryDraft): MemoryDraft {
   const detail = norm(input.detail);
   if (!detail) throw new Error("memory detail is empty");
+  const title = typeof input.title === "string" && input.title.trim() ? norm(input.title) : undefined;
   const kind = normalizeLabelValue(input.kind, "kind:");
   const topics = uniqueNormalized((input.topics ?? []).map((topic) => normalizeLabelValue(topic, "topic:")).filter(Boolean) as string[]);
   return {
+    ...(title ? { title } : {}),
     detail,
     ...(kind ? { kind } : {}),
     ...(topics.length > 0 ? { topics } : {}),
@@ -462,41 +362,83 @@ function uniqueNormalized(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort();
 }
 
-function parseDecision(raw: string): MemoryDecision {
-  const tryParse = (s: string): MemoryDecision | null => {
+export function parseCandidates(raw: string): MemoryCandidate[] {
+  const tryParse = (s: string): MemoryCandidate[] | null => {
     try {
-      const p = JSON.parse(s) as Record<string, unknown>;
-      return {
-        save: Array.isArray(p.save) ? p.save.map(parseSaveItem).filter((v): v is MemoryDraft => Boolean(v)) : [],
-        stale: Array.isArray(p.stale) ? p.stale.filter((v): v is string => typeof v === "string") : [],
-      };
+      const payload = JSON.parse(s) as Record<string, unknown>;
+      const candidates = Array.isArray(payload.candidates)
+        ? payload.candidates.map(parseCandidateItem).filter((candidate): candidate is MemoryCandidate => Boolean(candidate))
+        : [];
+      return mergeMemoryCandidates([], candidates);
     } catch {
       return null;
     }
   };
-  const t = raw.trim();
-  return tryParse(t) ?? (() => {
-    const f = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(t);
-    const nested = f?.[1] ? tryParse(f[1].trim()) : null;
+  const trimmed = raw.trim();
+  const direct = tryParse(trimmed);
+  if (direct) return direct;
+  const fenced = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(trimmed);
+  if (fenced?.[1]) {
+    const nested = tryParse(fenced[1].trim());
     if (nested) return nested;
-    throw new Error("memory decision subagent returned invalid JSON");
-  })();
+  }
+  throw new Error("finalize memory candidates returned invalid JSON");
 }
 
-function parseSaveItem(value: unknown): MemoryDraft | null {
+function parseCandidateItem(value: unknown): MemoryCandidate | null {
   if (typeof value === "string") {
     const detail = norm(value);
-    return detail ? { detail } : null;
+    return detail ? { candidateId: sha256(detail), detail } : null;
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   const detail = typeof record.detail === "string" ? norm(record.detail) : "";
   if (!detail) return null;
+  const title = typeof record.title === "string" ? record.title : undefined;
   const kind = typeof record.kind === "string" ? record.kind : undefined;
-  const topics = Array.isArray(record.topics) ? record.topics.filter((v): v is string => typeof v === "string") : undefined;
+  const topics = Array.isArray(record.topics) ? record.topics.filter((topic): topic is string => typeof topic === "string") : undefined;
+  const evidence = typeof record.evidence === "string" ? norm(record.evidence) : undefined;
   try {
-    return normalizeDraft({ detail, ...(kind ? { kind } : {}), ...(topics ? { topics } : {}) });
+    const draft = normalizeDraft({
+      ...(title ? { title } : {}),
+      detail,
+      ...(kind ? { kind } : {}),
+      ...(topics ? { topics } : {}),
+    });
+    return {
+      candidateId: sha256(draft.detail),
+      detail: draft.detail,
+      ...(draft.title ? { title: draft.title } : {}),
+      ...(draft.kind ? { kind: draft.kind } : {}),
+      ...(draft.topics ? { topics: draft.topics } : {}),
+      ...(evidence ? { evidence } : {}),
+    };
   } catch {
     return null;
   }
+}
+
+export function mergeMemoryCandidates(base: MemoryCandidate[], next: MemoryCandidate[]): MemoryCandidate[] {
+  const out = new Map<string, MemoryCandidate>();
+  for (const candidate of [...base, ...next]) {
+    const existing = out.get(candidate.candidateId);
+    if (!existing) {
+      out.set(candidate.candidateId, {
+        ...candidate,
+        ...(candidate.topics ? { topics: uniqueNormalized(candidate.topics) } : {}),
+      });
+      continue;
+    }
+    out.set(candidate.candidateId, {
+      candidateId: candidate.candidateId,
+      detail: candidate.detail || existing.detail,
+      ...(candidate.title || existing.title ? { title: candidate.title || existing.title } : {}),
+      ...(candidate.kind || existing.kind ? { kind: candidate.kind || existing.kind } : {}),
+      ...((candidate.topics || existing.topics)
+        ? { topics: uniqueNormalized([...(existing.topics ?? []), ...(candidate.topics ?? [])]) }
+        : {}),
+      ...(candidate.evidence || existing.evidence ? { evidence: candidate.evidence || existing.evidence } : {}),
+    });
+  }
+  return [...out.values()];
 }

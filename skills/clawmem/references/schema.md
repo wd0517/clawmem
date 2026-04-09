@@ -54,7 +54,8 @@ If you create a curated memory manually, include:
 
 - Before inventing a new `kind` or `topic`, call `memory_labels`.
 - Reuse current schema when it already fits.
-- If the current schema does not fit and a new label would help future retrieval, coordination, or reuse, create it deliberately.
+- If the current schema does not fit and a new label would help future retrieval, coordination, or reuse, create one deliberate new machine-readable label.
+- Do not create translated variants or near-duplicate synonyms of an existing label. Prefer reuse first, then one canonical new label if needed.
 - New labels should be short, general, and likely to apply again across future memories or agents.
 - Do not invent random label prefixes. Schema evolution must stay within `kind:*` and `topic:*`.
 

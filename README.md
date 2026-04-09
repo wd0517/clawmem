@@ -4,8 +4,8 @@
 
 **What it does:**
 - Creates one `type:conversation` issue per session, mirrors the full transcript as comments.
-- During request-scoped hooks: best-effort extracts durable memories and stores each as a `type:memory` issue.
 - On session start: searches active memories by relevance and injects them into context.
+- On session reset/end: best-effort writes a final conversation summary/title and stores durable memory candidates as `type:memory` issues.
 - Lets agents inspect memory indexes and schema, fetch exact memories, update canonical facts in place, and write structured memories with `kind:*` and `topic:*` labels through plugin tools.
 
 ---
@@ -135,10 +135,10 @@ Full config with all options:
               token: "<token>"
             }
           },
-          turnCommentDelayMs: 1000,
           summaryWaitTimeoutMs: 120000,
+          memoryExtractWaitTimeoutMs: 45000,
           memoryRecallLimit: 5,
-          memoryAutoRecallLimit: 5
+          memoryAutoRecallLimit: 3
         }
       }
     }
@@ -151,10 +151,13 @@ Full config with all options:
 ## Notes
 
 - Conversation comments exclude tool calls, tool results, system messages, and heartbeat noise.
-- Summary failures do not block finalization; the `summary` field is written as `failed: ...`.
-- Memory search and auto-injection only return open `type:memory` issues. Closed memory issues are treated as stale.
-- `memory_recall` now prefers the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`, with a simple local lexical fallback when backend search is unavailable or returns no matches.
-- Durable memories are extracted best-effort during later request-scoped maintenance, not by background subagent work after a request has already ended.
+- Each `agent_end` mirrors conversation comments only; no background subagent-derived memory work runs after turns.
+- Finalization performs one request-scoped summarize-and-capture pass: generate the final issue summary/title plus durable memory candidates, then store exact-deduplicated memories.
+- Summary or memory-capture failures do not block finalization; the conversation issue still closes, and the mirrored transcript remains the durable source of truth for manual follow-up.
+- Memory search and auto-recall only return open `type:memory` issues. Closed memory issues are treated as stale.
+- ClawMem automatically injects a small set of relevant memories before each turn using the agent's default repo and the backend recall API. Auto-recall is best-effort and quietly skips injection when backend recall is unavailable.
+- `memory_recall` uses the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`. When backend recall is unavailable, use `memory_list` or `memory_get` to inspect memories explicitly.
+- Automatic durable capture happens when the session resets or ends. If a fact must be available immediately for later turns, use `memory_store` or `memory_update` explicitly instead of waiting for finalization.
 - The plugin exposes `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
 - Route resolution is now: agent identity supplies credentials, `defaultRepo` is the fallback memory space, and explicit tool calls may override repo per operation.
 - `memory_store` accepts optional schema hints such as kind and topics; the plugin normalizes them into managed `kind:*` and `topic:*` labels.
@@ -162,4 +165,4 @@ Full config with all options:
 - `memory_update` updates one existing memory issue in place; use it for evolving canonical facts or active tasks instead of creating a duplicate node.
 - Conversation lifecycle is stored in native issue state (`open` while live, `closed` after finalize); memory lifecycle uses native issue state too (`open` active, `closed` stale).
 - Memory extraction now prefers one atomic fact per memory item instead of bundling whole sessions into a single node.
-- Memory issue bodies store the durable detail plus flat metadata such as `memory_hash` and logical `date`; labels are reserved for schema and routing.
+- Memory issue bodies store the durable detail in a YAML `detail` field plus flat metadata such as `memory_hash` and logical `date`; this matches the current Console parser in `agent-git-service/web`.

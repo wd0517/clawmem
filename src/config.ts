@@ -46,9 +46,9 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
     authScheme: raw.authScheme === "bearer" ? "bearer" : "token",
     agents,
     memoryRecallLimit: clamp(num(raw.memoryRecallLimit, 5), 1, 20),
-    memoryAutoRecallLimit: clamp(num(raw.memoryAutoRecallLimit, num(raw.memoryRecallLimit, 5)), 1, 20),
-    turnCommentDelayMs: num(raw.turnCommentDelayMs, 1000),
+    memoryAutoRecallLimit: clamp(num(raw.memoryAutoRecallLimit, 3), 1, 20),
     summaryWaitTimeoutMs: clamp(num(raw.summaryWaitTimeoutMs, 120000), 1000, 600000),
+    memoryExtractWaitTimeoutMs: clamp(num(raw.memoryExtractWaitTimeoutMs, 45000), 1000, 600000),
   };
 }
 

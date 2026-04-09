@@ -4,10 +4,14 @@ import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { AGENT_LABEL_PREFIX, DEFAULT_LABELS, SESSION_TITLE_PREFIX, extractLabelNames } from "./config.js";
 import type { GitHubIssueClient } from "./github-client.js";
+import { parseCandidates } from "./memory.js";
 import { normalizeMessages, readTranscriptSnapshot } from "./transcript.js";
-import type { ClawMemPluginConfig, NormalizedMessage, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import type { ClawMemPluginConfig, MemoryCandidate, MemorySchema, NormalizedMessage, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { fmtTranscript, localDate, localDateTime, sha256, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
+
+const FINALIZE_SCHEMA_KIND_LIMIT = 24;
+const FINALIZE_SCHEMA_TOPIC_LIMIT = 80;
 
 export class ConversationMirror {
   constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
@@ -16,12 +20,15 @@ export class ConversationMirror {
     if (sessionId.startsWith("slug-generator-")) return false;
     const first = messages.find((m) => m.role === "user")?.text ?? "";
     if (first.includes("generate a short 1-2 word filename slug") && first.includes("Reply with ONLY the slug")) return false;
-    if (first.includes("Summarize the following conversation.") && first.includes('Return valid JSON only in the form {"summary":"..."}')) return false;
-    if (first.includes("Extract durable memories from the conversation below.") && first.includes('Return JSON only in the form {"save":')) return false;
+    if (first.includes("Write the final issue summary and extract durable memory candidates from the conversation below.")) return false;
     return true;
   }
 
   async loadSnapshot(session: SessionMirrorState, fallback: unknown[]): Promise<TranscriptSnapshot> {
+    const normalizedFallback = normalizeMessages(fallback);
+    if (normalizedFallback.length > 0) {
+      return { sessionId: session.sessionId, messages: normalizedFallback };
+    }
     const filePath = await this.resolveTranscriptPath(session.sessionFile);
     if (filePath) {
       session.sessionFile = filePath;
@@ -32,7 +39,7 @@ export class ConversationMirror {
         this.api.logger.warn(`clawmem: transcript read failed for ${filePath}: ${String(error)}`);
       }
     }
-    return { sessionId: session.sessionId, messages: normalizeMessages(fallback) };
+    return { sessionId: session.sessionId, messages: normalizedFallback };
   }
 
   async ensureIssue(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<void> {
@@ -90,174 +97,34 @@ export class ConversationMirror {
     return count;
   }
 
-  async generateSummaryAndTitle(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<{ summary: string; title?: string }> {
-    if (snapshot.messages.length === 0) throw new Error("no conversation messages to summarize");
+  async generateFinalArtifacts(
+    session: SessionMirrorState,
+    snapshot: TranscriptSnapshot,
+    schema?: MemorySchema,
+  ): Promise<{ summary: string; title?: string; candidates: MemoryCandidate[] }> {
+    if (snapshot.messages.length === 0) throw new Error("no conversation messages to finalize");
     const subagent = this.api.runtime.subagent;
-    const sessionKey = subKey(session, "summary");
-    const message = [
-      "Summarize the following conversation and generate a short title.",
-      'Return valid JSON only in the form {"summary":"...","title":"..."}',
-      "The summary should be concise, factual, and written in 2-4 sentences.",
-      "Do not include markdown, bullet points, or analysis.",
-      "",
-      "Title rules:",
-      "- Under 50 characters, accurately describe the main topic or task.",
-      "- Should let someone immediately know what the conversation is about.",
-      "- Must be in the same language as the majority of the conversation content.",
-      "- Good: precise, descriptive, specific. Bad: vague, overly creative, generic.",
-      "", "<conversation>", fmtTranscript(snapshot.messages), "</conversation>",
-    ].join("\n");
+    const sessionKey = subKey(session, "finalize");
+    const message = buildFinalizeArtifactsPrompt(snapshot, schema);
     try {
       const run = await subagent.run({
-        sessionKey, message, deliver: false, lane: "clawmem-summary",
-        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:summary-v2`),
-        extraSystemPrompt: "You summarize conversations and generate accurate, descriptive titles. Output JSON only with string fields summary and title.",
+        sessionKey,
+        message,
+        deliver: false,
+        lane: "clawmem-finalize",
+        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:finalize-v2`),
+        extraSystemPrompt: "You finalize ClawMem conversations. Output JSON only with summary, title, and durable memory candidates. Reuse existing schema when it fits and keep human-readable memory text in the conversation language.",
       });
-      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.summaryWaitTimeoutMs });
-      if (wait.status === "timeout") throw new Error("summary subagent timed out");
-      if (wait.status === "error") throw new Error(wait.error || "summary subagent failed");
+      const wait = await subagent.waitForRun({
+        runId: run.runId,
+        timeoutMs: Math.max(this.config.summaryWaitTimeoutMs, this.config.memoryExtractWaitTimeoutMs),
+      });
+      if (wait.status === "timeout") throw new Error("finalize subagent timed out");
+      if (wait.status === "error") throw new Error(wait.error || "finalize subagent failed");
       const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
-      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!text) throw new Error("summary subagent returned no assistant text");
-      return parseSummaryAndTitle(text);
-    } finally { subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {}); }
-  }
-
-  /** If the title has not yet been generated by LLM, generate an accurate title from the full conversation and update the issue. */
-  async syncTitle(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<void> {
-    if (!session.issueNumber) return;
-    if (session.titleSource === "llm") return;
-    if (snapshot.messages.length < 2) return;
-    try {
-      const title = await this.generateTitle(session, snapshot);
-      if (title) {
-        await this.client.updateIssue(session.issueNumber, { title });
-        session.issueTitle = title;
-        session.titleSource = "llm";
-      }
-    } catch (e) {
-      this.api.logger.warn(`clawmem: title sync failed: ${String(e)}`);
-    }
-  }
-
-  /** Generate an accurate, descriptive title from the full conversation content via LLM. */
-  async generateTitle(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<string | undefined> {
-    if (snapshot.messages.length === 0) return undefined;
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = subKey(session, "title");
-    const message = [
-      "Generate a short, accurate title for the following conversation.",
-      'Return valid JSON only in the form {"title":"..."}',
-      "",
-      "Title rules:",
-      "- Under 50 characters.",
-      "- Accurately describe the main topic or task of the conversation.",
-      "- Should let someone immediately know what the conversation is about.",
-      "- Must be in the same language as the majority of the conversation content.",
-      "- Good: precise, descriptive, specific. Bad: vague, overly creative, generic.",
-      "",
-      "<conversation>",
-      fmtTranscript(snapshot.messages),
-      "</conversation>",
-    ].join("\n");
-    try {
-      const run = await subagent.run({
-        sessionKey, message, deliver: false, lane: "clawmem-title",
-        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:title-v1`),
-        extraSystemPrompt: "You generate accurate, descriptive titles for conversations. Output JSON only with a string field title.",
-      });
-      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: 30000 });
-      if (wait.status === "timeout" || wait.status === "error") return undefined;
-      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 10 })).messages);
-      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!text) return undefined;
-      return parseTitle(text);
-    } catch (e) {
-      this.api.logger.warn(`clawmem: title generation failed: ${String(e)}`);
-      return undefined;
-    } finally {
-      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
-    }
-  }
-
-  /** Re-title all existing conversation issues. Uses summary when available, falls back to reading comments. */
-  async retitleConversations(): Promise<{ updated: number; skipped: number; failed: number; retitledIssues: number[] }> {
-    let updated = 0, skipped = 0, failed = 0;
-    const retitledIssues: number[] = [];
-    let page = 1;
-    while (true) {
-      const issues = await this.client.listIssues({ labels: ["type:conversation"], state: "all", page, perPage: 50 });
-      if (issues.length === 0) break;
-      for (const issue of issues) {
-        try {
-          const yaml = parseFlatYaml(issue.body || "");
-          const summary = yaml.summary;
-          let titleInput: string | undefined;
-          if (summary && summary !== "pending" && !summary.startsWith("failed:")) {
-            titleInput = summary;
-          } else {
-            // No usable summary — reconstruct conversation from issue comments.
-            const comments = await this.client.listComments(issue.number, { perPage: 50 });
-            const conversationText = comments
-              .map((c) => c.body?.trim())
-              .filter((b): b is string => Boolean(b))
-              .join("\n\n");
-            if (conversationText.length >= 20) {
-              // Cap to avoid excessive token usage in LLM call.
-              titleInput = conversationText.length > 4000 ? conversationText.slice(0, 4000) + "\n..." : conversationText;
-            }
-          }
-          if (!titleInput) { skipped++; continue; }
-          const title = await this.generateTitleFromText(titleInput, `retitle-${issue.number}`);
-          if (!title) { skipped++; continue; }
-          await this.client.updateIssue(issue.number, { title });
-          this.api.logger.info?.(`clawmem: retitled issue #${issue.number} -> "${title}"`);
-          retitledIssues.push(issue.number);
-          updated++;
-        } catch (e) {
-          this.api.logger.warn(`clawmem: retitle failed for issue #${issue.number}: ${String(e)}`);
-          failed++;
-        }
-      }
-      if (issues.length < 50) break;
-      page++;
-    }
-    return { updated, skipped, failed, retitledIssues };
-  }
-
-  private async generateTitleFromText(text: string, uniqueKey: string): Promise<string | undefined> {
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = `clawmem-${uniqueKey}`;
-    const message = [
-      "Generate a short, accurate title based on the following conversation content.",
-      'Return valid JSON only in the form {"title":"..."}',
-      "",
-      "Title rules:",
-      "- Under 50 characters.",
-      "- Accurately describe the main topic or task.",
-      "- Should let someone immediately know what the conversation was about.",
-      "- Must be in the same language as the content.",
-      "- Good: precise, descriptive, specific. Bad: vague, overly creative, generic.",
-      "",
-      "<content>",
-      text,
-      "</content>",
-    ].join("\n");
-    try {
-      const run = await subagent.run({
-        sessionKey, message, deliver: false, lane: "clawmem-retitle",
-        idempotencyKey: sha256(`retitle:${uniqueKey}:${text.slice(0, 200)}`),
-        extraSystemPrompt: "You generate accurate, descriptive titles. Output JSON only with a string field title.",
-      });
-      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: 30000 });
-      if (wait.status === "timeout" || wait.status === "error") return undefined;
-      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 10 })).messages);
-      const raw = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!raw) return undefined;
-      return parseTitle(raw);
-    } catch (e) {
-      this.api.logger.warn(`clawmem: title generation from text failed (${uniqueKey}): ${String(e)}`);
-      return undefined;
+      const text = [...msgs].reverse().find((entry) => entry.role === "assistant" && entry.text.trim())?.text;
+      if (!text) throw new Error("finalize subagent returned no assistant text");
+      return parseFinalArtifacts(text);
     } finally {
       subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
     }
@@ -328,6 +195,65 @@ export class ConversationMirror {
   }
 }
 
+export function buildFinalizeArtifactsPrompt(snapshot: TranscriptSnapshot, schema?: MemorySchema): string {
+  return [
+    "Write the final issue summary and extract durable memory candidates from the conversation below.",
+    'Return valid JSON only in the form {"summary":"...","title":"...","candidates":[{"title":"...","detail":"...","kind":"...","topics":["..."],"evidence":"..."}]}.',
+    "The summary should be concise, factual, and written in 2-4 sentences.",
+    "Do not include markdown, bullet points, or analysis.",
+    "",
+    "Title rules:",
+    "- Under 50 characters, accurately describe the main topic or task.",
+    "- Should let someone immediately know what the conversation is about.",
+    "- Must be in the same language as the majority of the conversation content.",
+    "- Good: precise, descriptive, specific. Bad: vague, overly creative, generic.",
+    "",
+    "Candidate rules:",
+    "- Extract only durable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
+    "- Each candidate must represent one durable fact. Split independent facts into separate candidates.",
+    "- Prefer a concise explicit title for each candidate whenever the fact can be named clearly.",
+    "- Candidate titles and details must be in the same language as the majority of the conversation content.",
+    "- Do not extract temporary requests, tool chatter, startup boilerplate, or summaries about internal helper sessions.",
+    "- Reuse existing schema labels when one already fits.",
+    "- If no existing kind or topic fits, create one short stable machine-readable label instead of a translated or near-duplicate variant.",
+    "- Keep kind and topic labels short, reusable, low-cardinality, and machine-readable.",
+    "- Evidence is optional. If present, keep it short and quote-free.",
+    "- Prefer an empty candidates array when nothing durable was learned.",
+    "",
+    ...buildFinalizeSchemaSection(schema),
+    "<conversation>",
+    fmtTranscript(snapshot.messages),
+    "</conversation>",
+  ].join("\n");
+}
+
+function buildFinalizeSchemaSection(schema?: MemorySchema): string[] {
+  if (!schema) return [];
+
+  const kinds = schema.kinds.map((kind) => kind.trim()).filter(Boolean);
+  const topics = schema.topics.map((topic) => topic.trim()).filter(Boolean);
+  if (kinds.length === 0 && topics.length === 0) return [];
+
+  const kindLines = kinds.slice(0, FINALIZE_SCHEMA_KIND_LIMIT).map((kind) => `- kind:${kind}`);
+  const topicLines = topics.slice(0, FINALIZE_SCHEMA_TOPIC_LIMIT).map((topic) => `- topic:${topic}`);
+  const kindOverflow = kinds.length > kindLines.length ? [`- ...and ${kinds.length - kindLines.length} more kinds`] : [];
+  const topicOverflow = topics.length > topicLines.length ? [`- ...and ${topics.length - topicLines.length} more topics`] : [];
+
+  return [
+    "Current schema to reuse first:",
+    "<current-schema>",
+    "Kinds:",
+    ...(kindLines.length > 0 ? kindLines : ["- None"]),
+    ...kindOverflow,
+    "Topics:",
+    ...(topicLines.length > 0 ? topicLines : ["- None"]),
+    ...topicOverflow,
+    "</current-schema>",
+    "Prefer these existing labels whenever they fit. Only create a new label when none of the current labels matches the fact you are storing.",
+    "",
+  ];
+}
+
 async function fexists(p: string): Promise<boolean> { try { return (await fs.promises.stat(p)).isFile(); } catch { return false; } }
 function isNotFoundError(error: unknown): boolean {
   const text = String(error);
@@ -367,26 +293,12 @@ function parseSummaryAndTitle(raw: string): { summary: string; title?: string } 
   return { summary: t };
 }
 
-function parseTitle(raw: string): string | undefined {
-  const tryParse = (s: string): string | undefined => {
-    try {
-      const p = JSON.parse(s) as { title?: unknown };
-      return typeof p?.title === "string" && p.title.trim() ? p.title.trim() : undefined;
-    } catch {
-      const i = s.indexOf("{"), j = s.lastIndexOf("}");
-      if (i >= 0 && j > i) {
-        try {
-          const p = JSON.parse(s.slice(i, j + 1)) as { title?: unknown };
-          return typeof p?.title === "string" && p.title.trim() ? p.title.trim() : undefined;
-        } catch { return undefined; }
-      }
-      return undefined;
-    }
+function parseFinalArtifacts(raw: string): { summary: string; title?: string; candidates: MemoryCandidate[] } {
+  const parsedSummary = parseSummaryAndTitle(raw);
+  const candidates = parseCandidates(raw);
+  return {
+    summary: parsedSummary.summary,
+    ...(parsedSummary.title ? { title: parsedSummary.title } : {}),
+    candidates,
   };
-  const t = raw.trim();
-  const direct = tryParse(t);
-  if (direct) return direct;
-  const f = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(t);
-  if (f?.[1]) return tryParse(f[1].trim());
-  return undefined;
 }

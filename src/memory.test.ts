@@ -1,5 +1,6 @@
-import { MemoryStore, scoreMemoryMatch } from "./memory.js";
+import { MemoryStore, mergeMemoryCandidates } from "./memory.js";
 import type { ParsedMemoryIssue } from "./types.js";
+import { sha256 } from "./utils.js";
 import { stringifyFlatYaml } from "./yaml.js";
 
 function memory(overrides: Partial<ParsedMemoryIssue> = {}): ParsedMemoryIssue {
@@ -41,49 +42,47 @@ function assert(condition: unknown, message: string): void {
   if (!condition) throw new Error(message);
 }
 
-function testConfig(): never {
-  return {
-    memoryRecallLimit: 5,
-    memoryAutoRecallLimit: 5,
-    turnCommentDelayMs: 1000,
-    summaryWaitTimeoutMs: 120000,
-  } as never;
-}
-
-async function testSearchRanking(): Promise<void> {
-  const issues = [
-    issueFromMemory(memory({
-      issueNumber: 1,
-      title: "Memory: Redis rate limit tuning",
-      detail: "Distributed Redis rate limiting must use Lua scripts to stay atomic.",
-      kind: "lesson",
-      topics: ["redis", "rate-limiting"],
-    })),
-    issueFromMemory(memory({
-      issueNumber: 2,
-      title: "Memory: Generic backend notes",
-      detail: "We use Redis in several services, but this one is not about rate limiting.",
-      topics: ["backend"],
-    })),
-  ];
+async function testBackendSearchBuildsSingleCleanedQuery(): Promise<void> {
+  const queries: string[] = [];
   const client = {
-    listIssues: async () => issues,
+    repo: () => "owner/main-memory",
+    searchIssues: async (query: string) => {
+      queries.push(query);
+      return [] as IssueRecord[];
+    },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
-  const found = await store.search("redis rate limiting", 5);
-  assert(found.length === 2, "expected both memories to match");
-  assert(found[0]?.issueNumber === 1, "expected the more specific Redis rate limiting memory to rank first");
+  const store = new MemoryStore(client as never);
+  await store.search([
+    "<clawmem-context>",
+    "- [11] Previous memory that should be stripped",
+    "</clawmem-context>",
+    "Conversation info (untrusted metadata):",
+    "```json",
+    '{"channel":"slack"}',
+    "```",
+    "",
+    "[message_id: abc-123]",
+    "",
+    "[Slack 2026-04-03 09:30]: Please help debug the Redis rate limiting path.",
+    "See https://example.com/debug for more context.",
+    "throw new TimeoutError('lua script timeout')",
+    "[System: auto-translated]",
+  ].join("\n"), 5);
+
+  assert(queries.length === 1, "expected a single backend search query");
+  assert(queries[0]?.includes("repo:owner/main-memory"), "expected the backend query to stay scoped to the repo");
+  assert(queries[0]?.includes('label:"type:memory"'), "expected the backend query to filter memory issues");
+  assert((queries[0] ?? "").length <= 1610, "expected the backend search query to stay within the configured cap plus qualifiers");
+  assert(queries[0]?.toLowerCase().includes("redis"), "expected the backend query to retain key terms");
+  assert(!queries[0]?.includes("<clawmem-context>"), "expected injected clawmem context to be stripped");
+  assert(!queries[0]?.includes("https://example.com/debug"), "expected URLs to be stripped from backend recall");
+  assert(!queries[0]?.includes("Conversation info (untrusted metadata):"), "expected inbound metadata blocks to be stripped");
+  assert(!queries[0]?.includes("[message_id:"), "expected message id hints to be stripped");
+  assert(!queries[0]?.includes("[Slack 2026-04-03 09:30]"), "expected envelope prefixes to be stripped");
+  assert(!queries[0]?.includes("[System: auto-translated]"), "expected trailing system hints to be stripped");
 }
 
 async function testBackendSearchPreferredForRecall(): Promise<void> {
-  const listed = [
-    issueFromMemory(memory({
-      issueNumber: 1,
-      title: "Memory: lexical decoy",
-      detail: "redis rate limiting checklist",
-      kind: "lesson",
-    })),
-  ];
   const searched = [
     issueFromMemory(memory({
       issueNumber: 2,
@@ -96,14 +95,13 @@ async function testBackendSearchPreferredForRecall(): Promise<void> {
   const queries: string[] = [];
   const client = {
     repo: () => "owner/main-memory",
-    listIssues: async () => listed,
     searchIssues: async (query: string) => {
       queries.push(query);
       return searched;
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
-  const found = await store.search("redis rate limiting", 5);
+  const store = new MemoryStore(client as never);
+  const found = await store.search("redis rate limiting", 1);
 
   assert(queries.length === 1, "expected backend search to be called once");
   assert(queries[0]?.includes('repo:owner/main-memory'), "expected backend query to scope to the current repo");
@@ -111,7 +109,7 @@ async function testBackendSearchPreferredForRecall(): Promise<void> {
   assert(found.length === 1 && found[0]?.issueNumber === 2, "expected backend search results to be preferred");
 }
 
-async function testBackendSearchFallsBackToLocalLexical(): Promise<void> {
+async function testBackendSearchReturnsEmptyWithoutLexicalFallback(): Promise<void> {
   const issues = [
     issueFromMemory(memory({
       issueNumber: 3,
@@ -124,31 +122,54 @@ async function testBackendSearchFallsBackToLocalLexical(): Promise<void> {
   const client = {
     repo: () => "owner/main-memory",
     listIssues: async () => issues,
-    searchIssues: async () => { throw new Error("search unavailable"); },
+    searchIssues: async () => [] as IssueRecord[],
   };
-  const store = new MemoryStore(client as never, { logger: { warn: () => {} } } as never, testConfig());
+  const store = new MemoryStore(client as never);
   const found = await store.search("redis rate limiting", 5);
 
-  assert(found.length === 1 && found[0]?.issueNumber === 3, "expected lexical fallback when backend search fails");
+  assert(found.length === 0, "expected backend-only recall to return no results when the backend finds nothing");
 }
 
-function testCjkScoring(): void {
-  const billing = memory({
-    issueNumber: 3,
-    title: "Memory: 账单修复流程",
-    detail: "遇到账单不一致时，先核对 invoice_id，再补发 webhook。",
-    topics: ["账单", "支付"],
-  });
-  const unrelated = memory({
-    issueNumber: 4,
-    title: "Memory: 部署备注",
-    detail: "发布前需要确认灰度流量比例。",
-    topics: ["部署"],
-  });
-  const billingScore = scoreMemoryMatch(billing, "账单 webhook");
-  const unrelatedScore = scoreMemoryMatch(unrelated, "账单 webhook");
-  assert(billingScore > unrelatedScore, "expected Chinese query scoring to prefer the billing memory");
-  assert(billingScore > 0, "expected Chinese query to produce a positive match score");
+async function testBackendSearchPropagatesErrors(): Promise<void> {
+  const client = {
+    repo: () => "owner/main-memory",
+    searchIssues: async () => { throw new Error("search unavailable"); },
+  };
+  const store = new MemoryStore(client as never);
+  let message = "";
+  try {
+    await store.search("redis rate limiting", 5);
+  } catch (error) {
+    message = String(error);
+  }
+
+  assert(message.includes("search unavailable"), "expected backend failures to propagate instead of falling back locally");
+}
+
+function testMergeMemoryCandidates(): void {
+  const merged = mergeMemoryCandidates(
+    [
+      {
+        candidateId: "abc",
+        detail: "Redis Lua scripts keep rate limiting atomic.",
+        topics: ["redis"],
+      },
+    ],
+    [
+      {
+        candidateId: "abc",
+        detail: "Redis Lua scripts keep rate limiting atomic.",
+        kind: "lesson",
+        topics: ["rate-limit"],
+        evidence: "User confirmed the production path uses Lua.",
+      },
+    ],
+  );
+
+  assert(merged.length === 1, "expected duplicate candidates to merge by candidateId");
+  assert(merged[0]?.kind === "lesson", "expected merged candidates to preserve new schema hints");
+  assert(JSON.stringify(merged[0]?.topics) === JSON.stringify(["rate-limit", "redis"]), "expected merged candidates to union topics");
+  assert(merged[0]?.evidence === "User confirmed the production path uses Lua.", "expected merged candidates to preserve evidence");
 }
 
 async function testStructuredStoreAndSchema(): Promise<void> {
@@ -156,6 +177,8 @@ async function testStructuredStoreAndSchema(): Promise<void> {
   const ensured: string[][] = [];
   const labels: LabelRecord[] = [{ name: "kind:lesson" }, { name: "topic:redis" }];
   const client = {
+    repo: () => "owner/main-memory",
+    searchIssues: async () => [] as IssueRecord[],
     listIssues: async () => [] as IssueRecord[],
     listLabels: async () => labels,
     ensureLabels: async (next: string[]) => { ensured.push(next); },
@@ -164,7 +187,7 @@ async function testStructuredStoreAndSchema(): Promise<void> {
       return { number: 99, title: payload.title };
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const result = await store.store({ detail: "Redis Lua scripts are required for atomic rate limiting.", kind: "Lesson", topics: ["Redis Ops", "rate_limit"] });
   const schema = await store.listSchema();
 
@@ -177,10 +200,75 @@ async function testStructuredStoreAndSchema(): Promise<void> {
   assert(created[0]?.labels.includes("topic:rate-limit"), "expected created labels to include normalized topic");
   assert(!created[0]?.labels.some((label) => label.startsWith("session:")), "expected manual memory_store writes to omit synthetic session labels");
   assert(!created[0]?.labels.some((label) => label.startsWith("date:")), "expected new memory labels to omit date labels");
+  assert(created[0]?.body.includes("memory_hash:"), "expected new memory body to retain metadata fields");
+  assert(created[0]?.body.includes("detail: Redis Lua scripts are required for atomic rate limiting."), "expected new memory body to store detail in YAML");
   assert(created[0]?.body.includes(`date: ${result.memory.date}`), "expected new memory body to retain logical date metadata");
   assert(ensured[0]?.includes("kind:lesson"), "expected ensureLabels to include kind label");
   assert(schema.kinds.includes("lesson"), "expected schema to expose existing kind labels");
   assert(schema.topics.includes("redis"), "expected schema to expose existing topic labels");
+}
+
+async function testListSchemaPrefersLabelsWithoutIssueScan(): Promise<void> {
+  const client = {
+    listLabels: async () => [{ name: "kind:lesson" }, { name: "topic:redis" }, { name: "topic:rate-limit" }],
+    listIssues: async () => { throw new Error("listSchema should not scan issues when label schema is available"); },
+  };
+  const store = new MemoryStore(client as never);
+  const schema = await store.listSchema();
+
+  assert(JSON.stringify(schema.kinds) === JSON.stringify(["lesson"]), "expected schema kinds to come from labels");
+  assert(JSON.stringify(schema.topics) === JSON.stringify(["rate-limit", "redis"]), "expected schema topics to come from labels");
+}
+
+async function testStoreDeduplicatesViaHashSearch(): Promise<void> {
+  const detail = "Redis Lua scripts are required for atomic rate limiting.";
+  const hash = sha256(detail);
+  const existing = memory({
+    issueNumber: 77,
+    detail,
+    memoryHash: hash,
+    kind: "lesson",
+    topics: ["redis-ops"],
+  });
+  const queries: string[] = [];
+  const client = {
+    repo: () => "owner/main-memory",
+    searchIssues: async (query: string) => {
+      queries.push(query);
+      return [issueFromMemory(existing)];
+    },
+    listIssues: async () => { throw new Error("store should not scan all active memories"); },
+    ensureLabels: async () => {},
+    createIssue: async () => { throw new Error("store should not create a duplicate issue"); },
+  };
+  const store = new MemoryStore(client as never);
+  const result = await store.store({ detail, kind: "lesson", topics: ["redis_ops"] });
+
+  assert(result.created === false, "expected hash search to reuse an existing exact duplicate");
+  assert(result.memory.issueNumber === 77, "expected hash search to return the existing memory");
+  assert(queries.length === 1 && queries[0]?.includes(hash), "expected store to query by memory hash");
+}
+
+async function testStoreKeepsFullAutoTitleAndSupportsExplicitTitle(): Promise<void> {
+  const created: Array<{ title: string; body: string; labels: string[] }> = [];
+  const client = {
+    listIssues: async () => [] as IssueRecord[],
+    listLabels: async () => [] as LabelRecord[],
+    ensureLabels: async () => {},
+    createIssue: async (payload: { title: string; body: string; labels: string[] }) => {
+      created.push(payload);
+      return { number: created.length + 100, title: payload.title };
+    },
+  };
+  const store = new MemoryStore(client as never);
+  const longDetail = "Tech Decision #001: Frontend = React Native, Backend = FastAPI, Database = PostgreSQL, and analytics events must stay append-only for auditability.";
+  const auto = await store.store({ detail: longDetail });
+  const explicit = await store.store({ title: "Architecture Decision #001", detail: "Use React Native + FastAPI for the first mobile stack." });
+
+  assert(auto.memory.title === `Memory: ${longDetail}`, "expected auto-generated memory title to keep the full detail without truncation");
+  assert(explicit.memory.title === "Memory: Architecture Decision #001", "expected explicit memory title to be preserved");
+  assert(created[0]?.title === `Memory: ${longDetail}`, "expected created issue title to keep the full auto title");
+  assert(created[1]?.title === "Memory: Architecture Decision #001", "expected created issue title to use the explicit title");
 }
 
 async function testGetAndListMemories(): Promise<void> {
@@ -209,6 +297,11 @@ async function testGetAndListMemories(): Promise<void> {
     })),
   ];
   const client = {
+    getIssue: async (number: number) => {
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      return issue;
+    },
     listIssues: async (params?: { labels?: string[]; state?: "open" | "closed" | "all" }) => {
       const labels = params?.labels ?? [];
       const state = params?.state ?? "open";
@@ -220,7 +313,7 @@ async function testGetAndListMemories(): Promise<void> {
       });
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const exact = await store.get("4");
   const activeFacts = await store.listMemories({ status: "active", kind: "core-fact", limit: 10 });
   const sports = await store.listMemories({ status: "all", topic: "sports", limit: 10 });
@@ -241,6 +334,12 @@ async function testLegacyMemoriesWithoutSessionOrDate(): Promise<void> {
     },
   ];
   const client = {
+    repo: () => "owner/main-memory",
+    getIssue: async (number: number) => {
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      return issue;
+    },
     listIssues: async (params?: { labels?: string[]; state?: "open" | "closed" | "all" }) => {
       const labels = params?.labels ?? [];
       const state = params?.state ?? "open";
@@ -251,8 +350,9 @@ async function testLegacyMemoriesWithoutSessionOrDate(): Promise<void> {
         return (issue.state ?? "open") === state;
       });
     },
+    searchIssues: async () => issues,
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const exact = await store.get("4");
   const recalled = await store.search("F1 Dota 2", 5);
 
@@ -275,6 +375,11 @@ async function testUpdateMemoryInPlace(): Promise<void> {
   const updatedIssues: Array<{ number: number; title?: string; body?: string }> = [];
   const syncedLabels: Array<{ number: number; labels: string[] }> = [];
   const client = {
+    getIssue: async (number: number) => {
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      return issue;
+    },
     listIssues: async (params?: { labels?: string[]; state?: "open" | "closed" | "all" }) => {
       const labels = params?.labels ?? [];
       const state = params?.state ?? "open";
@@ -301,7 +406,7 @@ async function testUpdateMemoryInPlace(): Promise<void> {
       issue.labels = labels;
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const updated = await store.update("4", {
     detail: "xiangz likes F1, watches Dota 2 as a viewer, and recently follows tennis.",
     topics: ["preferences", "sports"],
@@ -312,8 +417,100 @@ async function testUpdateMemoryInPlace(): Promise<void> {
   assert(JSON.stringify(updated?.topics) === JSON.stringify(["preferences", "sports"]), "expected topics to be replaced");
   assert(updatedIssues.length === 1, "expected a single issue update");
   assert(updatedIssues[0]?.title !== "Memory: xiangz preferences", "expected title to refresh from updated detail");
+  assert(updatedIssues[0]?.body?.includes("memory_hash:"), "expected updated body to retain metadata");
+  assert(updatedIssues[0]?.body?.includes("detail:"), "expected updated body to store a detail field in YAML");
+  assert(updatedIssues[0]?.body?.includes("recently follows tennis"), "expected updated body to contain the updated detail text");
   assert(ensured[0]?.includes("topic:sports"), "expected new topic label to be ensured");
   assert(syncedLabels[0]?.labels.includes("kind:core-fact"), "expected existing kind label to be preserved");
+}
+
+async function testUpdateSupportsExplicitRetitle(): Promise<void> {
+  const issues: IssueRecord[] = [
+    issueFromMemory(memory({
+      issueNumber: 20,
+      title: "Memory: old short title",
+      detail: "We use append-only audit events for billing changes.",
+      kind: "convention",
+    })),
+  ];
+  const updatedIssues: Array<{ number: number; title?: string; body?: string }> = [];
+  const client = {
+    getIssue: async (number: number) => {
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      return issue;
+    },
+    listIssues: async (params?: { labels?: string[]; state?: "open" | "closed" | "all" }) => {
+      const labels = params?.labels ?? [];
+      const state = params?.state ?? "open";
+      return issues.filter((issue) => {
+        const issueLabels = issue.labels ?? [];
+        if (!labels.every((label) => issueLabels.includes(label))) return false;
+        if (state === "all") return true;
+        return (issue.state ?? "open") === state;
+      });
+    },
+    ensureLabels: async () => {},
+    updateIssue: async (number: number, patch: { title?: string; body?: string }) => {
+      updatedIssues.push({ number, ...patch });
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      if (patch.title) issue.title = patch.title;
+      if (patch.body) issue.body = patch.body;
+      return issue;
+    },
+    syncManagedLabels: async () => {},
+  };
+  const store = new MemoryStore(client as never);
+  const updated = await store.update("20", { title: "Billing Audit Convention" });
+
+  assert(updated?.title === "Memory: Billing Audit Convention", "expected memory_update to support explicit retitle");
+  assert(updatedIssues[0]?.title === "Memory: Billing Audit Convention", "expected issue title patch to use the explicit retitle");
+}
+
+async function testUpdateUsesHashSearchForDuplicateCheck(): Promise<void> {
+  const currentDetail = "We use append-only audit events for billing changes.";
+  const conflictingDetail = "Billing events must stay append-only for auditability.";
+  const current = issueFromMemory(memory({
+    issueNumber: 20,
+    title: "Memory: billing convention",
+    detail: currentDetail,
+    memoryHash: sha256(currentDetail),
+    kind: "convention",
+  }));
+  const conflicting = issueFromMemory(memory({
+    issueNumber: 21,
+    title: "Memory: audit rule",
+    detail: conflictingDetail,
+    memoryHash: sha256(conflictingDetail),
+    kind: "convention",
+  }));
+  const queries: string[] = [];
+  const client = {
+    repo: () => "owner/main-memory",
+    getIssue: async (number: number) => {
+      if (number === 20) return current;
+      throw new Error("issue missing");
+    },
+    searchIssues: async (query: string) => {
+      queries.push(query);
+      return [conflicting];
+    },
+    listIssues: async () => { throw new Error("update should not scan all active memories when direct lookup/search are available"); },
+    ensureLabels: async () => {},
+    updateIssue: async () => { throw new Error("duplicate update should fail before mutating"); },
+    syncManagedLabels: async () => {},
+  };
+  const store = new MemoryStore(client as never);
+  let message = "";
+  try {
+    await store.update("20", { detail: conflictingDetail });
+  } catch (error) {
+    message = String(error);
+  }
+
+  assert(message.includes("[21]"), "expected duplicate detection to reference the conflicting memory");
+  assert(queries.length === 1 && queries[0]?.includes(sha256(conflictingDetail)), "expected update duplicate checks to search by memory hash");
 }
 
 async function testForgetClosesMemoryIssue(): Promise<void> {
@@ -329,6 +526,11 @@ async function testForgetClosesMemoryIssue(): Promise<void> {
   const syncedLabels: Array<{ number: number; labels: string[] }> = [];
   const updatedIssues: Array<{ number: number; state?: "open" | "closed" }> = [];
   const client = {
+    getIssue: async (number: number) => {
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      return issue;
+    },
     listIssues: async (params?: { labels?: string[]; state?: "open" | "closed" | "all" }) => {
       const labels = params?.labels ?? [];
       const state = params?.state ?? "open";
@@ -353,7 +555,7 @@ async function testForgetClosesMemoryIssue(): Promise<void> {
       return issue;
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const forgotten = await store.forget("12");
 
   assert(forgotten?.status === "stale", "expected forgotten memory to be returned as stale");
@@ -362,15 +564,21 @@ async function testForgetClosesMemoryIssue(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  await testSearchRanking();
+  await testBackendSearchBuildsSingleCleanedQuery();
   await testBackendSearchPreferredForRecall();
-  await testBackendSearchFallsBackToLocalLexical();
-  testCjkScoring();
+  await testBackendSearchReturnsEmptyWithoutLexicalFallback();
+  await testBackendSearchPropagatesErrors();
+  testMergeMemoryCandidates();
   await testStructuredStoreAndSchema();
+  await testListSchemaPrefersLabelsWithoutIssueScan();
+  await testStoreDeduplicatesViaHashSearch();
+  await testStoreKeepsFullAutoTitleAndSupportsExplicitTitle();
   await testGetAndListMemories();
   await testLegacyMemoriesWithoutSessionOrDate();
   await testUpdateMemoryInPlace();
+  await testUpdateSupportsExplicitRetitle();
   await testForgetClosesMemoryIssue();
+  await testUpdateUsesHashSearchForDuplicateCheck();
   console.log("memory tests passed");
 }
 
