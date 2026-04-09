@@ -108,22 +108,34 @@ function testBuildClawMemPromptSection(): void {
 function createFakePluginApi(options?: {
   slot?: string;
   exposeCapability?: boolean;
+  exposePromptSection?: boolean;
+  runtimeVersion?: string;
 }) {
   let registeredCapability: { promptBuilder?: typeof buildClawMemPromptSection } | undefined;
   let registeredPromptSection: typeof buildClawMemPromptSection | undefined;
+  const handlers = new Map<string, Array<(...args: any[]) => unknown>>();
+  const warnings: string[] = [];
+  const infos: string[] = [];
   const api = {
     id: "clawmem",
     name: "ClawMem",
     source: "test",
     registrationMode: "test",
     config: {},
-    pluginConfig: {},
+    pluginConfig: {
+      agents: {
+        main: {
+          token: "test-token",
+          defaultRepo: "acme/memory",
+        },
+      },
+    },
     logger: {
-      info: () => {},
-      warn: () => {},
+      info: (message: string) => { infos.push(message); },
+      warn: (message: string) => { warnings.push(message); },
     },
     runtime: {
-      version: "2026.4.9",
+      version: options?.runtimeVersion ?? "2026.4.9",
       config: {
         loadConfig: () => ({
           plugins: {
@@ -138,7 +150,11 @@ function createFakePluginApi(options?: {
       },
       subagent: {},
     },
-    on: () => {},
+    on: (event: string, handler: (...args: any[]) => unknown) => {
+      const current = handlers.get(event) ?? [];
+      current.push(handler);
+      handlers.set(event, current);
+    },
     registerTool: () => {},
     registerService: () => {},
     ...(options?.exposeCapability === false
@@ -148,15 +164,22 @@ function createFakePluginApi(options?: {
             registeredCapability = capability;
           },
         }),
-    registerMemoryPromptSection: (builder: typeof buildClawMemPromptSection) => {
-      registeredPromptSection = builder;
-    },
+    ...(options?.exposePromptSection === false
+      ? {}
+      : {
+          registerMemoryPromptSection: (builder: typeof buildClawMemPromptSection) => {
+            registeredPromptSection = builder;
+          },
+        }),
   };
 
   return {
     api,
     getRegisteredCapability: () => registeredCapability,
     getRegisteredPromptSection: () => registeredPromptSection,
+    getWarnings: () => warnings,
+    getInfos: () => infos,
+    getHandler: (event: string) => handlers.get(event)?.[0],
   };
 }
 
@@ -179,6 +202,50 @@ function testFallsBackToLegacyMemoryPromptSectionRegistration(): void {
   assert(Boolean(builder), "expected fallback registration through registerMemoryPromptSection");
   const prompt = builder?.({ availableTools: new Set(["memory_recall"]) }).join("\n") ?? "";
   assert(prompt.includes("## ClawMem"), "expected the fallback builder to emit ClawMem guidance");
+}
+
+function testOlderHostWithoutPromptRegistrationDoesNotWarn(): void {
+  const fake = createFakePluginApi({
+    exposeCapability: false,
+    exposePromptSection: false,
+    runtimeVersion: "2026.3.13",
+  });
+  createClawMemPlugin(fake.api as never);
+
+  assert(fake.getWarnings().length === 0, "expected older hosts without prompt registration to avoid warnings");
+  assert(
+    fake.getInfos().some((message) => message.includes("falling back to before_prompt_build prependSystemContext")),
+    "expected older hosts to log an informational compatibility note",
+  );
+}
+
+function testModernHostWithoutPromptRegistrationWarns(): void {
+  const fake = createFakePluginApi({
+    exposeCapability: false,
+    exposePromptSection: false,
+    runtimeVersion: "2026.3.22",
+  });
+  createClawMemPlugin(fake.api as never);
+
+  assert(
+    fake.getWarnings().some((message) => message.includes("falling back to before_prompt_build prependSystemContext")),
+    "expected warning when a new-enough host is missing prompt registration",
+  );
+}
+
+async function testOlderModernHostInjectsPromptGuidanceViaPrependSystemContext(): Promise<void> {
+  const fake = createFakePluginApi({
+    exposeCapability: false,
+    exposePromptSection: false,
+    runtimeVersion: "2026.3.13",
+  });
+  createClawMemPlugin(fake.api as never);
+
+  const handler = fake.getHandler("before_prompt_build");
+  assert(typeof handler === "function", "expected before_prompt_build handler to be registered for modern hosts");
+  const result = await handler?.({ prompt: "hi" }, { agentId: "main" }) as { prependContext?: string; prependSystemContext?: string } | void;
+  assert(Boolean(result && result.prependSystemContext?.includes("## ClawMem")), "expected static ClawMem guidance to use prependSystemContext fallback");
+  assert(!result || !result.prependContext, "expected no dynamic recall context when the prompt is too short for auto-recall");
 }
 
 function testSkipsAlwaysOnPromptWhenClawMemIsNotSelectedMemoryPlugin(): void {
@@ -262,6 +329,9 @@ testResolvePromptHookModeLegacy();
 testResolvePromptHookModeLegacyForUnknownVersion();
 testRegistersAlwaysOnMemoryPromptCapability();
 testFallsBackToLegacyMemoryPromptSectionRegistration();
+testOlderHostWithoutPromptRegistrationDoesNotWarn();
+testModernHostWithoutPromptRegistrationWarns();
 testSkipsAlwaysOnPromptWhenClawMemIsNotSelectedMemoryPlugin();
+await testOlderModernHostInjectsPromptGuidanceViaPrependSystemContext();
 
 console.log("service tests passed");
