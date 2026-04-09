@@ -33,9 +33,6 @@
     "access": "public"
   },
   "openclaw": {
-    "hooks": [
-      "./index.ts"
-    ],
     "extensions": [
       "./index.ts"
     ]
