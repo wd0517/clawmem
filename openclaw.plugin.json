@@ -2,7 +2,7 @@
   "id": "clawmem",
   "name": "ClawMem",
   "version": "0.1.16",
-  "description": "Mirror OpenClaw sessions into GitHub-compatible issues and comments.",
+  "description": "Repo-backed long-term memory plugin for OpenClaw with auto recall, durable memory capture, and conversation mirroring.",
   "kind": "memory",
   "skills": [
     "./skills"
@@ -62,27 +62,12 @@
           }
         }
       },
-      "turnCommentDelayMs": {
-        "type": "integer",
-        "minimum": 0,
-        "maximum": 60000
-      },
-      "digestWaitTimeoutMs": {
-        "type": "integer",
-        "minimum": 1000,
-        "maximum": 600000
-      },
       "summaryWaitTimeoutMs": {
         "type": "integer",
         "minimum": 1000,
         "maximum": 600000
       },
       "memoryExtractWaitTimeoutMs": {
-        "type": "integer",
-        "minimum": 1000,
-        "maximum": 600000
-      },
-      "memoryReconcileWaitTimeoutMs": {
         "type": "integer",
         "minimum": 1000,
         "maximum": 600000
@@ -128,25 +113,13 @@
       "label": "Agent Routes",
       "help": "Per-agent ClawMem identities keyed by agent id. Each identity has credentials plus an optional defaultRepo."
     },
-    "turnCommentDelayMs": {
-      "label": "Turn Sync Delay (ms)",
-      "help": "Small delay so transcript writes settle before a turn comment is mirrored."
-    },
-    "digestWaitTimeoutMs": {
-      "label": "Digest Wait Timeout (ms)",
-      "help": "How long clawmem waits for the rolling conversation digest subagent before retrying later."
-    },
     "summaryWaitTimeoutMs": {
       "label": "Summary Wait Timeout (ms)",
       "help": "How long clawmem waits for the final conversation summary subagent during session finalization."
     },
     "memoryExtractWaitTimeoutMs": {
-      "label": "Memory Extract Timeout (ms)",
-      "help": "How long clawmem waits while extracting atomic memory candidates from new conversation deltas."
-    },
-    "memoryReconcileWaitTimeoutMs": {
-      "label": "Memory Reconcile Timeout (ms)",
-      "help": "How long clawmem waits while reconciling extracted memory candidates against existing memories."
+      "label": "Finalize Memory Timeout (ms)",
+      "help": "How long clawmem waits while extracting durable memory candidates during session finalization."
     },
     "memoryRecallLimit": {
       "label": "Memory Recall Limit",

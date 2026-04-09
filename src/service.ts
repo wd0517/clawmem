@@ -5,11 +5,11 @@ import { filterDirectCollaborators, listRepoAccessTeams, resolveOrgInvitationRol
 import { ConversationMirror } from "./conversation.js";
 import { GitHubIssueClient } from "./github-client.js";
 import { KeyedAsyncQueue } from "./keyed-async-queue.js";
-import { MemoryStore, mergeMemoryCandidates } from "./memory.js";
+import { MemoryStore } from "./memory.js";
 import { sanitizeRecallQueryInput } from "./recall-sanitize.js";
 import { loadState, resolveStatePath, saveState } from "./state.js";
 import { readTranscriptSnapshot } from "./transcript.js";
-import type { BootstrapIdentityResponse, ClawMemPluginConfig, ClawMemResolvedRoute, PluginState, SessionDerivedState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import type { BootstrapIdentityResponse, ClawMemPluginConfig, ClawMemResolvedRoute, MemoryCandidate, PluginState, SessionDerivedState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { buildAgentBootstrapRegistration, inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
 import { getOpenClawAgentIdFromEnv, getOpenClawHostVersionFromEnv } from "./runtime-env.js";
 
@@ -20,21 +20,17 @@ type CollaborationTeamRole = "member" | "maintainer";
 type MemoryPromptBuilder = NonNullable<MemoryPluginCapability["promptBuilder"]>;
 type MemoryPromptBuilderParams = Parameters<MemoryPromptBuilder>[0];
 
-const DERIVED_WORK_RECOVERY_DELAYS_MS = [5000, 30000, 120000] as const;
 const MODERN_PROMPT_HOOK_MIN_HOST_VERSION = "2026.3.7";
 type PromptHookMode = "modern" | "legacy";
 
 class ClawMemService {
   private readonly config: ClawMemPluginConfig;
   private readonly ioQueue = new KeyedAsyncQueue();
-  private readonly deriveQueue = new KeyedAsyncQueue();
   private readonly repoWriteQueue = new KeyedAsyncQueue();
   private readonly stateQueue = new KeyedAsyncQueue();
   private readonly pending = new Set<Promise<unknown>>();
-  private readonly syncTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly recoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private statePath = "";
-  private state: PluginState = { version: 3, sessions: {} };
+  private state: PluginState = { version: 4, sessions: {} };
   private unsubTranscript?: () => void;
   private loadPromise: Promise<void> | null = null;
   private readonly configPromises = new Map<string, Promise<boolean>>();
@@ -51,9 +47,27 @@ class ClawMemService {
     } else {
       this.api.on("before_agent_start", async (ev, ctx) => this.handleBeforeAgentStart(ev, ctx.agentId));
     }
-    this.api.on("agent_end", (ev, ctx) => this.scheduleTurn({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, agentId: ctx.agentId, messages: ev.messages }));
-    this.api.on("before_reset", (ev, ctx) => this.enqueueFinalize({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, sessionFile: ev.sessionFile, agentId: ctx.agentId, reason: ev.reason, messages: ev.messages }));
-    this.api.on("session_end", (ev, ctx) => this.enqueueFinalize({ sessionId: ev.sessionId ?? ctx.sessionId, sessionKey: ev.sessionKey ?? ctx.sessionKey, agentId: ctx.agentId, reason: "session_end" }));
+    this.api.on("agent_end", async (ev, ctx) => {
+      try {
+        await this.handleAgentEnd({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, agentId: ctx.agentId, messages: ev.messages });
+      } catch (error) {
+        this.warn("turn sync", error);
+      }
+    });
+    this.api.on("before_reset", async (ev, ctx) => {
+      try {
+        await this.handleFinalize({ sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, sessionFile: ev.sessionFile, agentId: ctx.agentId, reason: ev.reason, messages: ev.messages });
+      } catch (error) {
+        this.warn("finalize", error);
+      }
+    });
+    this.api.on("session_end", async (ev, ctx) => {
+      try {
+        await this.handleFinalize({ sessionId: ev.sessionId ?? ctx.sessionId, sessionKey: ev.sessionKey ?? ctx.sessionKey, agentId: ctx.agentId, reason: "session_end" });
+      } catch (error) {
+        this.warn("finalize", error);
+      }
+    });
     this.registerTools();
 
     this.api.registerService({
@@ -65,7 +79,6 @@ class ClawMemService {
         this.unsubTranscript = this.api.runtime.events.onSessionTranscriptUpdate((u) => {
           void this.track(this.handleTranscript(u.sessionFile)).catch((e) => this.warn("transcript update", e));
         });
-        this.recoverDerivedWorkOnStart();
         const configuredCount = Object.keys(this.config.agents).filter((agentId) => {
           const route = resolveAgentRoute(this.config, agentId);
           return isAgentConfigured(route) && hasDefaultRepo(route);
@@ -79,10 +92,6 @@ class ClawMemService {
       },
       stop: async () => {
         this.unsubTranscript?.();
-        for (const t of this.syncTimers.values()) clearTimeout(t);
-        this.syncTimers.clear();
-        for (const t of this.recoveryTimers.values()) clearTimeout(t);
-        this.recoveryTimers.clear();
         await Promise.allSettled([...this.pending]);
       },
     });
@@ -466,6 +475,7 @@ class ClawMemService {
         return toolText(`Marked memory [${forgotten.memoryId}] stale in ${resolved.route.repo}: ${forgotten.detail}`);
       },
     });
+
     this.registerCollaborationTools();
   }
 
@@ -1766,6 +1776,16 @@ class ClawMemService {
     return context ? { prependContext: context } : undefined;
   }
 
+  private async handleAgentEnd(payload: TurnPayload): Promise<void> {
+    if (!payload.sessionId) return;
+    await this.enqueueSessionIo(sessionScopeKey(payload.sessionId, payload.agentId), () => this.syncTurn(payload));
+  }
+
+  private async handleFinalize(payload: FinalizePayload): Promise<void> {
+    if (!payload.sessionId) return;
+    await this.enqueueSessionIo(sessionScopeKey(payload.sessionId, payload.agentId), () => this.finalize(payload));
+  }
+
   private async collectAutoRecallContext(event: unknown, agentId?: string): Promise<string | undefined> {
     const routeAgentId = normalizeAgentId(agentId);
     if (!(await this.ensureDefaultRepoConfigured(routeAgentId))) return undefined;
@@ -1804,26 +1824,13 @@ class ClawMemService {
     });
   }
 
-  private scheduleTurn(p: TurnPayload): void {
-    if (!p.sessionId) return;
-    const scopeKey = sessionScopeKey(p.sessionId, p.agentId);
-    const prev = this.syncTimers.get(scopeKey);
-    if (prev) clearTimeout(prev);
-    const timer = setTimeout(() => {
-      this.syncTimers.delete(scopeKey);
-      void this.track(this.enqueueSessionIo(scopeKey, () => this.syncTurn(p))).catch((e) => this.warn("turn sync", e));
-    }, this.config.turnCommentDelayMs);
-    timer.unref?.();
-    this.syncTimers.set(scopeKey, timer);
-  }
-
   private async syncTurn(p: TurnPayload): Promise<void> {
     if (!p.sessionId) return;
     const agentId = normalizeAgentId(p.agentId);
-    const scopeKey = sessionScopeKey(p.sessionId, agentId);
     if (!(await this.ensureDefaultRepoConfigured(agentId))) return;
     const { conv } = this.getServices(agentId);
     const s = this.getOrCreate(p.sessionId, agentId);
+    if (s.finalizedAt) return;
     s.sessionKey = p.sessionKey ?? s.sessionKey; s.agentId = agentId; s.updatedAt = new Date().toISOString();
     const snap = await conv.loadSnapshot(s, p.messages);
     if (!conv.shouldMirror(s.sessionId, snap.messages) || snap.messages.length === 0) { await this.persistState(); return; }
@@ -1831,52 +1838,181 @@ class ClawMemService {
     await conv.syncLabels(s, snap, false);
     const next = snap.messages.slice(s.lastMirroredCount);
     if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; }
-    this.markPostMirrorTasks(s);
     await this.persistState();
-    this.kickDerivedWork(scopeKey, agentId, "turn");
-  }
-
-  private enqueueFinalize(p: FinalizePayload): void {
-    if (!p.sessionId) return;
-    const scopeKey = sessionScopeKey(p.sessionId, p.agentId);
-    const prev = this.syncTimers.get(scopeKey);
-    if (prev) { clearTimeout(prev); this.syncTimers.delete(scopeKey); }
-    void this.track(this.enqueueSessionIo(scopeKey, () => this.finalize(p))).catch((e) => this.warn("finalize", e));
   }
 
   private async finalize(p: FinalizePayload): Promise<void> {
     if (!p.sessionId) return;
     const agentId = normalizeAgentId(p.agentId);
-    const scopeKey = sessionScopeKey(p.sessionId, agentId);
     if (!(await this.ensureDefaultRepoConfigured(agentId))) return;
-    const { conv } = this.getServices(agentId);
+    const { conv, mem, route } = this.getServices(agentId);
     const s = this.getOrCreate(p.sessionId, agentId);
-    if (s.finalizedAt) return;
     s.sessionKey = p.sessionKey ?? s.sessionKey; s.sessionFile = p.sessionFile ?? s.sessionFile;
     s.agentId = agentId; s.updatedAt = new Date().toISOString();
     const snap = await conv.loadSnapshot(s, p.messages ?? []);
     if (!conv.shouldMirror(s.sessionId, snap.messages)) { await this.persistState(); return; }
     if (snap.messages.length === 0 && !s.issueNumber) { await this.persistState(); return; }
-    await conv.ensureIssue(s, snap);
-    const next = snap.messages.slice(s.lastMirroredCount);
-    let allOk = true;
-    if (next.length > 0) { const n = await conv.appendComments(s.issueNumber!, next); s.lastMirroredCount += n; s.turnCount += n; allOk = n === next.length; }
-    await conv.syncLabels(s, snap, true);
-    await conv.syncBody(s, snap, "pending", true);
-    if (allOk) s.finalizedAt = new Date().toISOString();
-    this.markPostMirrorTasks(s);
-    this.markSummaryPending(s);
+    await this.captureSessionFinalState(s, snap, conv, mem, route, { markFinalized: true, reason: "finalize" });
+  }
+
+  private async captureSessionFinalState(
+    session: SessionMirrorState,
+    snapshot: TranscriptSnapshot,
+    conv: ConversationMirror,
+    mem: MemoryStore,
+    route: ClawMemResolvedRoute,
+    options: { markFinalized: boolean; reason: string },
+  ): Promise<void> {
+    await conv.ensureIssue(session, snapshot);
+    const next = snapshot.messages.slice(session.lastMirroredCount);
+    if (next.length > 0) {
+      const n = await conv.appendComments(session.issueNumber!, next);
+      session.lastMirroredCount += n;
+      session.turnCount += n;
+    }
+
+    const derived = this.ensureDerived(session);
+    let summaryText = derived.summary.text?.trim() || "pending";
+    let titleOverride = derived.summary.title?.trim() || session.issueTitle;
+    let generatedTitle = Boolean(derived.summary.title?.trim());
+    const targetCursor = snapshot.messages.length;
+    const meaningfulTranscript = snapshot.messages.filter((message) => message.text.trim()).length >= 2;
+
+    if (meaningfulTranscript) {
+      try {
+        const artifacts = await this.resolveFinalArtifacts(session, snapshot, conv);
+        summaryText = artifacts.summary;
+        if (artifacts.title?.trim()) {
+          titleOverride = artifacts.title.trim();
+          generatedTitle = true;
+        }
+        const storedCount = await this.applyFinalMemoryCandidates(session, mem, route, targetCursor, artifacts.candidates);
+        if (storedCount > 0) {
+          this.api.logger.info?.(
+            `clawmem: ${options.reason} stored ${storedCount} memor${storedCount === 1 ? "y" : "ies"} for ${session.sessionId}`,
+          );
+        }
+      } catch (error) {
+        derived.summary.status = "error";
+        derived.summary.lastError = String(error);
+        derived.summary.updatedAt = new Date().toISOString();
+        derived.memory.status = "error";
+        derived.memory.lastError = String(error);
+        derived.memory.updatedAt = new Date().toISOString();
+        this.warn(`${options.reason} derive for ${session.sessionId}`, error);
+      }
+    } else {
+      derived.summary.status = "complete";
+      derived.summary.basedOnCursor = targetCursor;
+      derived.summary.lastError = undefined;
+      derived.summary.updatedAt = new Date().toISOString();
+      derived.memory.capturedCursor = targetCursor;
+      derived.memory.status = "complete";
+      derived.memory.lastError = undefined;
+      derived.memory.updatedAt = new Date().toISOString();
+    }
+
+    try {
+      await conv.syncLabels(session, snapshot, true);
+      await conv.syncBody(session, snapshot, summaryText, true, titleOverride);
+      derived.summary.text = summaryText;
+      derived.summary.basedOnCursor = targetCursor;
+      derived.summary.status = "complete";
+      derived.summary.lastError = undefined;
+      derived.summary.updatedAt = new Date().toISOString();
+      if (titleOverride?.trim()) {
+        derived.summary.title = titleOverride.trim();
+        session.issueTitle = titleOverride.trim();
+        if (generatedTitle) session.titleSource = "llm";
+      }
+      if (options.markFinalized && !session.finalizedAt) session.finalizedAt = new Date().toISOString();
+    } catch (error) {
+      derived.summary.status = "error";
+      derived.summary.lastError = String(error);
+      derived.summary.updatedAt = new Date().toISOString();
+      this.warn(`${options.reason} summary sync for ${session.sessionId}`, error);
+    }
+
+    session.updatedAt = new Date().toISOString();
     await this.persistState();
-    this.kickDerivedWork(scopeKey, agentId, p.reason ?? "finalize");
+  }
+
+  private async resolveFinalArtifacts(
+    session: SessionMirrorState,
+    snapshot: TranscriptSnapshot,
+    conv: ConversationMirror,
+  ): Promise<{ summary: string; title?: string; candidates: MemoryCandidate[] }> {
+    const cached = getCachedFinalArtifacts(session, snapshot.messages.length);
+    if (cached) return cached;
+
+    const artifacts = await conv.generateFinalArtifacts(session, snapshot);
+    const derived = this.ensureDerived(session);
+    const now = new Date().toISOString();
+    derived.summary.text = artifacts.summary;
+    derived.summary.title = artifacts.title?.trim() || undefined;
+    derived.summary.basedOnCursor = snapshot.messages.length;
+    derived.summary.lastError = undefined;
+    derived.summary.updatedAt = now;
+    derived.memory.candidates = artifacts.candidates;
+    derived.memory.lastError = undefined;
+    derived.memory.updatedAt = now;
+    return artifacts;
+  }
+
+  private async applyFinalMemoryCandidates(
+    session: SessionMirrorState,
+    mem: MemoryStore,
+    route: ClawMemResolvedRoute,
+    targetCursor: number,
+    candidates: MemoryCandidate[],
+  ): Promise<number> {
+    const derived = this.ensureDerived(session);
+    if (derived.memory.capturedCursor >= targetCursor && derived.memory.status === "complete") {
+      derived.memory.candidates = undefined;
+      return 0;
+    }
+    if (candidates.length === 0) {
+      derived.memory.candidates = undefined;
+      derived.memory.capturedCursor = targetCursor;
+      derived.memory.status = "complete";
+      derived.memory.lastError = undefined;
+      derived.memory.updatedAt = new Date().toISOString();
+      return 0;
+    }
+    try {
+      const result = await this.enqueueRepoWrite(this.repoWriteKey(route), async () => {
+        let createdCount = 0;
+        for (const candidate of candidates) {
+          const stored = await mem.store({
+            ...(candidate.title ? { title: candidate.title } : {}),
+            detail: candidate.detail,
+            ...(candidate.kind ? { kind: candidate.kind } : {}),
+            ...(candidate.topics?.length ? { topics: candidate.topics } : {}),
+          });
+          if (stored.created) createdCount++;
+        }
+        return createdCount;
+      });
+      derived.memory.candidates = undefined;
+      derived.memory.capturedCursor = targetCursor;
+      derived.memory.status = "complete";
+      derived.memory.lastError = undefined;
+      derived.memory.updatedAt = new Date().toISOString();
+      return result;
+    } catch (error) {
+      derived.memory.candidates = candidates;
+      derived.memory.status = "error";
+      derived.memory.lastError = String(error);
+      derived.memory.updatedAt = new Date().toISOString();
+      this.warn(`finalize memory store for ${session.sessionId}`, error);
+      return 0;
+    }
   }
 
   // --- Infrastructure ---
 
   private enqueueSessionIo<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
     return this.ioQueue.enqueue(sessionId, async () => { await this.ensureLoaded(); return task(); });
-  }
-  private enqueueSessionDerived<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
-    return this.deriveQueue.enqueue(sessionId, async () => { await this.ensureLoaded(); return task(); });
   }
   private enqueueRepoWrite<T>(repoKey: string, task: () => Promise<T>): Promise<T> {
     return this.repoWriteQueue.enqueue(repoKey, task);
@@ -1904,15 +2040,10 @@ class ClawMemService {
       lastMirroredCount: 0,
       turnCount: 0,
       derived: {
-        digest: { cursor: 0, status: "idle", attempt: 0 },
         summary: { basedOnCursor: 0, status: "idle" },
         memory: {
-          extractCursor: 0,
-          appliedCursor: 0,
-          extractStatus: "idle",
-          reconcileStatus: "idle",
-          attempt: 0,
-          pendingCandidates: [],
+          capturedCursor: 0,
+          status: "idle",
         },
       },
       createdAt: now,
@@ -1925,67 +2056,14 @@ class ClawMemService {
   private ensureDerived(session: SessionMirrorState): SessionDerivedState {
     if (!session.derived) {
       session.derived = {
-        digest: { cursor: 0, status: "idle", attempt: 0 },
         summary: { basedOnCursor: 0, status: "idle" },
         memory: {
-          extractCursor: 0,
-          appliedCursor: session.lastMemorySyncCount ?? 0,
-          extractStatus: "idle",
-          reconcileStatus: "idle",
-          attempt: 0,
-          pendingCandidates: [],
+          capturedCursor: 0,
+          status: "idle",
         },
       };
     }
     return session.derived;
-  }
-
-  private syncLegacyTaskFields(session: SessionMirrorState): void {
-    const derived = this.ensureDerived(session);
-    session.summaryStatus = derived.summary.status === "complete" ? "complete" : session.finalizedAt ? "pending" : undefined;
-    session.lastMemorySyncCount = derived.memory.appliedCursor;
-  }
-
-  private hasMeaningfulTranscript(session: SessionMirrorState): boolean {
-    return Math.max(session.lastMirroredCount, session.turnCount) >= 2;
-  }
-
-  private needsDigest(session: SessionMirrorState): boolean {
-    if (!this.hasMeaningfulTranscript(session)) return false;
-    const derived = this.ensureDerived(session);
-    return derived.digest.cursor < session.lastMirroredCount;
-  }
-
-  private needsFinalSummary(session: SessionMirrorState): boolean {
-    if (!session.finalizedAt || !this.hasMeaningfulTranscript(session)) return false;
-    const derived = this.ensureDerived(session);
-    return derived.summary.status !== "complete" || derived.summary.basedOnCursor < session.lastMirroredCount;
-  }
-
-  private needsMemoryExtract(session: SessionMirrorState): boolean {
-    if (!this.hasMeaningfulTranscript(session)) return false;
-    const derived = this.ensureDerived(session);
-    return derived.memory.extractCursor < session.lastMirroredCount;
-  }
-
-  private needsMemoryReconcile(session: SessionMirrorState): boolean {
-    if (!this.hasMeaningfulTranscript(session)) return false;
-    const derived = this.ensureDerived(session);
-    return derived.memory.pendingCandidates.length > 0 || derived.memory.appliedCursor < derived.memory.extractCursor;
-  }
-
-  private markPostMirrorTasks(session: SessionMirrorState): void {
-    const derived = this.ensureDerived(session);
-    if (this.needsDigest(session)) derived.digest.status = "pending";
-    if (this.needsMemoryExtract(session)) derived.memory.extractStatus = "pending";
-    if (this.needsMemoryReconcile(session)) derived.memory.reconcileStatus = "pending";
-    this.syncLegacyTaskFields(session);
-  }
-
-  private markSummaryPending(session: SessionMirrorState): void {
-    const derived = this.ensureDerived(session);
-    derived.summary.status = "pending";
-    this.syncLegacyTaskFields(session);
   }
   private resolveTranscriptAgentId(sessionId: string, sessionFile: string): string | null {
     const fromPath = inferAgentIdFromTranscriptPath(sessionFile);
@@ -2111,279 +2189,6 @@ class ClawMemService {
       },
     });
   }
-  private clearRecoveryTimer(scopeKey: string): void {
-    const prev = this.recoveryTimers.get(scopeKey);
-    if (!prev) return;
-    clearTimeout(prev);
-    this.recoveryTimers.delete(scopeKey);
-  }
-
-  private recoverDerivedWorkOnStart(): void {
-    const recoverableSessions = Object.values(this.state.sessions)
-      .filter((session) => this.sessionNeedsDerivedWork(session))
-      .sort((a, b) => Date.parse(b.updatedAt ?? b.createdAt ?? "") - Date.parse(a.updatedAt ?? a.createdAt ?? ""));
-    for (const session of recoverableSessions) {
-      this.scheduleDerivedRecovery(sessionScopeKey(session.sessionId, session.agentId), normalizeAgentId(session.agentId), {
-        delayMs: 0,
-        attempt: 0,
-        reason: "startup-recovery",
-      });
-    }
-  }
-
-  private kickDerivedWork(scopeKey: string, agentId: string, reason: string): void {
-    this.clearRecoveryTimer(scopeKey);
-    void this.track(this.enqueueSessionDerived(scopeKey, () => this.runSessionDerivedWork(scopeKey, agentId, 0, reason)))
-      .catch((error) => this.warn(`derived work for ${scopeKey}`, error));
-  }
-
-  private scheduleDerivedRecovery(
-    scopeKey: string,
-    agentId: string,
-    options: { delayMs?: number; attempt?: number; reason?: string } = {},
-  ): void {
-    this.clearRecoveryTimer(scopeKey);
-    const delayMs = Math.max(0, options.delayMs ?? 0);
-    const attempt = Math.max(0, options.attempt ?? 0);
-    const reason = options.reason ?? "scheduled-recovery";
-    const timer = setTimeout(() => {
-      this.recoveryTimers.delete(scopeKey);
-      void this.track(this.enqueueSessionDerived(scopeKey, () => this.runSessionDerivedWork(scopeKey, agentId, attempt, reason)))
-        .catch((error) => this.warn(`derived recovery for ${scopeKey}`, error));
-    }, delayMs);
-    timer.unref?.();
-    this.recoveryTimers.set(scopeKey, timer);
-  }
-
-  private async runSessionDerivedWork(scopeKey: string, agentId: string, attempt: number, reason: string): Promise<void> {
-    const session = this.state.sessions[scopeKey];
-    if (!session || !this.sessionNeedsDerivedWork(session)) return;
-    if (!(await this.ensureDefaultRepoConfigured(agentId))) return;
-    const { route, conv, mem, client } = this.getServices(agentId);
-    const snap = await conv.loadSnapshot(session, []);
-    if (!conv.shouldMirror(session.sessionId, snap.messages) || snap.messages.length === 0) return;
-
-    let retryNeeded = false;
-    const derived = this.ensureDerived(session);
-    const updateLegacyAndPersist = async (): Promise<void> => {
-      this.syncLegacyTaskFields(session);
-      await this.persistState();
-    };
-    const mirroredCount = Math.min(session.lastMirroredCount, snap.messages.length);
-    if (mirroredCount <= 0) return;
-    const canCombineDeltaDerivation = this.needsDigest(session)
-      && this.needsMemoryExtract(session)
-      && derived.digest.cursor === derived.memory.extractCursor;
-
-    if (canCombineDeltaDerivation) {
-      const deriveTarget = mirroredCount;
-      const deriveFromCursor = Math.min(derived.digest.cursor, deriveTarget);
-      const deriveSnapshot: TranscriptSnapshot = { ...snap, messages: snap.messages.slice(0, deriveTarget) };
-      const startedAt = new Date().toISOString();
-      derived.digest.status = "running";
-      derived.digest.updatedAt = startedAt;
-      derived.memory.extractStatus = "running";
-      derived.memory.updatedAt = startedAt;
-      await updateLegacyAndPersist();
-      try {
-        const result = await conv.deriveDelta(session, deriveSnapshot, deriveFromCursor, derived.digest.text);
-        derived.digest.text = result.digest.trim();
-        derived.digest.title = result.title?.trim() || derived.digest.title;
-        derived.digest.cursor = deriveTarget;
-        derived.digest.status = deriveTarget < session.lastMirroredCount ? "pending" : "complete";
-        derived.digest.attempt = 0;
-        derived.digest.lastError = undefined;
-        derived.digest.updatedAt = new Date().toISOString();
-        if (result.title?.trim() && session.issueNumber) {
-          await client.updateIssue(session.issueNumber, { title: result.title.trim() });
-          session.issueTitle = result.title.trim();
-          session.titleSource = "digest";
-        }
-
-        derived.memory.pendingCandidates = mergeMemoryCandidates(derived.memory.pendingCandidates, result.candidates);
-        derived.memory.extractCursor = deriveTarget;
-        derived.memory.extractStatus = deriveTarget < session.lastMirroredCount ? "pending" : "complete";
-        derived.memory.attempt = 0;
-        derived.memory.lastError = undefined;
-        derived.memory.updatedAt = new Date().toISOString();
-        if (derived.memory.pendingCandidates.length === 0) {
-          derived.memory.appliedCursor = Math.max(derived.memory.appliedCursor, deriveTarget);
-          derived.memory.reconcileStatus = "complete";
-        } else {
-          derived.memory.reconcileStatus = "pending";
-        }
-      } catch (error) {
-        const failedAt = new Date().toISOString();
-        derived.digest.status = "error";
-        derived.digest.attempt += 1;
-        derived.digest.lastError = String(error);
-        derived.digest.updatedAt = failedAt;
-        derived.memory.extractStatus = "error";
-        derived.memory.attempt += 1;
-        derived.memory.lastError = String(error);
-        derived.memory.updatedAt = failedAt;
-        retryNeeded = true;
-        this.warn(`background derive delta for ${session.sessionId}`, error);
-      }
-      await updateLegacyAndPersist();
-    }
-
-    if (!canCombineDeltaDerivation && this.needsDigest(session)) {
-      const digestTarget = mirroredCount;
-      const digestFromCursor = Math.min(derived.digest.cursor, digestTarget);
-      const digestSnapshot: TranscriptSnapshot = { ...snap, messages: snap.messages.slice(0, digestTarget) };
-      derived.digest.status = "running";
-      derived.digest.updatedAt = new Date().toISOString();
-      await updateLegacyAndPersist();
-      try {
-        const result = await conv.generateRollingDigest(session, digestSnapshot, digestFromCursor, derived.digest.text);
-        derived.digest.text = result.digest.trim();
-        derived.digest.title = result.title?.trim() || derived.digest.title;
-        derived.digest.cursor = digestTarget;
-        derived.digest.status = digestTarget < session.lastMirroredCount ? "pending" : "complete";
-        derived.digest.attempt = 0;
-        derived.digest.lastError = undefined;
-        derived.digest.updatedAt = new Date().toISOString();
-        if (result.title?.trim() && session.issueNumber) {
-          await client.updateIssue(session.issueNumber, { title: result.title.trim() });
-          session.issueTitle = result.title.trim();
-          session.titleSource = "digest";
-        }
-      } catch (error) {
-        derived.digest.status = "error";
-        derived.digest.attempt += 1;
-        derived.digest.lastError = String(error);
-        derived.digest.updatedAt = new Date().toISOString();
-        retryNeeded = true;
-        this.warn(`background digest sync for ${session.sessionId}`, error);
-      }
-      await updateLegacyAndPersist();
-    }
-
-    if (this.needsFinalSummary(session) && derived.digest.cursor >= session.lastMirroredCount) {
-      const summaryTarget = Math.min(session.lastMirroredCount, snap.messages.length);
-      const summarySnapshot: TranscriptSnapshot = { ...snap, messages: snap.messages.slice(0, summaryTarget) };
-      derived.summary.status = "running";
-      derived.summary.updatedAt = new Date().toISOString();
-      await updateLegacyAndPersist();
-      try {
-        const result = await conv.generateFinalSummaryFromDigest(session, summarySnapshot, derived.digest.text ?? "");
-        await conv.syncLabels(session, summarySnapshot, true);
-        await conv.syncBody(session, summarySnapshot, result.summary, true, result.title);
-        derived.summary.text = result.summary;
-        derived.summary.status = summaryTarget < session.lastMirroredCount ? "pending" : "complete";
-        derived.summary.basedOnCursor = summaryTarget;
-        derived.summary.lastError = undefined;
-        derived.summary.updatedAt = new Date().toISOString();
-        if (result.title?.trim()) {
-          session.issueTitle = result.title.trim();
-          session.titleSource = "llm";
-        }
-        this.maybeAutoNameRepo(agentId, result.summary, result.title);
-      } catch (error) {
-        derived.summary.status = "error";
-        derived.summary.lastError = String(error);
-        derived.summary.updatedAt = new Date().toISOString();
-        retryNeeded = true;
-        this.warn(`background summary sync for ${session.sessionId}`, error);
-      }
-      await updateLegacyAndPersist();
-    }
-
-    if (!canCombineDeltaDerivation && this.needsMemoryExtract(session)) {
-      const extractTarget = Math.min(session.lastMirroredCount, snap.messages.length);
-      const extractFromCursor = Math.min(derived.memory.extractCursor, extractTarget);
-      const extractSnapshot: TranscriptSnapshot = { ...snap, messages: snap.messages.slice(0, extractTarget) };
-      derived.memory.extractStatus = "running";
-      derived.memory.updatedAt = new Date().toISOString();
-      await updateLegacyAndPersist();
-      try {
-        const candidates = await mem.extractCandidates(session, extractSnapshot, extractFromCursor, derived.digest.text);
-        derived.memory.pendingCandidates = mergeMemoryCandidates(derived.memory.pendingCandidates, candidates);
-        derived.memory.extractCursor = extractTarget;
-        derived.memory.extractStatus = extractTarget < session.lastMirroredCount ? "pending" : "complete";
-        derived.memory.attempt = 0;
-        derived.memory.lastError = undefined;
-        derived.memory.updatedAt = new Date().toISOString();
-        if (derived.memory.pendingCandidates.length === 0) {
-          derived.memory.appliedCursor = Math.max(derived.memory.appliedCursor, extractTarget);
-          derived.memory.reconcileStatus = "complete";
-        } else {
-          derived.memory.reconcileStatus = "pending";
-        }
-      } catch (error) {
-        derived.memory.extractStatus = "error";
-        derived.memory.attempt += 1;
-        derived.memory.lastError = String(error);
-        derived.memory.updatedAt = new Date().toISOString();
-        retryNeeded = true;
-        this.warn(`background memory extract for ${session.sessionId}`, error);
-      }
-      await updateLegacyAndPersist();
-    }
-
-    if (this.needsMemoryReconcile(session)) {
-      if (derived.memory.pendingCandidates.length === 0) {
-        derived.memory.appliedCursor = derived.memory.extractCursor;
-        derived.memory.reconcileStatus = "complete";
-        derived.memory.updatedAt = new Date().toISOString();
-        await updateLegacyAndPersist();
-      } else {
-        const candidates = mergeMemoryCandidates([], derived.memory.pendingCandidates);
-        derived.memory.reconcileStatus = "running";
-        derived.memory.updatedAt = new Date().toISOString();
-        await updateLegacyAndPersist();
-        try {
-          const decision = await mem.reconcileCandidates(session, candidates);
-          const { savedCount, staledCount } = await this.enqueueRepoWrite(
-            this.repoWriteKey(route),
-            () => mem.applyReconciledDecision(decision),
-          );
-          if (savedCount > 0 || staledCount > 0) {
-            this.api.logger.info?.(
-              `clawmem: synced memories for ${session.sessionId} (saved=${savedCount}, stale=${staledCount})`,
-            );
-          }
-          const consumed = new Set(candidates.map((candidate) => candidate.candidateId));
-          derived.memory.pendingCandidates = derived.memory.pendingCandidates.filter((candidate) => !consumed.has(candidate.candidateId));
-          derived.memory.appliedCursor = derived.memory.extractCursor;
-          derived.memory.reconcileStatus = derived.memory.pendingCandidates.length > 0 ? "pending" : "complete";
-          derived.memory.attempt = 0;
-          derived.memory.lastError = undefined;
-          derived.memory.updatedAt = new Date().toISOString();
-        } catch (error) {
-          derived.memory.reconcileStatus = "error";
-          derived.memory.attempt += 1;
-          derived.memory.lastError = String(error);
-          derived.memory.updatedAt = new Date().toISOString();
-          retryNeeded = true;
-          this.warn(`background memory reconcile for ${session.sessionId}`, error);
-        }
-        await updateLegacyAndPersist();
-      }
-    }
-
-    if (retryNeeded && this.sessionNeedsDerivedWork(session)) {
-      const delayMs = DERIVED_WORK_RECOVERY_DELAYS_MS[Math.min(attempt, DERIVED_WORK_RECOVERY_DELAYS_MS.length - 1)] ?? 120000;
-      this.api.logger.warn?.(
-        `clawmem: derived work incomplete for ${session.sessionId}; retrying in ${Math.round(delayMs / 1000)}s (${reason})`,
-      );
-      this.scheduleDerivedRecovery(scopeKey, agentId, { delayMs, attempt: attempt + 1, reason: "retry" });
-      return;
-    }
-
-    if (this.sessionNeedsDerivedWork(session)) {
-      this.kickDerivedWork(scopeKey, agentId, "follow-up");
-    }
-  }
-
-  private sessionNeedsDerivedWork(session: SessionMirrorState): boolean {
-    return this.needsDigest(session)
-      || this.needsFinalSummary(session)
-      || this.needsMemoryExtract(session)
-      || this.needsMemoryReconcile(session);
-  }
-
   private getServices(agentId?: string, repo?: string): { route: ClawMemResolvedRoute; conv: ConversationMirror; mem: MemoryStore; client: GitHubIssueClient } {
     const route = resolveAgentRoute(this.config, agentId, repo);
     const client = new GitHubIssueClient(route, this.api.logger);
@@ -2391,7 +2196,7 @@ class ClawMemService {
       route,
       client,
       conv: new ConversationMirror(client, this.api, this.config),
-      mem: new MemoryStore(client, this.api, this.config),
+      mem: new MemoryStore(client),
     };
   }
   private resolveToolAgentId(agentId: unknown): string {
@@ -2474,28 +2279,6 @@ class ClawMemService {
       return { error: `${field} must be a positive integer.` };
     }
     return { value };
-  }
-  /**
-   * After finalization, check if the repo still has an empty/default description.
-   * If so, use the conversation summary to suggest a meaningful name and update
-   * the repo description automatically. Best-effort, fire-and-forget.
-   */
-  private maybeAutoNameRepo(agentId: string, summary: string, title?: string): void {
-    if (!summary || summary.startsWith("failed:") || summary === "pending") return;
-    const snippet = title || summary.slice(0, 100);
-    void (async () => {
-      try {
-        const client = new GitHubIssueClient(resolveAgentRoute(this.config, agentId), this.api.logger);
-        const repo = await client.getRepoInfo();
-        // Only auto-name if description is still empty or a default placeholder.
-        if (repo.description && repo.description !== "My Memory Space" && repo.description !== "我的记忆空间" && repo.description !== "マイメモリースペース") return;
-        // Use the conversation title or summary as a lightweight description.
-        await client.updateRepoDescription(snippet);
-        this.api.logger.info?.(`clawmem: auto-named repo to "${snippet}"`);
-      } catch (e) {
-        this.api.logger.warn(`clawmem: auto-name repo failed: ${String(e)}`);
-      }
-    })();
   }
   private warn(scope: string, error: unknown): void { this.api.logger.warn(`clawmem: ${scope} failed: ${String(error)}`); }
 }
@@ -2678,6 +2461,23 @@ function candidatePromptText(value: unknown): { text?: string; changed: boolean 
     return { ...(sanitized ? { text: sanitized } : {}), changed: Boolean(sanitized && sanitized !== raw) };
   }
   return { changed: false };
+}
+
+function getCachedFinalArtifacts(
+  session: SessionMirrorState,
+  targetCursor: number,
+): { summary: string; title?: string; candidates: MemoryCandidate[] } | null {
+  const derived = session.derived;
+  if (!derived) return null;
+  const summary = derived.summary.text?.trim();
+  if (!summary || derived.summary.basedOnCursor < targetCursor) return null;
+  const hasCachedMemory = Array.isArray(derived.memory.candidates) || derived.memory.capturedCursor >= targetCursor;
+  if (!hasCachedMemory) return null;
+  return {
+    summary,
+    ...(derived.summary.title?.trim() ? { title: derived.summary.title.trim() } : {}),
+    candidates: Array.isArray(derived.memory.candidates) ? derived.memory.candidates : [],
+  };
 }
 
 export function resolvePromptHookMode(api: Pick<OpenClawPluginApi, "runtime">): PromptHookMode {

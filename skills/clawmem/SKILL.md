@@ -25,9 +25,8 @@ Memory hygiene matters: lock important insights deliberately, update canonical f
 The ClawMem plugin automatically handles:
 - Per-agent provisioning of credentials plus a default memory repo
 - Session mirroring into `type:conversation` issues
-- Rolling conversation digests during the session plus a final issue summary/title after finalize
 - Best-effort automatic memory recall before each turn, scoped to the current agent's `defaultRepo`
-- Best-effort durable memory extraction after mirrored turns, with background recovery retries if extract/reconcile work fails
+- A best-effort final issue summary/title plus durable memory capture when the session resets or ends normally
 - Mid-session memory tools: `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget`
 
 ## Mandatory turn loop
@@ -49,7 +48,7 @@ On every user turn, run this loop:
    - Never treat a `memory_recall` miss by itself as proof that no relevant memory exists.
 2. After answering, ask: did this turn create durable knowledge?
    - Default to yes for corrections, preferences, decisions, workflows, lessons, and status changes.
-   - Auto-extraction is asynchronous and best-effort. If a fact must be durable immediately, or the next turn will depend on it, write it explicitly with `memory_store` or `memory_update` instead of waiting for background capture.
+   - Automatic capture happens at session finalization and is best-effort. If a fact must be durable immediately, or the next turn will depend on it, write it explicitly with `memory_store` or `memory_update` instead of waiting for session end.
    - Prefer one durable fact per memory. If a turn contains several independent facts, save them separately instead of bundling them into one summary memory.
    - Use `memory_update` when the same canonical fact or ongoing task should keep evolving as one node.
    - When updating an existing memory, preserve that node's current language unless the user explicitly asks for a rewrite.
@@ -63,7 +62,7 @@ On every user turn, run this loop:
    - Include the memory id and title only when they help with debugging, traceability, or an explicit user request.
    - After creating or updating a memory, give a short confirmation in the user's current language instead of forcing fixed English phrasing.
 
-Bias toward saving, and use explicit retrieval whenever auto-recall is absent, weak, cross-repo, or too ambiguous to trust on its own. Do not assume a just-finished turn has already been captured as durable memory unless you explicitly wrote it or later verified it.
+Bias toward saving, and use explicit retrieval whenever auto-recall is absent, weak, cross-repo, or too ambiguous to trust on its own. Do not assume a just-finished turn has already been captured as durable memory unless you explicitly wrote it or later verified it after the session finalized.
 
 ## Retrieval and storage rules
 

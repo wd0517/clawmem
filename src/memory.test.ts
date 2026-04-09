@@ -1,4 +1,4 @@
-import { MemoryStore, mergeMemoryCandidates, scoreMemoryMatch } from "./memory.js";
+import { MemoryStore, mergeMemoryCandidates } from "./memory.js";
 import type { ParsedMemoryIssue } from "./types.js";
 import { sha256 } from "./utils.js";
 import { stringifyFlatYaml } from "./yaml.js";
@@ -42,18 +42,6 @@ function assert(condition: unknown, message: string): void {
   if (!condition) throw new Error(message);
 }
 
-function testConfig(): never {
-  return {
-    memoryRecallLimit: 5,
-    memoryAutoRecallLimit: 3,
-    turnCommentDelayMs: 1000,
-    digestWaitTimeoutMs: 30000,
-    summaryWaitTimeoutMs: 120000,
-    memoryExtractWaitTimeoutMs: 45000,
-    memoryReconcileWaitTimeoutMs: 45000,
-  } as never;
-}
-
 async function testBackendSearchBuildsSingleCleanedQuery(): Promise<void> {
   const queries: string[] = [];
   const client = {
@@ -63,7 +51,7 @@ async function testBackendSearchBuildsSingleCleanedQuery(): Promise<void> {
       return [] as IssueRecord[];
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   await store.search([
     "<clawmem-context>",
     "- [11] Previous memory that should be stripped",
@@ -112,7 +100,7 @@ async function testBackendSearchPreferredForRecall(): Promise<void> {
       return searched;
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const found = await store.search("redis rate limiting", 1);
 
   assert(queries.length === 1, "expected backend search to be called once");
@@ -136,7 +124,7 @@ async function testBackendSearchReturnsEmptyWithoutLexicalFallback(): Promise<vo
     listIssues: async () => issues,
     searchIssues: async () => [] as IssueRecord[],
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const found = await store.search("redis rate limiting", 5);
 
   assert(found.length === 0, "expected backend-only recall to return no results when the backend finds nothing");
@@ -147,7 +135,7 @@ async function testBackendSearchPropagatesErrors(): Promise<void> {
     repo: () => "owner/main-memory",
     searchIssues: async () => { throw new Error("search unavailable"); },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   let message = "";
   try {
     await store.search("redis rate limiting", 5);
@@ -156,25 +144,6 @@ async function testBackendSearchPropagatesErrors(): Promise<void> {
   }
 
   assert(message.includes("search unavailable"), "expected backend failures to propagate instead of falling back locally");
-}
-
-function testCjkScoring(): void {
-  const billing = memory({
-    issueNumber: 3,
-    title: "Memory: 账单修复流程",
-    detail: "遇到账单不一致时，先核对 invoice_id，再补发 webhook。",
-    topics: ["账单", "支付"],
-  });
-  const unrelated = memory({
-    issueNumber: 4,
-    title: "Memory: 部署备注",
-    detail: "发布前需要确认灰度流量比例。",
-    topics: ["部署"],
-  });
-  const billingScore = scoreMemoryMatch(billing, "账单 webhook");
-  const unrelatedScore = scoreMemoryMatch(unrelated, "账单 webhook");
-  assert(billingScore > unrelatedScore, "expected Chinese query scoring to prefer the billing memory");
-  assert(billingScore > 0, "expected Chinese query to produce a positive match score");
 }
 
 function testMergeMemoryCandidates(): void {
@@ -218,7 +187,7 @@ async function testStructuredStoreAndSchema(): Promise<void> {
       return { number: 99, title: payload.title };
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const result = await store.store({ detail: "Redis Lua scripts are required for atomic rate limiting.", kind: "Lesson", topics: ["Redis Ops", "rate_limit"] });
   const schema = await store.listSchema();
 
@@ -244,7 +213,7 @@ async function testListSchemaPrefersLabelsWithoutIssueScan(): Promise<void> {
     listLabels: async () => [{ name: "kind:lesson" }, { name: "topic:redis" }, { name: "topic:rate-limit" }],
     listIssues: async () => { throw new Error("listSchema should not scan issues when label schema is available"); },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const schema = await store.listSchema();
 
   assert(JSON.stringify(schema.kinds) === JSON.stringify(["lesson"]), "expected schema kinds to come from labels");
@@ -272,7 +241,7 @@ async function testStoreDeduplicatesViaHashSearch(): Promise<void> {
     ensureLabels: async () => {},
     createIssue: async () => { throw new Error("store should not create a duplicate issue"); },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const result = await store.store({ detail, kind: "lesson", topics: ["redis_ops"] });
 
   assert(result.created === false, "expected hash search to reuse an existing exact duplicate");
@@ -291,7 +260,7 @@ async function testStoreKeepsFullAutoTitleAndSupportsExplicitTitle(): Promise<vo
       return { number: created.length + 100, title: payload.title };
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const longDetail = "Tech Decision #001: Frontend = React Native, Backend = FastAPI, Database = PostgreSQL, and analytics events must stay append-only for auditability.";
   const auto = await store.store({ detail: longDetail });
   const explicit = await store.store({ title: "Architecture Decision #001", detail: "Use React Native + FastAPI for the first mobile stack." });
@@ -344,7 +313,7 @@ async function testGetAndListMemories(): Promise<void> {
       });
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const exact = await store.get("4");
   const activeFacts = await store.listMemories({ status: "active", kind: "core-fact", limit: 10 });
   const sports = await store.listMemories({ status: "all", topic: "sports", limit: 10 });
@@ -383,7 +352,7 @@ async function testLegacyMemoriesWithoutSessionOrDate(): Promise<void> {
     },
     searchIssues: async () => issues,
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const exact = await store.get("4");
   const recalled = await store.search("F1 Dota 2", 5);
 
@@ -437,7 +406,7 @@ async function testUpdateMemoryInPlace(): Promise<void> {
       issue.labels = labels;
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const updated = await store.update("4", {
     detail: "xiangz likes F1, watches Dota 2 as a viewer, and recently follows tennis.",
     topics: ["preferences", "sports"],
@@ -492,7 +461,7 @@ async function testUpdateSupportsExplicitRetitle(): Promise<void> {
     },
     syncManagedLabels: async () => {},
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const updated = await store.update("20", { title: "Billing Audit Convention" });
 
   assert(updated?.title === "Memory: Billing Audit Convention", "expected memory_update to support explicit retitle");
@@ -532,7 +501,7 @@ async function testUpdateUsesHashSearchForDuplicateCheck(): Promise<void> {
     updateIssue: async () => { throw new Error("duplicate update should fail before mutating"); },
     syncManagedLabels: async () => {},
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   let message = "";
   try {
     await store.update("20", { detail: conflictingDetail });
@@ -586,7 +555,7 @@ async function testForgetClosesMemoryIssue(): Promise<void> {
       return issue;
     },
   };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
+  const store = new MemoryStore(client as never);
   const forgotten = await store.forget("12");
 
   assert(forgotten?.status === "stale", "expected forgotten memory to be returned as stale");
@@ -594,60 +563,11 @@ async function testForgetClosesMemoryIssue(): Promise<void> {
   assert(syncedLabels[0]?.labels.every((label) => !label.startsWith("memory-status:")), "expected memory_forget to stop writing lifecycle labels");
 }
 
-async function testApplyDecisionUsesHashAndDirectIdLookup(): Promise<void> {
-  const detail = "Use Redis Lua scripts to keep distributed rate limiting atomic.";
-  const hash = sha256(detail);
-  const existing = issueFromMemory(memory({
-    issueNumber: 30,
-    detail,
-    memoryHash: hash,
-    kind: "lesson",
-  }));
-  const staleTarget = issueFromMemory(memory({
-    issueNumber: 31,
-    detail: "Old deployment notes.",
-    memoryHash: sha256("Old deployment notes."),
-    kind: "convention",
-  }));
-  const queries: string[] = [];
-  const updatedIssues: Array<{ number: number; state?: "open" | "closed" }> = [];
-  const client = {
-    repo: () => "owner/main-memory",
-    searchIssues: async (query: string) => {
-      queries.push(query);
-      return [existing];
-    },
-    getIssue: async (number: number) => {
-      if (number === 31) return staleTarget;
-      throw new Error("issue missing");
-    },
-    listIssues: async () => { throw new Error("applyDecision should not scan all active memories when hash/id lookups are available"); },
-    ensureLabels: async () => {},
-    createIssue: async () => { throw new Error("exact duplicates should not create new issues"); },
-    syncManagedLabels: async () => {},
-    updateIssue: async (number: number, patch: { state?: "open" | "closed" }) => {
-      updatedIssues.push({ number, state: patch.state });
-      return number === 31 ? { ...staleTarget, state: patch.state } : existing;
-    },
-  };
-  const store = new MemoryStore(client as never, {} as never, testConfig());
-  const result = await (store as any).applyDecision({
-    save: [{ detail, kind: "lesson" }],
-    stale: ["31"],
-  });
-
-  assert(result.savedCount === 0, "expected exact duplicate saves to be filtered by hash");
-  assert(result.staledCount === 1, "expected stale ids to resolve via direct issue lookup");
-  assert(updatedIssues[0]?.number === 31 && updatedIssues[0]?.state === "closed", "expected stale target to be closed");
-  assert(queries.length === 1 && queries[0]?.includes(hash), "expected applyDecision to search by memory hash");
-}
-
 async function main(): Promise<void> {
   await testBackendSearchBuildsSingleCleanedQuery();
   await testBackendSearchPreferredForRecall();
   await testBackendSearchReturnsEmptyWithoutLexicalFallback();
   await testBackendSearchPropagatesErrors();
-testCjkScoring();
   testMergeMemoryCandidates();
   await testStructuredStoreAndSchema();
   await testListSchemaPrefersLabelsWithoutIssueScan();
@@ -659,7 +579,6 @@ testCjkScoring();
   await testUpdateSupportsExplicitRetitle();
   await testForgetClosesMemoryIssue();
   await testUpdateUsesHashSearchForDuplicateCheck();
-  await testApplyDecisionUsesHashAndDirectIdLookup();
   console.log("memory tests passed");
 }
 

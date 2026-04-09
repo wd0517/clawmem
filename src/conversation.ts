@@ -7,7 +7,7 @@ import type { GitHubIssueClient } from "./github-client.js";
 import { parseCandidates } from "./memory.js";
 import { normalizeMessages, readTranscriptSnapshot } from "./transcript.js";
 import type { ClawMemPluginConfig, MemoryCandidate, NormalizedMessage, SessionMirrorState, TranscriptSnapshot } from "./types.js";
-import { fmtTranscript, fmtTranscriptFrom, localDate, localDateTime, sha256, sliceTranscriptDelta, subKey } from "./utils.js";
+import { fmtTranscript, localDate, localDateTime, sha256, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 
 export class ConversationMirror {
@@ -17,16 +17,15 @@ export class ConversationMirror {
     if (sessionId.startsWith("slug-generator-")) return false;
     const first = messages.find((m) => m.role === "user")?.text ?? "";
     if (first.includes("generate a short 1-2 word filename slug") && first.includes("Reply with ONLY the slug")) return false;
-    if (first.includes("Summarize the following conversation.") && first.includes('Return valid JSON only in the form {"summary":"..."}')) return false;
-    if (first.includes("Extract durable memories from the conversation below.") && first.includes('Return JSON only in the form {"save":')) return false;
-    if (first.includes("Maintain a rolling digest of the conversation below.") && first.includes('Return valid JSON only in the form {"digest":"...","title":"..."}')) return false;
-    if (first.includes("Write the final issue summary for the conversation below.") && first.includes('Return valid JSON only in the form {"summary":"...","title":"..."}')) return false;
-    if (first.includes("Extract atomic durable memory candidates from the conversation delta below.")) return false;
-    if (first.includes("Reconcile extracted durable memory candidates against existing memories.")) return false;
+    if (first.includes("Write the final issue summary and extract durable memory candidates from the conversation below.")) return false;
     return true;
   }
 
   async loadSnapshot(session: SessionMirrorState, fallback: unknown[]): Promise<TranscriptSnapshot> {
+    const normalizedFallback = normalizeMessages(fallback);
+    if (normalizedFallback.length > 0) {
+      return { sessionId: session.sessionId, messages: normalizedFallback };
+    }
     const filePath = await this.resolveTranscriptPath(session.sessionFile);
     if (filePath) {
       session.sessionFile = filePath;
@@ -37,7 +36,7 @@ export class ConversationMirror {
         this.api.logger.warn(`clawmem: transcript read failed for ${filePath}: ${String(error)}`);
       }
     }
-    return { sessionId: session.sessionId, messages: normalizeMessages(fallback) };
+    return { sessionId: session.sessionId, messages: normalizedFallback };
   }
 
   async ensureIssue(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<void> {
@@ -95,180 +94,16 @@ export class ConversationMirror {
     return count;
   }
 
-  async generateRollingDigest(
+  async generateFinalArtifacts(
     session: SessionMirrorState,
     snapshot: TranscriptSnapshot,
-    fromCursor: number,
-    previousDigest?: string,
-  ): Promise<{ digest: string; title?: string }> {
-    const { anchorStart, deltaStart, anchorMessages, deltaMessages } = sliceTranscriptDelta(snapshot.messages, fromCursor, 2);
-    if (deltaMessages.length === 0) {
-      return { digest: previousDigest?.trim() || "" };
-    }
+  ): Promise<{ summary: string; title?: string; candidates: MemoryCandidate[] }> {
+    if (snapshot.messages.length === 0) throw new Error("no conversation messages to finalize");
     const subagent = this.api.runtime.subagent;
-    const sessionKey = subKey(session, "digest");
+    const sessionKey = subKey(session, "finalize");
     const message = [
-      "Maintain a rolling digest of the conversation below.",
-      'Return valid JSON only in the form {"digest":"...","title":"..."}',
-      "Update the digest so it accurately represents the conversation so far in 4-8 concise factual sentences.",
-      "Focus on decisions, constraints, preferences, open workstreams, and concrete outcomes worth carrying forward.",
-      "Use the anchor messages only for context resolution. The new messages are the only part that must be incorporated now.",
-      "Title is optional. If provided, keep it under 50 characters and accurately describe the overall conversation.",
-      "",
-      "<previous-digest>",
-      previousDigest?.trim() || "None.",
-      "</previous-digest>",
-      "",
-      "<anchor-messages>",
-      anchorMessages.length > 0 ? fmtTranscriptFrom(anchorMessages, anchorStart) : "None.",
-      "</anchor-messages>",
-      "",
-      "<new-messages>",
-      fmtTranscriptFrom(deltaMessages, deltaStart),
-      "</new-messages>",
-    ].join("\n");
-    try {
-      const run = await subagent.run({
-        sessionKey,
-        message,
-        deliver: false,
-        lane: "clawmem-digest",
-        idempotencyKey: sha256(`${session.sessionId}:${fromCursor}:${snapshot.messages.length}:digest-v1`),
-        extraSystemPrompt: "You maintain rolling conversation digests for ClawMem. Output JSON only with string fields digest and optional title.",
-      });
-      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.digestWaitTimeoutMs });
-      if (wait.status === "timeout") throw new Error("digest subagent timed out");
-      if (wait.status === "error") throw new Error(wait.error || "digest subagent failed");
-      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
-      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!text) throw new Error("digest subagent returned no assistant text");
-      return parseDigestAndTitle(text);
-    } finally {
-      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
-    }
-  }
-
-  async deriveDelta(
-    session: SessionMirrorState,
-    snapshot: TranscriptSnapshot,
-    fromCursor: number,
-    previousDigest?: string,
-  ): Promise<{ digest: string; title?: string; candidates: MemoryCandidate[] }> {
-    const { anchorStart, deltaStart, anchorMessages, deltaMessages } = sliceTranscriptDelta(snapshot.messages, fromCursor, 2);
-    if (deltaMessages.length === 0) {
-      return { digest: previousDigest?.trim() || "", candidates: [] };
-    }
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = subKey(session, "derive-delta");
-    const message = [
-      "Maintain a rolling digest and extract atomic durable memory candidates from the conversation delta below.",
-      'Return valid JSON only in the form {"digest":"...","title":"...","candidates":[{"title":"...","detail":"...","kind":"...","topics":["..."],"evidence":"..."}]}.',
-      "Update the digest so it accurately represents the conversation so far in 4-8 concise factual sentences.",
-      "Focus the digest on decisions, constraints, preferences, open workstreams, and concrete outcomes worth carrying forward.",
-      "Extract only durable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
-      "Use the anchor messages only for context resolution. The new messages are the only source that may add new candidates now.",
-      "Each candidate must represent one durable fact. Split independent facts into separate candidates.",
-      "Do not extract temporary requests, tool chatter, startup boilerplate, or summaries about internal helper sessions.",
-      "Kind and topics are optional. Keep them short, reusable, and low-cardinality.",
-      "Evidence is optional. If present, keep it short and quote-free.",
-      "Title is optional. If provided, keep it under 50 characters and accurately describe the overall conversation.",
-      "Prefer an empty candidates array when nothing durable was added.",
-      "",
-      "<previous-digest>",
-      previousDigest?.trim() || "None.",
-      "</previous-digest>",
-      "",
-      "<anchor-messages>",
-      anchorMessages.length > 0 ? fmtTranscriptFrom(anchorMessages, anchorStart) : "None.",
-      "</anchor-messages>",
-      "",
-      "<new-messages>",
-      fmtTranscriptFrom(deltaMessages, deltaStart),
-      "</new-messages>",
-    ].join("\n");
-    try {
-      const run = await subagent.run({
-        sessionKey,
-        message,
-        deliver: false,
-        lane: "clawmem-derive-delta",
-        idempotencyKey: sha256(`${session.sessionId}:${fromCursor}:${snapshot.messages.length}:derive-delta-v1`),
-        extraSystemPrompt: "You maintain rolling conversation digests and extract atomic durable memory candidates for ClawMem. Output JSON only with digest, optional title, and candidates.",
-      });
-      const wait = await subagent.waitForRun({
-        runId: run.runId,
-        timeoutMs: Math.max(this.config.digestWaitTimeoutMs, this.config.memoryExtractWaitTimeoutMs),
-      });
-      if (wait.status === "timeout") throw new Error("derive delta subagent timed out");
-      if (wait.status === "error") throw new Error(wait.error || "derive delta subagent failed");
-      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
-      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!text) throw new Error("derive delta subagent returned no assistant text");
-      return parseDerivedDelta(text);
-    } finally {
-      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
-    }
-  }
-
-  async generateFinalSummaryFromDigest(
-    session: SessionMirrorState,
-    snapshot: TranscriptSnapshot,
-    digestText: string,
-  ): Promise<{ summary: string; title?: string }> {
-    if (!digestText.trim() && snapshot.messages.length === 0) throw new Error("no conversation content to summarize");
-    const tailStart = Math.max(0, snapshot.messages.length - 6);
-    const tailMessages = snapshot.messages.slice(tailStart);
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = subKey(session, "summary-final");
-    const message = [
-      "Write the final issue summary for the conversation below.",
-      'Return valid JSON only in the form {"summary":"...","title":"..."}',
-      "The summary should be concise, factual, and written in 2-4 sentences.",
-      "Use the rolling digest as the primary source of truth, and use the recent tail only to preserve freshness and wording accuracy.",
-      "Do not include markdown, bullet points, or analysis.",
-      "",
-      "Title rules:",
-      "- Under 50 characters, accurately describe the main topic or task.",
-      "- Should let someone immediately know what the conversation is about.",
-      "- Must be in the same language as the majority of the conversation content.",
-      "- Good: precise, descriptive, specific. Bad: vague, overly creative, generic.",
-      "",
-      "<rolling-digest>",
-      digestText.trim() || "None.",
-      "</rolling-digest>",
-      "",
-      "<recent-tail>",
-      tailMessages.length > 0 ? fmtTranscriptFrom(tailMessages, tailStart) : "None.",
-      "</recent-tail>",
-    ].join("\n");
-    try {
-      const run = await subagent.run({
-        sessionKey,
-        message,
-        deliver: false,
-        lane: "clawmem-summary",
-        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:summary-final-v1`),
-        extraSystemPrompt: "You write final conversation issue summaries for ClawMem. Output JSON only with string fields summary and title.",
-      });
-      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.summaryWaitTimeoutMs });
-      if (wait.status === "timeout") throw new Error("summary subagent timed out");
-      if (wait.status === "error") throw new Error(wait.error || "summary subagent failed");
-      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
-      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!text) throw new Error("summary subagent returned no assistant text");
-      return parseSummaryAndTitle(text);
-    } finally {
-      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
-    }
-  }
-
-  async generateSummaryAndTitle(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<{ summary: string; title?: string }> {
-    if (snapshot.messages.length === 0) throw new Error("no conversation messages to summarize");
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = subKey(session, "summary");
-    const message = [
-      "Summarize the following conversation and generate a short title.",
-      'Return valid JSON only in the form {"summary":"...","title":"..."}',
+      "Write the final issue summary and extract durable memory candidates from the conversation below.",
+      'Return valid JSON only in the form {"summary":"...","title":"...","candidates":[{"title":"...","detail":"...","kind":"...","topics":["..."],"evidence":"..."}]}.',
       "The summary should be concise, factual, and written in 2-4 sentences.",
       "Do not include markdown, bullet points, or analysis.",
       "",
@@ -277,56 +112,14 @@ export class ConversationMirror {
       "- Should let someone immediately know what the conversation is about.",
       "- Must be in the same language as the majority of the conversation content.",
       "- Good: precise, descriptive, specific. Bad: vague, overly creative, generic.",
-      "", "<conversation>", fmtTranscript(snapshot.messages), "</conversation>",
-    ].join("\n");
-    try {
-      const run = await subagent.run({
-        sessionKey, message, deliver: false, lane: "clawmem-summary",
-        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:summary-v2`),
-        extraSystemPrompt: "You summarize conversations and generate accurate, descriptive titles. Output JSON only with string fields summary and title.",
-      });
-      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.summaryWaitTimeoutMs });
-      if (wait.status === "timeout") throw new Error("summary subagent timed out");
-      if (wait.status === "error") throw new Error(wait.error || "summary subagent failed");
-      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
-      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!text) throw new Error("summary subagent returned no assistant text");
-      return parseSummaryAndTitle(text);
-    } finally { subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {}); }
-  }
-
-  /** If the title has not yet been generated by LLM, generate an accurate title from the full conversation and update the issue. */
-  async syncTitle(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<void> {
-    if (!session.issueNumber) return;
-    if (session.titleSource === "llm") return;
-    if (snapshot.messages.length < 2) return;
-    try {
-      const title = await this.generateTitle(session, snapshot);
-      if (title) {
-        await this.client.updateIssue(session.issueNumber, { title });
-        session.issueTitle = title;
-        session.titleSource = "llm";
-      }
-    } catch (e) {
-      this.api.logger.warn(`clawmem: title sync failed: ${String(e)}`);
-    }
-  }
-
-  /** Generate an accurate, descriptive title from the full conversation content via LLM. */
-  async generateTitle(session: SessionMirrorState, snapshot: TranscriptSnapshot): Promise<string | undefined> {
-    if (snapshot.messages.length === 0) return undefined;
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = subKey(session, "title");
-    const message = [
-      "Generate a short, accurate title for the following conversation.",
-      'Return valid JSON only in the form {"title":"..."}',
       "",
-      "Title rules:",
-      "- Under 50 characters.",
-      "- Accurately describe the main topic or task of the conversation.",
-      "- Should let someone immediately know what the conversation is about.",
-      "- Must be in the same language as the majority of the conversation content.",
-      "- Good: precise, descriptive, specific. Bad: vague, overly creative, generic.",
+      "Candidate rules:",
+      "- Extract only durable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
+      "- Each candidate must represent one durable fact. Split independent facts into separate candidates.",
+      "- Do not extract temporary requests, tool chatter, startup boilerplate, or summaries about internal helper sessions.",
+      "- Kind and topics are optional. Keep them short, reusable, and low-cardinality.",
+      "- Evidence is optional. If present, keep it short and quote-free.",
+      "- Prefer an empty candidates array when nothing durable was learned.",
       "",
       "<conversation>",
       fmtTranscript(snapshot.messages),
@@ -334,102 +127,23 @@ export class ConversationMirror {
     ].join("\n");
     try {
       const run = await subagent.run({
-        sessionKey, message, deliver: false, lane: "clawmem-title",
-        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:title-v1`),
-        extraSystemPrompt: "You generate accurate, descriptive titles for conversations. Output JSON only with a string field title.",
+        sessionKey,
+        message,
+        deliver: false,
+        lane: "clawmem-finalize",
+        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:finalize-v1`),
+        extraSystemPrompt: "You finalize ClawMem conversations. Output JSON only with summary, title, and durable memory candidates.",
       });
-      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: 30000 });
-      if (wait.status === "timeout" || wait.status === "error") return undefined;
-      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 10 })).messages);
-      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!text) return undefined;
-      return parseTitle(text);
-    } catch (e) {
-      this.api.logger.warn(`clawmem: title generation failed: ${String(e)}`);
-      return undefined;
-    } finally {
-      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
-    }
-  }
-
-  /** Re-title all existing conversation issues. Uses summary when available, falls back to reading comments. */
-  async retitleConversations(): Promise<{ updated: number; skipped: number; failed: number; retitledIssues: number[] }> {
-    let updated = 0, skipped = 0, failed = 0;
-    const retitledIssues: number[] = [];
-    let page = 1;
-    while (true) {
-      const issues = await this.client.listIssues({ labels: ["type:conversation"], state: "all", page, perPage: 50 });
-      if (issues.length === 0) break;
-      for (const issue of issues) {
-        try {
-          const yaml = parseFlatYaml(issue.body || "");
-          const summary = yaml.summary;
-          let titleInput: string | undefined;
-          if (summary && summary !== "pending" && !summary.startsWith("failed:")) {
-            titleInput = summary;
-          } else {
-            // No usable summary — reconstruct conversation from issue comments.
-            const comments = await this.client.listComments(issue.number, { perPage: 50 });
-            const conversationText = comments
-              .map((c) => c.body?.trim())
-              .filter((b): b is string => Boolean(b))
-              .join("\n\n");
-            if (conversationText.length >= 20) {
-              // Cap to avoid excessive token usage in LLM call.
-              titleInput = conversationText.length > 4000 ? conversationText.slice(0, 4000) + "\n..." : conversationText;
-            }
-          }
-          if (!titleInput) { skipped++; continue; }
-          const title = await this.generateTitleFromText(titleInput, `retitle-${issue.number}`);
-          if (!title) { skipped++; continue; }
-          await this.client.updateIssue(issue.number, { title });
-          this.api.logger.info?.(`clawmem: retitled issue #${issue.number} -> "${title}"`);
-          retitledIssues.push(issue.number);
-          updated++;
-        } catch (e) {
-          this.api.logger.warn(`clawmem: retitle failed for issue #${issue.number}: ${String(e)}`);
-          failed++;
-        }
-      }
-      if (issues.length < 50) break;
-      page++;
-    }
-    return { updated, skipped, failed, retitledIssues };
-  }
-
-  private async generateTitleFromText(text: string, uniqueKey: string): Promise<string | undefined> {
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = `clawmem-${uniqueKey}`;
-    const message = [
-      "Generate a short, accurate title based on the following conversation content.",
-      'Return valid JSON only in the form {"title":"..."}',
-      "",
-      "Title rules:",
-      "- Under 50 characters.",
-      "- Accurately describe the main topic or task.",
-      "- Should let someone immediately know what the conversation was about.",
-      "- Must be in the same language as the content.",
-      "- Good: precise, descriptive, specific. Bad: vague, overly creative, generic.",
-      "",
-      "<content>",
-      text,
-      "</content>",
-    ].join("\n");
-    try {
-      const run = await subagent.run({
-        sessionKey, message, deliver: false, lane: "clawmem-retitle",
-        idempotencyKey: sha256(`retitle:${uniqueKey}:${text.slice(0, 200)}`),
-        extraSystemPrompt: "You generate accurate, descriptive titles. Output JSON only with a string field title.",
+      const wait = await subagent.waitForRun({
+        runId: run.runId,
+        timeoutMs: Math.max(this.config.summaryWaitTimeoutMs, this.config.memoryExtractWaitTimeoutMs),
       });
-      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: 30000 });
-      if (wait.status === "timeout" || wait.status === "error") return undefined;
-      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 10 })).messages);
-      const raw = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!raw) return undefined;
-      return parseTitle(raw);
-    } catch (e) {
-      this.api.logger.warn(`clawmem: title generation from text failed (${uniqueKey}): ${String(e)}`);
-      return undefined;
+      if (wait.status === "timeout") throw new Error("finalize subagent timed out");
+      if (wait.status === "error") throw new Error(wait.error || "finalize subagent failed");
+      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
+      const text = [...msgs].reverse().find((entry) => entry.role === "assistant" && entry.text.trim())?.text;
+      if (!text) throw new Error("finalize subagent returned no assistant text");
+      return parseFinalArtifacts(text);
     } finally {
       subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
     }
@@ -539,69 +253,12 @@ function parseSummaryAndTitle(raw: string): { summary: string; title?: string } 
   return { summary: t };
 }
 
-function parseDigestAndTitle(raw: string): { digest: string; title?: string } {
-  const tryParse = (s: string): { digest: string; title?: string } | null => {
-    try {
-      const p = JSON.parse(s) as { digest?: unknown; title?: unknown };
-      const digest = typeof p?.digest === "string" && p.digest.trim() ? p.digest.trim() : null;
-      if (!digest) return null;
-      const title = typeof p?.title === "string" && p.title.trim() ? p.title.trim() : undefined;
-      return { digest, title };
-    } catch {
-      const i = s.indexOf("{"), j = s.lastIndexOf("}");
-      if (i >= 0 && j > i) {
-        try {
-          const p = JSON.parse(s.slice(i, j + 1)) as { digest?: unknown; title?: unknown };
-          const digest = typeof p?.digest === "string" && p.digest.trim() ? p.digest.trim() : null;
-          if (!digest) return null;
-          const title = typeof p?.title === "string" && p.title.trim() ? p.title.trim() : undefined;
-          return { digest, title };
-        } catch { return null; }
-      }
-      return null;
-    }
-  };
-  const t = raw.trim();
-  const direct = tryParse(t);
-  if (direct) return direct;
-  const f = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(t);
-  if (f?.[1]) {
-    const nested = tryParse(f[1].trim());
-    if (nested) return nested;
-  }
-  return { digest: t };
-}
-
-function parseDerivedDelta(raw: string): { digest: string; title?: string; candidates: MemoryCandidate[] } {
-  const parsedDigest = parseDigestAndTitle(raw);
+function parseFinalArtifacts(raw: string): { summary: string; title?: string; candidates: MemoryCandidate[] } {
+  const parsedSummary = parseSummaryAndTitle(raw);
   const candidates = parseCandidates(raw);
   return {
-    digest: parsedDigest.digest,
-    ...(parsedDigest.title ? { title: parsedDigest.title } : {}),
+    summary: parsedSummary.summary,
+    ...(parsedSummary.title ? { title: parsedSummary.title } : {}),
     candidates,
   };
-}
-
-function parseTitle(raw: string): string | undefined {
-  const tryParse = (s: string): string | undefined => {
-    try {
-      const p = JSON.parse(s) as { title?: unknown };
-      return typeof p?.title === "string" && p.title.trim() ? p.title.trim() : undefined;
-    } catch {
-      const i = s.indexOf("{"), j = s.lastIndexOf("}");
-      if (i >= 0 && j > i) {
-        try {
-          const p = JSON.parse(s.slice(i, j + 1)) as { title?: unknown };
-          return typeof p?.title === "string" && p.title.trim() ? p.title.trim() : undefined;
-        } catch { return undefined; }
-      }
-      return undefined;
-    }
-  };
-  const t = raw.trim();
-  const direct = tryParse(t);
-  if (direct) return direct;
-  const f = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(t);
-  if (f?.[1]) return tryParse(f[1].trim());
-  return undefined;
 }
