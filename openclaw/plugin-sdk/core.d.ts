@@ -1,3 +1,12 @@
+export type MemoryPromptSectionBuilder = (params: {
+  availableTools: Set<string>;
+  citationsMode?: string;
+}) => string[];
+
+export type MemoryPluginCapability = {
+  promptBuilder?: MemoryPromptSectionBuilder;
+};
+
 export type OpenClawPluginApi = {
   id?: string;
   pluginConfig?: unknown;
@@ -31,4 +40,6 @@ export type OpenClawPluginApi = {
   on: (event: string, handler: (...args: any[]) => unknown) => void;
   registerTool: (tool: Record<string, unknown>) => void;
   registerService: (service: Record<string, unknown>) => void;
+  registerMemoryCapability?: (capability: MemoryPluginCapability) => void;
+  registerMemoryPromptSection?: (builder: MemoryPromptSectionBuilder) => void;
 };

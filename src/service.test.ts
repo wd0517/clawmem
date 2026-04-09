@@ -1,5 +1,7 @@
 import {
+  buildClawMemPromptSection,
   buildAutoRecallContext,
+  createClawMemPlugin,
   extractPromptTextForRecall,
   resolveOpenClawHostVersion,
   resolvePromptHookMode,
@@ -75,6 +77,111 @@ function testBuildAutoRecallContext(): void {
   assert(context.includes("- [11] OpenClaw main agent identity uses Gandalf."), "expected memories to be listed as bullets");
 }
 
+function testBuildClawMemPromptSection(): void {
+  const lines = buildClawMemPromptSection({
+    availableTools: new Set([
+      "memory_recall",
+      "memory_list",
+      "memory_get",
+      "memory_repos",
+      "memory_store",
+      "memory_update",
+      "memory_forget",
+    ]),
+  });
+  const prompt = lines.join("\n");
+
+  assert(lines[0] === "## ClawMem", "expected a stable heading for always-on ClawMem guidance");
+  assert(prompt.includes("active long-term memory system"), "expected the prompt to frame ClawMem as the active memory system");
+  assert(prompt.includes("`memory_recall`, `memory_list`, and `memory_get`"), "expected explicit retrieval guidance");
+  assert(prompt.includes("`memory_store` and `memory_update`"), "expected explicit save guidance");
+  assert(prompt.includes("`memory_forget`"), "expected explicit stale-memory guidance");
+}
+
+function createFakePluginApi(options?: {
+  slot?: string;
+  exposeCapability?: boolean;
+}) {
+  let registeredCapability: { promptBuilder?: typeof buildClawMemPromptSection } | undefined;
+  let registeredPromptSection: typeof buildClawMemPromptSection | undefined;
+  const api = {
+    id: "clawmem",
+    name: "ClawMem",
+    source: "test",
+    registrationMode: "test",
+    config: {},
+    pluginConfig: {},
+    logger: {
+      info: () => {},
+      warn: () => {},
+    },
+    runtime: {
+      version: "2026.4.9",
+      config: {
+        loadConfig: () => ({
+          plugins: {
+            slots: {
+              memory: options?.slot ?? "clawmem",
+            },
+          },
+        }),
+      },
+      events: {
+        onSessionTranscriptUpdate: () => () => {},
+      },
+      subagent: {},
+    },
+    on: () => {},
+    registerTool: () => {},
+    registerService: () => {},
+    ...(options?.exposeCapability === false
+      ? {}
+      : {
+          registerMemoryCapability: (capability: { promptBuilder?: typeof buildClawMemPromptSection }) => {
+            registeredCapability = capability;
+          },
+        }),
+    registerMemoryPromptSection: (builder: typeof buildClawMemPromptSection) => {
+      registeredPromptSection = builder;
+    },
+  };
+
+  return {
+    api,
+    getRegisteredCapability: () => registeredCapability,
+    getRegisteredPromptSection: () => registeredPromptSection,
+  };
+}
+
+function testRegistersAlwaysOnMemoryPromptCapability(): void {
+  const fake = createFakePluginApi();
+  createClawMemPlugin(fake.api as never);
+
+  const capability = fake.getRegisteredCapability();
+  assert(Boolean(capability?.promptBuilder), "expected ClawMem to register a memory prompt builder");
+  const prompt = capability?.promptBuilder?.({ availableTools: new Set(["memory_recall", "memory_store"]) }).join("\n") ?? "";
+  assert(prompt.includes("## ClawMem"), "expected the registered prompt builder to emit ClawMem guidance");
+}
+
+function testFallsBackToLegacyMemoryPromptSectionRegistration(): void {
+  const fake = createFakePluginApi({ exposeCapability: false });
+  createClawMemPlugin(fake.api as never);
+
+  assert(!fake.getRegisteredCapability(), "expected no memory capability registration when the host lacks that API");
+  const builder = fake.getRegisteredPromptSection();
+  assert(Boolean(builder), "expected fallback registration through registerMemoryPromptSection");
+  const prompt = builder?.({ availableTools: new Set(["memory_recall"]) }).join("\n") ?? "";
+  assert(prompt.includes("## ClawMem"), "expected the fallback builder to emit ClawMem guidance");
+}
+
+function testSkipsAlwaysOnPromptWhenClawMemIsNotSelectedMemoryPlugin(): void {
+  const fake = createFakePluginApi({ slot: "other-memory" });
+  createClawMemPlugin(fake.api as never);
+
+  assert(!fake.getRegisteredCapability(), "expected no memory prompt registration when ClawMem is not the selected memory plugin");
+  assert(!fake.getRegisteredPromptSection(), "expected no legacy prompt registration when ClawMem is not selected");
+}
+
 function testResolveHostVersionFromRuntime(): void {
   const version = resolveOpenClawHostVersion({ runtime: { version: "2026.3.28" } } as never);
   assert(version === "2026.3.28", "expected runtime.version to take precedence");
@@ -139,11 +246,15 @@ testExtractPromptFallsBackToLatestUserMessage();
 testExtractPromptFromPromptField();
 testExtractPromptFromStructuredContent();
 testBuildAutoRecallContext();
+testBuildClawMemPromptSection();
 testResolveHostVersionFromRuntime();
 testResolveHostVersionFromEnvFallback();
 testIgnoresNpmPackageVersionFallback();
 testResolvePromptHookModeModern();
 testResolvePromptHookModeLegacy();
 testResolvePromptHookModeLegacyForUnknownVersion();
+testRegistersAlwaysOnMemoryPromptCapability();
+testFallsBackToLegacyMemoryPromptSectionRegistration();
+testSkipsAlwaysOnPromptWhenClawMemIsNotSelectedMemoryPlugin();
 
 console.log("service tests passed");
