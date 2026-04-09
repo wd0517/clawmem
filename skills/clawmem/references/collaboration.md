@@ -24,8 +24,12 @@ Use this reference when the user asks to:
 - invite someone into an organization
 - inspect, accept, or decline an invitation sent to the current user
 - create or manage a team
+- inspect or remove organization members or membership state
+- revoke a pending organization invitation from the org side
 - add or remove a repository collaborator
 - grant a team access to a repo
+- rename or delete a team, or inspect team members
+- move an existing memory repo into an organization
 - inspect outside collaborators
 - create a shared team memory repo or org-owned memory space
 - debug why a user can or cannot access a repo
@@ -45,7 +49,11 @@ Do not use this workflow for ordinary memory recall or save actions unless the u
 Tool-first rule:
 - Read-only inspection:
   - `collaboration_orgs`
+  - `collaboration_org_members`
+  - `collaboration_org_membership`
   - `collaboration_teams`
+  - `collaboration_team`
+  - `collaboration_team_members`
   - `collaboration_team_repos`
   - `collaboration_repo_collaborators`
   - `collaboration_repo_invitations`
@@ -56,16 +64,22 @@ Tool-first rule:
   - `collaboration_repo_access_inspect`
 - Mutations:
   - `collaboration_org_create`
+  - `collaboration_org_member_remove`
+  - `collaboration_org_membership_remove`
   - `collaboration_team_create`
+  - `collaboration_team_update`
+  - `collaboration_team_delete`
   - `collaboration_team_membership_set`
   - `collaboration_team_membership_remove`
   - `collaboration_team_repo_set`
   - `collaboration_team_repo_remove`
+  - `collaboration_repo_transfer`
   - `collaboration_repo_collaborator_set`
   - `collaboration_repo_collaborator_remove`
   - `collaboration_user_repo_invitation_accept`
   - `collaboration_user_repo_invitation_decline`
   - `collaboration_org_invitation_create`
+  - `collaboration_org_invitation_revoke`
   - `collaboration_user_org_invitation_accept`
   - `collaboration_user_org_invitation_decline`
 
@@ -103,6 +117,7 @@ Reason with these rules before every collaboration action:
 - Accepting a repository invitation is what turns a pending share into visible repo access for the invitee.
 - Outside collaborators are non-members who still have direct collaborator access to at least one org-owned repo.
 - Accepting an org invitation creates org membership, joins invited teams as `member`, and removes the pending invitation.
+- Org default repository permission can still grant repo access to active org members even after direct collaborator or team grants are removed.
 - If a user becomes an org member, any outside-collaborator row for that org should disappear.
 - The system-managed `admins` team is an implementation mechanism, not a user-facing product primitive.
 
@@ -114,8 +129,10 @@ Use this decision map:
 |---|---|
 | Give one user access to one repo without org membership | Direct collaborator |
 | Bring one user into the org | Org invitation |
+| Inspect whether a user already has org membership or only a pending org invite | Org membership inspection |
 | Grant a group access to selected repos | Team + team-repo grant |
 | Create a shared team memory space | Org-owned repo + team-repo grant |
+| Move an existing memory repo under org governance | Repo transfer into org |
 | Create another memory space under the current agent identity | `memory_repo_create` |
 | Inspect non-members who still have repo access | Outside collaborator listing |
 
@@ -152,6 +169,24 @@ Translate user intent like this:
 - `Bring Alice into the org and platform team`
   - inspect teams first with `collaboration_teams`
   - then use `collaboration_org_invitation_create`
+- `Show me who is in this org`
+  - use `collaboration_org_members`
+  - if you need one person's exact state, use `collaboration_org_membership`
+- `Remove Alice from the org`
+  - inspect `collaboration_org_membership` first
+  - if Alice is an active org member, use `collaboration_org_member_remove`
+  - if you want one command that also handles pending invites, use `collaboration_org_membership_remove`
+- `Revoke the pending org invite for Alice`
+  - inspect `collaboration_org_invitations` to get the invitation id
+  - then use `collaboration_org_invitation_revoke`
+- `Rename or delete this team`
+  - inspect the team with `collaboration_team`
+  - use `collaboration_team_update` or `collaboration_team_delete`
+- `Who is in team platform?`
+  - use `collaboration_team_members`
+- `Move this repo into org acme so team access can govern it`
+  - ensure the target org already exists and the actor has org admin rights
+  - then use `collaboration_repo_transfer`
 - `Someone shared a memory repo with me; can you see it and accept it?`
   - start with `collaboration_user_repo_invitations`
   - do not treat a `memory_repos` miss as proof that no share exists
@@ -161,9 +196,12 @@ Translate user intent like this:
   - if needed, have the repo owner inspect `collaboration_repo_invitations`
 - `Why can Bob still see this repo?`
   - start with `collaboration_repo_access_inspect`
+  - if you know the username, pass it so the tool can check org membership and org-base access explicitly
   - then drill into `collaboration_repo_collaborators`, `collaboration_repo_invitations`, `collaboration_team_repos`, `collaboration_outside_collaborators`, and `collaboration_org_invitations` as needed
 - `Remove Carol from org-shared memory access`
-  - identify whether access comes from a direct collaborator grant, a team repo grant, or a pending invitation
+  - identify whether access comes from org default permission, a direct collaborator grant, a team repo grant, or a pending invitation
+  - inspect `collaboration_org_membership` when the repo is org-owned
+  - if org default permission still applies, remove org membership with `collaboration_org_member_remove` or `collaboration_org_membership_remove`
   - remove the actual source of access rather than guessing
 
 ## Team memory quality bar
@@ -205,6 +243,10 @@ After the repo exists:
 - grant the team access with `collaboration_team_repo_set`
 - use the main memory tools with explicit `repo` targeting for read and write flows
 - reuse [manual-ops.md](manual-ops.md) only if you need raw memory issue control after the repo already exists
+
+If the repo already exists under a personal owner and should become org-governed instead of creating a fresh repo:
+- use `collaboration_repo_transfer`
+- then continue with team grants and explicit `repo` targeting against the new org-owned full name
 
 ## Fallback mode
 
