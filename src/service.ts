@@ -1883,7 +1883,7 @@ class ClawMemService {
 
     if (meaningfulTranscript) {
       try {
-        const artifacts = await this.resolveFinalArtifacts(session, snapshot, conv);
+        const artifacts = await this.resolveFinalArtifacts(session, snapshot, conv, mem);
         summaryText = artifacts.summary;
         if (artifacts.title?.trim()) {
           titleOverride = artifacts.title.trim();
@@ -1944,11 +1944,19 @@ class ClawMemService {
     session: SessionMirrorState,
     snapshot: TranscriptSnapshot,
     conv: ConversationMirror,
+    mem: MemoryStore,
   ): Promise<{ summary: string; title?: string; candidates: MemoryCandidate[] }> {
     const cached = getCachedFinalArtifacts(session, snapshot.messages.length);
     if (cached) return cached;
 
-    const artifacts = await conv.generateFinalArtifacts(session, snapshot);
+    let schema;
+    try {
+      schema = await mem.listSchema();
+    } catch (error) {
+      this.warn(`finalize schema load for ${session.sessionId}`, error);
+    }
+
+    const artifacts = await conv.generateFinalArtifacts(session, snapshot, schema);
     const derived = this.ensureDerived(session);
     const now = new Date().toISOString();
     derived.summary.text = artifacts.summary;
@@ -2352,6 +2360,7 @@ export function buildClawMemPromptSection(params: MemoryPromptBuilderParams): st
     hasTool("memory_get") ? "`memory_get`" : "",
   ].filter(Boolean);
   const routingTools = [hasTool("memory_repos") ? "`memory_repos`" : ""].filter(Boolean);
+  const schemaTools = [hasTool("memory_labels") ? "`memory_labels`" : ""].filter(Boolean);
   const writeTools = [
     hasTool("memory_store") ? "`memory_store`" : "",
     hasTool("memory_update") ? "`memory_update`" : "",
@@ -2368,6 +2377,11 @@ export function buildClawMemPromptSection(params: MemoryPromptBuilderParams): st
     `${writeTools.length > 0 || hasForgetTool
       ? `- After answering, ask whether this turn created durable knowledge. If yes or unsure, write it now${writeTools.length > 0 ? ` with ${joinNaturalLanguageList(writeTools)}` : ""}${hasForgetTool ? `${writeTools.length > 0 ? "; " : " "}use \`memory_forget\` for stale or superseded memories` : ""} instead of waiting for background extraction.`
       : "- After answering, ask whether this turn created durable knowledge and save it immediately instead of waiting for background extraction."}`,
+    "- Store one durable fact per memory. Skip temporary requests, tool chatter, startup boilerplate, and bundled summaries of unrelated facts.",
+    "- Prefer an explicit short `title` plus a fuller `detail`. Write new human-readable memory text in the user's current language and keep structural labels machine-readable.",
+    `${schemaTools.length > 0
+      ? `- Reuse existing \`kind\` and \`topic\` labels by checking ${joinNaturalLanguageList(schemaTools)} first. If no current label fits, create one short stable machine-readable label instead of a translated or near-duplicate variant.`
+      : "- Reuse existing `kind` and `topic` labels before inventing new ones. If no current label fits, create one short stable machine-readable label instead of a translated or near-duplicate variant."}`,
     "- Use the bundled `clawmem` skill for detailed routing, schema, collaboration, communication, and manual repo-backed workflows.",
     "",
   ];

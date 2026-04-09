@@ -55,6 +55,7 @@ On every user turn, run this loop:
    - Use `memory_store` when this is a genuinely new memory.
    - When using `memory_store`, pass both `title` and `detail` when you can. Keep the title concise and human-readable, and keep `detail` as the full durable fact.
    - When using `memory_update`, pass `title` as well if the existing title is too short, outdated, or less precise than the current canonical fact.
+   - Keep one durable fact per memory. Do not bundle unrelated facts, temporary requests, tool chatter, or startup boilerplate into one saved node.
    - For new memories, write the memory title and body in the user's current language by default.
    - Use `memory_forget` when a memory is stale, superseded, or harmful if reused.
 3. Keep the user posted.
@@ -67,7 +68,7 @@ Bias toward saving, and use explicit retrieval whenever auto-recall is absent, w
 ## Retrieval and storage rules
 
 - Before inventing a new `kind` or `topic`, call `memory_labels` and reuse the existing schema when possible.
-- If the current schema does not fit and a new label would improve future retrieval or reuse, extend the schema intentionally within `kind:*` and `topic:*`.
+- If no current label fits, create one new stable machine-readable label within `kind:*` or `topic:*`. Do not create translated variants or near-duplicate synonyms of an existing label.
 - Reuse stable labels over one-off labels.
 - Private personal memory usually belongs in the agent's `defaultRepo`.
 - Project memory belongs in the relevant project repo.

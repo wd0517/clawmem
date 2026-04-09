@@ -6,9 +6,12 @@ import { AGENT_LABEL_PREFIX, DEFAULT_LABELS, SESSION_TITLE_PREFIX, extractLabelN
 import type { GitHubIssueClient } from "./github-client.js";
 import { parseCandidates } from "./memory.js";
 import { normalizeMessages, readTranscriptSnapshot } from "./transcript.js";
-import type { ClawMemPluginConfig, MemoryCandidate, NormalizedMessage, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import type { ClawMemPluginConfig, MemoryCandidate, MemorySchema, NormalizedMessage, SessionMirrorState, TranscriptSnapshot } from "./types.js";
 import { fmtTranscript, localDate, localDateTime, sha256, subKey } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
+
+const FINALIZE_SCHEMA_KIND_LIMIT = 24;
+const FINALIZE_SCHEMA_TOPIC_LIMIT = 80;
 
 export class ConversationMirror {
   constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
@@ -97,42 +100,20 @@ export class ConversationMirror {
   async generateFinalArtifacts(
     session: SessionMirrorState,
     snapshot: TranscriptSnapshot,
+    schema?: MemorySchema,
   ): Promise<{ summary: string; title?: string; candidates: MemoryCandidate[] }> {
     if (snapshot.messages.length === 0) throw new Error("no conversation messages to finalize");
     const subagent = this.api.runtime.subagent;
     const sessionKey = subKey(session, "finalize");
-    const message = [
-      "Write the final issue summary and extract durable memory candidates from the conversation below.",
-      'Return valid JSON only in the form {"summary":"...","title":"...","candidates":[{"title":"...","detail":"...","kind":"...","topics":["..."],"evidence":"..."}]}.',
-      "The summary should be concise, factual, and written in 2-4 sentences.",
-      "Do not include markdown, bullet points, or analysis.",
-      "",
-      "Title rules:",
-      "- Under 50 characters, accurately describe the main topic or task.",
-      "- Should let someone immediately know what the conversation is about.",
-      "- Must be in the same language as the majority of the conversation content.",
-      "- Good: precise, descriptive, specific. Bad: vague, overly creative, generic.",
-      "",
-      "Candidate rules:",
-      "- Extract only durable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
-      "- Each candidate must represent one durable fact. Split independent facts into separate candidates.",
-      "- Do not extract temporary requests, tool chatter, startup boilerplate, or summaries about internal helper sessions.",
-      "- Kind and topics are optional. Keep them short, reusable, and low-cardinality.",
-      "- Evidence is optional. If present, keep it short and quote-free.",
-      "- Prefer an empty candidates array when nothing durable was learned.",
-      "",
-      "<conversation>",
-      fmtTranscript(snapshot.messages),
-      "</conversation>",
-    ].join("\n");
+    const message = buildFinalizeArtifactsPrompt(snapshot, schema);
     try {
       const run = await subagent.run({
         sessionKey,
         message,
         deliver: false,
         lane: "clawmem-finalize",
-        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:finalize-v1`),
-        extraSystemPrompt: "You finalize ClawMem conversations. Output JSON only with summary, title, and durable memory candidates.",
+        idempotencyKey: sha256(`${session.sessionId}:${snapshot.messages.length}:finalize-v2`),
+        extraSystemPrompt: "You finalize ClawMem conversations. Output JSON only with summary, title, and durable memory candidates. Reuse existing schema when it fits and keep human-readable memory text in the conversation language.",
       });
       const wait = await subagent.waitForRun({
         runId: run.runId,
@@ -212,6 +193,65 @@ export class ConversationMirror {
     session.turnCount = 0;
     session.finalizedAt = undefined;
   }
+}
+
+export function buildFinalizeArtifactsPrompt(snapshot: TranscriptSnapshot, schema?: MemorySchema): string {
+  return [
+    "Write the final issue summary and extract durable memory candidates from the conversation below.",
+    'Return valid JSON only in the form {"summary":"...","title":"...","candidates":[{"title":"...","detail":"...","kind":"...","topics":["..."],"evidence":"..."}]}.',
+    "The summary should be concise, factual, and written in 2-4 sentences.",
+    "Do not include markdown, bullet points, or analysis.",
+    "",
+    "Title rules:",
+    "- Under 50 characters, accurately describe the main topic or task.",
+    "- Should let someone immediately know what the conversation is about.",
+    "- Must be in the same language as the majority of the conversation content.",
+    "- Good: precise, descriptive, specific. Bad: vague, overly creative, generic.",
+    "",
+    "Candidate rules:",
+    "- Extract only durable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
+    "- Each candidate must represent one durable fact. Split independent facts into separate candidates.",
+    "- Prefer a concise explicit title for each candidate whenever the fact can be named clearly.",
+    "- Candidate titles and details must be in the same language as the majority of the conversation content.",
+    "- Do not extract temporary requests, tool chatter, startup boilerplate, or summaries about internal helper sessions.",
+    "- Reuse existing schema labels when one already fits.",
+    "- If no existing kind or topic fits, create one short stable machine-readable label instead of a translated or near-duplicate variant.",
+    "- Keep kind and topic labels short, reusable, low-cardinality, and machine-readable.",
+    "- Evidence is optional. If present, keep it short and quote-free.",
+    "- Prefer an empty candidates array when nothing durable was learned.",
+    "",
+    ...buildFinalizeSchemaSection(schema),
+    "<conversation>",
+    fmtTranscript(snapshot.messages),
+    "</conversation>",
+  ].join("\n");
+}
+
+function buildFinalizeSchemaSection(schema?: MemorySchema): string[] {
+  if (!schema) return [];
+
+  const kinds = schema.kinds.map((kind) => kind.trim()).filter(Boolean);
+  const topics = schema.topics.map((topic) => topic.trim()).filter(Boolean);
+  if (kinds.length === 0 && topics.length === 0) return [];
+
+  const kindLines = kinds.slice(0, FINALIZE_SCHEMA_KIND_LIMIT).map((kind) => `- kind:${kind}`);
+  const topicLines = topics.slice(0, FINALIZE_SCHEMA_TOPIC_LIMIT).map((topic) => `- topic:${topic}`);
+  const kindOverflow = kinds.length > kindLines.length ? [`- ...and ${kinds.length - kindLines.length} more kinds`] : [];
+  const topicOverflow = topics.length > topicLines.length ? [`- ...and ${topics.length - topicLines.length} more topics`] : [];
+
+  return [
+    "Current schema to reuse first:",
+    "<current-schema>",
+    "Kinds:",
+    ...(kindLines.length > 0 ? kindLines : ["- None"]),
+    ...kindOverflow,
+    "Topics:",
+    ...(topicLines.length > 0 ? topicLines : ["- None"]),
+    ...topicOverflow,
+    "</current-schema>",
+    "Prefer these existing labels whenever they fit. Only create a new label when none of the current labels matches the fact you are storing.",
+    "",
+  ];
 }
 
 async function fexists(p: string): Promise<boolean> { try { return (await fs.promises.stat(p)).isFile(); } catch { return false; } }

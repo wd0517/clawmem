@@ -84,6 +84,7 @@ function testBuildClawMemPromptSection(): void {
       "memory_list",
       "memory_get",
       "memory_repos",
+      "memory_labels",
       "memory_store",
       "memory_update",
       "memory_forget",
@@ -96,6 +97,12 @@ function testBuildClawMemPromptSection(): void {
   assert(prompt.includes("`memory_recall`, `memory_list`, and `memory_get`"), "expected explicit retrieval guidance");
   assert(prompt.includes("`memory_store` and `memory_update`"), "expected explicit save guidance");
   assert(prompt.includes("`memory_forget`"), "expected explicit stale-memory guidance");
+  assert(prompt.includes("Store one durable fact per memory."), "expected one-fact-per-memory guidance");
+  assert(prompt.includes("Skip temporary requests, tool chatter"), "expected anti-noise write guardrails");
+  assert(prompt.includes("explicit short `title` plus a fuller `detail`"), "expected explicit title guidance");
+  assert(prompt.includes("user's current language"), "expected language guidance for new memories");
+  assert(prompt.includes("`memory_labels`"), "expected schema reuse guidance to mention memory_labels");
+  assert(prompt.includes("translated or near-duplicate variant"), "expected anti-duplication schema guidance");
 }
 
 function createFakePluginApi(options?: {

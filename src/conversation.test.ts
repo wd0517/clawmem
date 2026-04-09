@@ -1,6 +1,6 @@
 // Tests for conversation title derivation logic.
-import { ConversationMirror, deriveInitialTitle } from "./conversation.js";
-import type { NormalizedMessage, SessionMirrorState } from "./types.js";
+import { ConversationMirror, buildFinalizeArtifactsPrompt, deriveInitialTitle } from "./conversation.js";
+import type { MemorySchema, NormalizedMessage, SessionMirrorState } from "./types.js";
 
 function msg(role: string, text: string): NormalizedMessage {
   return { role, text };
@@ -75,6 +75,27 @@ async function testLoadSnapshotPrefersFallbackMessages(): Promise<void> {
   assert(snapshot.messages[0]?.text === "Use the in-request transcript.", "expected loadSnapshot to prefer in-request messages over transcript files");
 }
 
+function testBuildFinalizeArtifactsPromptIncludesSchemaReuseRules(): void {
+  const schema: MemorySchema = {
+    kinds: ["core-fact", "convention"],
+    topics: ["redis", "rate-limits"],
+  };
+  const prompt = buildFinalizeArtifactsPrompt({
+    sessionId: "finalize-session",
+    messages: [
+      msg("user", "请记住我们现在统一用 Redis 做限流。"),
+      msg("assistant", "好的，我会按这个约定处理。"),
+    ],
+  }, schema);
+
+  assert(prompt.includes("Candidate titles and details must be in the same language as the majority of the conversation content."), "expected language guidance for candidate text");
+  assert(prompt.includes("Prefer a concise explicit title for each candidate"), "expected explicit title guidance for candidates");
+  assert(prompt.includes("Reuse existing schema labels when one already fits."), "expected schema reuse guidance");
+  assert(prompt.includes("Only create a new label when none of the current labels matches"), "expected controlled schema creation guidance");
+  assert(prompt.includes("- kind:core-fact"), "expected kinds to be embedded in finalize prompt");
+  assert(prompt.includes("- topic:redis"), "expected topics to be embedded in finalize prompt");
+}
+
 async function main(): Promise<void> {
   for (const t of tests) {
     const got = deriveInitialTitle(t.messages, t.sessionId);
@@ -89,8 +110,10 @@ async function main(): Promise<void> {
   }
   await testLoadSnapshotPrefersFallbackMessages();
   console.log("PASS: loadSnapshot prefers fallback messages");
+  testBuildFinalizeArtifactsPromptIncludesSchemaReuseRules();
+  console.log("PASS: buildFinalizeArtifactsPrompt includes schema reuse rules");
 
-  console.log(`\n${passed + 1} passed, ${failed} failed`);
+  console.log(`\n${passed + 2} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
 }
 
