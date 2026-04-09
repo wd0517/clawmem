@@ -1,9 +1,13 @@
 // Tests for conversation title derivation logic.
-import { deriveInitialTitle } from "./conversation.js";
-import type { NormalizedMessage } from "./types.js";
+import { ConversationMirror, deriveInitialTitle } from "./conversation.js";
+import type { NormalizedMessage, SessionMirrorState } from "./types.js";
 
 function msg(role: string, text: string): NormalizedMessage {
   return { role, text };
+}
+
+function assert(condition: unknown, message: string): void {
+  if (!condition) throw new Error(message);
 }
 
 const tests: Array<{ name: string; messages: NormalizedMessage[]; sessionId: string; expected: string }> = [
@@ -54,17 +58,40 @@ const tests: Array<{ name: string; messages: NormalizedMessage[]; sessionId: str
 let passed = 0;
 let failed = 0;
 
-for (const t of tests) {
-  const got = deriveInitialTitle(t.messages, t.sessionId);
-  const ok = got === t.expected;
-  if (!ok) {
-    console.error(`FAIL: ${t.name}\n  got:      ${JSON.stringify(got)}\n  expected: ${JSON.stringify(t.expected)}`);
-    failed++;
-  } else {
-    console.log(`PASS: ${t.name}`);
-    passed++;
-  }
+async function testLoadSnapshotPrefersFallbackMessages(): Promise<void> {
+  const mirror = new ConversationMirror(
+    {} as never,
+    { logger: { warn() {}, info() {} } } as never,
+    {} as never,
+  );
+  const session: SessionMirrorState = {
+    sessionId: "sync-session",
+    sessionFile: "/tmp/does-not-need-to-exist.jsonl",
+    lastMirroredCount: 0,
+    turnCount: 0,
+  };
+  const snapshot = await mirror.loadSnapshot(session, [{ role: "user", text: "Use the in-request transcript." }]);
+  assert(snapshot.messages.length === 1, "expected loadSnapshot to return fallback messages");
+  assert(snapshot.messages[0]?.text === "Use the in-request transcript.", "expected loadSnapshot to prefer in-request messages over transcript files");
 }
 
-console.log(`\n${passed} passed, ${failed} failed`);
-if (failed > 0) process.exit(1);
+async function main(): Promise<void> {
+  for (const t of tests) {
+    const got = deriveInitialTitle(t.messages, t.sessionId);
+    const ok = got === t.expected;
+    if (!ok) {
+      console.error(`FAIL: ${t.name}\n  got:      ${JSON.stringify(got)}\n  expected: ${JSON.stringify(t.expected)}`);
+      failed++;
+    } else {
+      console.log(`PASS: ${t.name}`);
+      passed++;
+    }
+  }
+  await testLoadSnapshotPrefersFallbackMessages();
+  console.log("PASS: loadSnapshot prefers fallback messages");
+
+  console.log(`\n${passed + 1} passed, ${failed} failed`);
+  if (failed > 0) process.exit(1);
+}
+
+await main();

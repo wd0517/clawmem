@@ -36,13 +36,10 @@ async function testMigratesLegacyV2State(): Promise<void> {
   }, async (filePath) => {
     const state = await loadState(filePath);
     const session = state.sessions["main:s-1"];
-    assert(state.version === 3, "expected state version 3 after migration");
+    assert(state.version === 4, "expected state version 4 after migration");
     assert(Boolean(session), "expected migrated session to exist");
-    assert(session?.derived?.digest.cursor === 0, "expected legacy sessions to rebuild digest from cursor 0");
-    assert(session?.derived?.digest.status === "pending", "expected digest to become pending after migration");
-    assert(session?.derived?.summary.status === "pending", "expected finalized legacy sessions to keep summary pending");
-    assert(session?.derived?.memory.appliedCursor === 4, "expected legacy memory sync cursor to migrate into appliedCursor");
-    assert(session?.lastMemorySyncCount === 4, "expected compatibility field to mirror appliedCursor");
+    assert(session?.derived?.summary.status === "error", "expected finalized legacy sessions without a final summary to surface as needing manual attention");
+    assert(session?.derived?.memory.capturedCursor === 4, "expected legacy memory sync cursor to migrate into capturedCursor");
   });
 }
 
@@ -56,17 +53,12 @@ async function testNormalizesRunningTaskStates(): Promise<void> {
         lastMirroredCount: 3,
         turnCount: 3,
         derived: {
-          digest: { cursor: 1, status: "running", attempt: 2, text: "digest" },
           summary: { basedOnCursor: 0, status: "running" },
           memory: {
             extractCursor: 1,
             appliedCursor: 0,
             extractStatus: "running",
             reconcileStatus: "running",
-            attempt: 1,
-            pendingCandidates: [
-              { candidateId: "abc", detail: "Remember Redis is atomic with Lua." },
-            ],
           },
         },
       },
@@ -74,15 +66,54 @@ async function testNormalizesRunningTaskStates(): Promise<void> {
   }, async (filePath) => {
     const state = await loadState(filePath);
     const session = state.sessions["main:s-2"];
-    assert(session?.derived?.digest.status === "pending", "expected running digest tasks to normalize to pending on load");
-    assert(session?.derived?.summary.status === "pending", "expected running summary tasks to normalize to pending on load");
-    assert(session?.derived?.memory.extractStatus === "pending", "expected running memory extract tasks to normalize to pending");
-    assert(session?.derived?.memory.reconcileStatus === "pending", "expected running memory reconcile tasks to normalize to pending");
-    assert(session?.derived?.memory.pendingCandidates.length === 1, "expected pending candidates to survive state reload");
+    assert(session?.derived?.summary.status === "idle", "expected running summary tasks to normalize to idle on load");
+    assert(session?.derived?.memory.status === "idle", "expected running memory tasks to normalize to idle on load");
+    assert(session?.derived?.memory.capturedCursor === 0, "expected captured cursor to preserve the applied progress");
+  });
+}
+
+async function testPreservesCachedFinalArtifacts(): Promise<void> {
+  await withTempStateFile({
+    version: 4,
+    sessions: {
+      "main:s-3": {
+        sessionId: "s-3",
+        agentId: "main",
+        lastMirroredCount: 5,
+        turnCount: 5,
+        derived: {
+          summary: {
+            basedOnCursor: 5,
+            status: "idle",
+            text: "Recovered summary",
+            title: "Recovered title",
+          },
+          memory: {
+            capturedCursor: 0,
+            status: "error",
+            candidates: [
+              {
+                candidateId: "cand-1",
+                detail: "Store this durable fact.",
+                kind: "lesson",
+                topics: ["redis"],
+              },
+            ],
+          },
+        },
+      },
+    },
+  }, async (filePath) => {
+    const state = await loadState(filePath);
+    const session = state.sessions["main:s-3"];
+    assert(session?.derived?.summary.title === "Recovered title", "expected cached finalize title to survive state load");
+    assert(session?.derived?.memory.candidates?.length === 1, "expected cached memory candidates to survive state load");
+    assert(session?.derived?.memory.candidates?.[0]?.detail === "Store this durable fact.", "expected cached candidate detail to survive state load");
   });
 }
 
 await testMigratesLegacyV2State();
 await testNormalizesRunningTaskStates();
+await testPreservesCachedFinalArtifacts();
 
 console.log("state tests passed");

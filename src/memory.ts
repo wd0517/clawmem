@@ -1,18 +1,12 @@
-// Memory CRUD, sha256 dedup, and AI-driven memory extraction.
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
+// Memory CRUD, recall search helpers, and candidate parsing.
 import { LABEL_MEMORY_STALE, MEMORY_TITLE_PREFIX, extractLabelNames, labelVal } from "./config.js";
 import type { GitHubIssueClient } from "./github-client.js";
-import { normalizeMessages } from "./transcript.js";
-import type { ClawMemPluginConfig, MemoryCandidate, MemoryDraft, MemoryListOptions, MemorySchema, ParsedMemoryIssue, SessionMirrorState, TranscriptSnapshot } from "./types.js";
-import { fmtTranscriptFrom, localDate, sha256, sliceTranscriptDelta, subKey } from "./utils.js";
+import type { MemoryCandidate, MemoryDraft, MemoryListOptions, MemorySchema, ParsedMemoryIssue } from "./types.js";
+import { localDate, sha256 } from "./utils.js";
 import { parseFlatYaml, stringifyFlatYaml } from "./yaml.js";
 import { sanitizeRecallQueryInput } from "./recall-sanitize.js";
 
-type MemoryDecision = { save: MemoryDraft[]; stale: string[] };
-type SearchIndex = { title: string; detail: string; kind?: string; topics: string[] };
-
 const MAX_BACKEND_QUERY_CHARS = 1500;
-const MEMORY_RECONCILE_RECALL_LIMIT = 5;
 
 const RECALL_INJECTED_BLOCKS = [
   /<clawmem-context>[\s\S]*?<\/clawmem-context>/gi,
@@ -23,7 +17,7 @@ const RECALL_INJECTED_BLOCKS = [
 const URL_RE = /https?:\/\/\S+/gi;
 
 export class MemoryStore {
-  constructor(private readonly client: GitHubIssueClient, private readonly api: OpenClawPluginApi, private readonly config: ClawMemPluginConfig) {}
+  constructor(private readonly client: GitHubIssueClient) {}
 
   async search(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const q = normalizeSearch(query);
@@ -157,128 +151,6 @@ export class MemoryStore {
     return { ...mem, status: "stale" };
   }
 
-  async applyReconciledDecision(decision: { save: MemoryDraft[]; stale: string[] }): Promise<{ savedCount: number; staledCount: number }> {
-    return this.applyDecision(decision);
-  }
-
-  async extractCandidates(
-    session: SessionMirrorState,
-    snapshot: TranscriptSnapshot,
-    fromCursor: number,
-    digestText?: string,
-  ): Promise<MemoryCandidate[]> {
-    const { anchorStart, deltaStart, anchorMessages, deltaMessages } = sliceTranscriptDelta(snapshot.messages, fromCursor, 2);
-    if (deltaMessages.length === 0) return [];
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = subKey(session, "memory-extract");
-    const message = [
-      "Extract atomic durable memory candidates from the conversation delta below.",
-      'Return JSON only in the form {"candidates":[{"title":"...","detail":"...","kind":"...","topics":["..."],"evidence":"..."}]}.',
-      "Only extract durable facts, preferences, decisions, constraints, workflows, and ongoing context worth remembering later.",
-      "Use the anchor messages and rolling digest only for context resolution. The new messages are the only source that may add new candidates now.",
-      "Each candidate must represent one durable fact. Split independent facts into separate candidates.",
-      "Do not extract temporary requests, tool chatter, startup boilerplate, or summaries about internal helper sessions.",
-      "Kind and topics are optional. Keep them short, reusable, and low-cardinality.",
-      "Evidence is optional. If present, keep it short and quote-free.",
-      "Prefer an empty candidates array when nothing durable was added.",
-      "",
-      "<rolling-digest>",
-      digestText?.trim() || "None.",
-      "</rolling-digest>",
-      "",
-      "<anchor-messages>",
-      anchorMessages.length > 0 ? fmtTranscriptFrom(anchorMessages, anchorStart) : "None.",
-      "</anchor-messages>",
-      "",
-      "<new-messages>",
-      fmtTranscriptFrom(deltaMessages, deltaStart),
-      "</new-messages>",
-    ].join("\n");
-    try {
-      const run = await subagent.run({
-        sessionKey,
-        message,
-        deliver: false,
-        lane: "clawmem-memory-extract",
-        idempotencyKey: sha256(`${session.sessionId}:${fromCursor}:${snapshot.messages.length}:memory-extract-v1`),
-        extraSystemPrompt: "You extract atomic durable memory candidates for ClawMem. Output JSON only with an array field candidates.",
-      });
-      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.memoryExtractWaitTimeoutMs });
-      if (wait.status === "timeout") throw new Error("memory extraction subagent timed out");
-      if (wait.status === "error") throw new Error(wait.error || "memory extraction subagent failed");
-      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
-      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!text) throw new Error("memory extraction subagent returned no assistant text");
-      return parseCandidates(text);
-    } finally {
-      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
-    }
-  }
-
-  async reconcileCandidates(session: SessionMirrorState, candidates: MemoryCandidate[]): Promise<MemoryDecision> {
-    const pending = mergeMemoryCandidates([], candidates);
-    if (pending.length === 0) return { save: [], stale: [] };
-    const existingByCandidate = await Promise.all(pending.map(async (candidate) => ({
-      candidate,
-      matches: await this.searchViaBackend(candidate.detail, MEMORY_RECONCILE_RECALL_LIMIT),
-    })));
-    const candidateBlock = pending.map((candidate) => [
-      `[${candidate.candidateId}] ${candidate.title ? `${candidate.title} | ` : ""}${candidate.detail}`,
-      ...(candidate.kind ? [`kind=${candidate.kind}`] : []),
-      ...(candidate.topics && candidate.topics.length > 0 ? [`topics=${candidate.topics.join(", ")}`] : []),
-      ...(candidate.evidence ? [`evidence=${candidate.evidence}`] : []),
-    ].join("\n")).join("\n\n");
-    const existingBlock = existingByCandidate.map(({ candidate, matches }) => {
-      const lines = matches.length > 0
-        ? matches.map((memory) => {
-            const schema = [memory.kind ? `kind=${memory.kind}` : "", ...(memory.topics ?? []).map((topic) => `topic=${topic}`)]
-              .filter(Boolean)
-              .join(", ");
-            return `- [${memory.memoryId}] ${schema ? `${schema} | ` : ""}${memory.detail}`;
-          })
-        : ["- None."];
-      return [`Candidate [${candidate.candidateId}] matches:`, ...lines].join("\n");
-    }).join("\n\n");
-    const subagent = this.api.runtime.subagent;
-    const sessionKey = subKey(session, "memory-reconcile");
-    const message = [
-      "Reconcile extracted durable memory candidates against existing memories.",
-      'Return JSON only in the form {"save":[{"title":"...","detail":"...","kind":"...","topics":["..."]}],"stale":["memory-id"]}.',
-      "Use save only for candidates that should become durable memories after comparing them with existing memories.",
-      "If a candidate is already fully covered by an existing memory, omit it from save.",
-      "Use stale only when a candidate clearly supersedes or invalidates an existing memory.",
-      "Do not stale memories just because they overlap or are related. Prefer keeping both when they can coexist.",
-      "Keep each save item atomic and durable.",
-      "",
-      "<candidates>",
-      candidateBlock,
-      "</candidates>",
-      "",
-      "<matching-existing-memories>",
-      existingBlock,
-      "</matching-existing-memories>",
-    ].join("\n");
-    try {
-      const run = await subagent.run({
-        sessionKey,
-        message,
-        deliver: false,
-        lane: "clawmem-memory-reconcile",
-        idempotencyKey: sha256(`${session.sessionId}:${pending.map((candidate) => candidate.candidateId).join(",")}:memory-reconcile-v1`),
-        extraSystemPrompt: "You reconcile extracted durable memory candidates for ClawMem. Output JSON only with save memory drafts and stale memory ids.",
-      });
-      const wait = await subagent.waitForRun({ runId: run.runId, timeoutMs: this.config.memoryReconcileWaitTimeoutMs });
-      if (wait.status === "timeout") throw new Error("memory reconcile subagent timed out");
-      if (wait.status === "error") throw new Error(wait.error || "memory reconcile subagent failed");
-      const msgs = normalizeMessages((await subagent.getSessionMessages({ sessionKey, limit: 50 })).messages);
-      const text = [...msgs].reverse().find((e) => e.role === "assistant" && e.text.trim())?.text;
-      if (!text) throw new Error("memory reconcile subagent returned no assistant text");
-      return parseDecision(text);
-    } finally {
-      subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
-    }
-  }
-
   private async searchViaBackend(query: string, limit: number): Promise<ParsedMemoryIssue[]> {
     const repo = this.client.repo();
     if (!repo) throw new Error("ClawMem memory recall requires a configured repo.");
@@ -353,59 +225,6 @@ export class MemoryStore {
     };
   }
 
-  private async applyDecision(decision: MemoryDecision): Promise<{ savedCount: number; staledCount: number }> {
-    const activeByHash = new Map<string, ParsedMemoryIssue | null>();
-    const activeById = new Map<string, ParsedMemoryIssue | null>();
-    let savedCount = 0;
-    for (const raw of decision.save) {
-      const draft = normalizeDraft(raw);
-      const detail = norm(draft.detail);
-      if (!detail) continue;
-      const hash = sha256(detail);
-      let existing = activeByHash.get(hash);
-      if (existing === undefined) {
-        existing = await this.findActiveByHash(hash);
-        activeByHash.set(hash, existing);
-      }
-      if (existing) {
-        const merged = await this.mergeSchema(existing, draft);
-        activeByHash.set(hash, merged);
-        continue;
-      }
-      const labels = memLabels(draft.kind, draft.topics);
-      const date = localDate();
-      const title = renderMemoryTitle(draft);
-      const body = renderMemoryBody(detail, hash, date);
-      await this.client.ensureLabels(labels);
-      const issue = await this.client.createIssue({ title, body, labels });
-      activeByHash.set(hash, {
-        issueNumber: issue.number,
-        title,
-        memoryId: String(issue.number),
-        memoryHash: hash,
-        date,
-        detail,
-        ...(draft.kind ? { kind: draft.kind } : {}),
-        ...(draft.topics && draft.topics.length > 0 ? { topics: draft.topics } : {}),
-        status: "active",
-      });
-      savedCount++;
-    }
-    let staledCount = 0;
-    for (const id of [...new Set(decision.stale.map((s) => s.trim()).filter(Boolean))]) {
-      let mem = activeById.get(id);
-      if (mem === undefined) {
-        mem = await this.findActiveByRef(id);
-        activeById.set(id, mem);
-      }
-      if (!mem) continue;
-      await this.client.syncManagedLabels(mem.issueNumber, memLabels(mem.kind, mem.topics));
-      await this.client.updateIssue(mem.issueNumber, { state: "closed" });
-      staledCount++;
-    }
-    return { savedCount, staledCount };
-  }
-
   private async mergeSchema(memory: ParsedMemoryIssue, draft: MemoryDraft): Promise<ParsedMemoryIssue> {
     const normalized = normalizeDraft(draft);
     const nextKind = normalized.kind ?? memory.kind;
@@ -468,44 +287,6 @@ function normalizeSearch(v: string): string {
   return v.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-function buildSearchIndex(memory: ParsedMemoryIssue): SearchIndex {
-  return {
-    title: normalizeSearch(memory.title),
-    detail: normalizeSearch(memory.detail),
-    ...(memory.kind ? { kind: normalizeSearch(memory.kind) } : {}),
-    topics: (memory.topics ?? []).map(normalizeSearch).filter(Boolean),
-  };
-}
-
-function searchTokens(v: string): string[] {
-  const seen = new Set<string>();
-  for (const token of v.split(/[^0-9\p{L}]+/u)) {
-    if (token.length > 1) seen.add(token);
-  }
-  for (const chunk of v.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]{2,}/gu) ?? []) {
-    for (let i = 0; i < chunk.length; i++) {
-      seen.add(chunk[i]!);
-      if (i + 1 < chunk.length) seen.add(chunk.slice(i, i + 2));
-    }
-  }
-  return [...seen];
-}
-
-function charBigrams(v: string): Set<string> {
-  const compact = v.replace(/\s+/g, "");
-  if (compact.length < 2) return new Set(compact ? [compact] : []);
-  const out = new Set<string>();
-  for (let i = 0; i < compact.length - 1; i++) out.add(compact.slice(i, i + 2));
-  return out;
-}
-
-function overlapRatio(left: Set<string>, right: Set<string>): number {
-  if (left.size === 0 || right.size === 0) return 0;
-  let hits = 0;
-  for (const token of left) if (right.has(token)) hits++;
-  return hits / Math.max(left.size, right.size);
-}
-
 function buildMemorySearchQuery(query: string, repo: string): string {
   const parts = [buildRecallSearchText(query), `repo:${repo}`, "is:issue", "state:open", 'label:"type:memory"'].filter(Boolean);
   return parts.join(" ");
@@ -541,42 +322,6 @@ function truncateRecallQuery(text: string, maxLen: number): string {
   const compact = text.replace(/\s+/g, " ").trim();
   if (!compact) return "";
   return compact.length <= maxLen ? compact : compact.slice(0, maxLen).trimEnd();
-}
-
-export function scoreMemoryMatch(memory: ParsedMemoryIssue, rawQuery: string): number {
-  const query = normalizeSearch(rawQuery);
-  if (!query) return 0;
-  const idx = buildSearchIndex(memory);
-  const tokens = searchTokens(query);
-  const queryTokenSet = new Set(tokens);
-  const titleTokenSet = new Set(searchTokens(idx.title));
-  const detailTokenSet = new Set(searchTokens(idx.detail));
-  const kindTokenSet = new Set(searchTokens(idx.kind ?? ""));
-  const topicTokenSet = new Set(idx.topics.flatMap(searchTokens));
-  let score = 0;
-
-  if (idx.title.includes(query)) score += 18;
-  if (idx.detail.includes(query)) score += 12;
-  if (idx.kind?.includes(query)) score += 8;
-  for (const topic of idx.topics) if (topic.includes(query)) score += 10;
-
-  for (const token of tokens) {
-    if (idx.title.includes(token)) score += 4;
-    if (idx.detail.includes(token)) score += 2;
-    if (idx.kind?.includes(token)) score += 3;
-    if (idx.topics.some((topic) => topic.includes(token))) score += 3;
-  }
-
-  score += overlapRatio(queryTokenSet, titleTokenSet) * 10;
-  score += overlapRatio(queryTokenSet, detailTokenSet) * 6;
-  score += overlapRatio(queryTokenSet, kindTokenSet) * 6;
-  score += overlapRatio(queryTokenSet, topicTokenSet) * 8;
-
-  const queryBigrams = charBigrams(query);
-  score += overlapRatio(queryBigrams, charBigrams(idx.title)) * 6;
-  score += overlapRatio(queryBigrams, charBigrams(idx.detail)) * 3;
-
-  return score;
 }
 
 function normalizeDraft(input: MemoryDraft): MemoryDraft {
@@ -617,27 +362,6 @@ function uniqueNormalized(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort();
 }
 
-function parseDecision(raw: string): MemoryDecision {
-  const tryParse = (s: string): MemoryDecision | null => {
-    try {
-      const p = JSON.parse(s) as Record<string, unknown>;
-      return {
-        save: Array.isArray(p.save) ? p.save.map(parseSaveItem).filter((v): v is MemoryDraft => Boolean(v)) : [],
-        stale: Array.isArray(p.stale) ? p.stale.filter((v): v is string => typeof v === "string") : [],
-      };
-    } catch {
-      return null;
-    }
-  };
-  const t = raw.trim();
-  return tryParse(t) ?? (() => {
-    const f = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(t);
-    const nested = f?.[1] ? tryParse(f[1].trim()) : null;
-    if (nested) return nested;
-    throw new Error("memory decision subagent returned invalid JSON");
-  })();
-}
-
 export function parseCandidates(raw: string): MemoryCandidate[] {
   const tryParse = (s: string): MemoryCandidate[] | null => {
     try {
@@ -658,26 +382,7 @@ export function parseCandidates(raw: string): MemoryCandidate[] {
     const nested = tryParse(fenced[1].trim());
     if (nested) return nested;
   }
-  throw new Error("memory extraction subagent returned invalid JSON");
-}
-
-function parseSaveItem(value: unknown): MemoryDraft | null {
-  if (typeof value === "string") {
-    const detail = norm(value);
-    return detail ? { detail } : null;
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const title = typeof record.title === "string" ? record.title : undefined;
-  const detail = typeof record.detail === "string" ? norm(record.detail) : "";
-  if (!detail) return null;
-  const kind = typeof record.kind === "string" ? record.kind : undefined;
-  const topics = Array.isArray(record.topics) ? record.topics.filter((v): v is string => typeof v === "string") : undefined;
-  try {
-    return normalizeDraft({ ...(title ? { title } : {}), detail, ...(kind ? { kind } : {}), ...(topics ? { topics } : {}) });
-  } catch {
-    return null;
-  }
+  throw new Error("finalize memory candidates returned invalid JSON");
 }
 
 function parseCandidateItem(value: unknown): MemoryCandidate | null {
