@@ -26,8 +26,10 @@ The ClawMem plugin automatically handles:
 - Per-agent provisioning of credentials plus a default memory repo
 - Session mirroring into `type:conversation` issues
 - Best-effort automatic memory recall before each turn, scoped to the current agent's `defaultRepo`
+- When `teamConfigRepo` plus `teamConfigIssueNumber` are configured for the current agent, best-effort automatic team-collaboration state injection before each turn from that config issue
 - A best-effort final issue summary/title plus durable memory capture when the session resets or ends normally
 - Mid-session memory tools: `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget`
+- Shared-workflow tools for collaboration routing, default repo retargeting, team-config binding, generic issues, and issue comments
 
 ## Mandatory turn loop
 
@@ -36,6 +38,7 @@ On every user turn, run this loop:
 1. Before answering, ask: could ClawMem improve this answer?
    - Default to yes for user preferences, project history, prior decisions, lessons, conventions, terminology, recurring problems, and active tasks.
    - Auto-recall may already inject useful context from the current agent's `defaultRepo`, but it is only a hint. Do not treat missing auto-recall context as proof that no relevant memory exists.
+   - Team-collaboration state may also be auto-injected from a configured config issue. Treat that as live routing state for the current turn, not as historical memory.
    - If the injected context already answers the question, you do not need to immediately call `memory_recall` again.
    - Auto-recall does not currently fan out across every accessible repo. Shared organization memory, team memory, and project memory outside the current `defaultRepo` will not be recalled automatically.
    - Before explicit memory work, choose the right repo. If unclear, inspect `memory_repos` and fall back to the agent's `defaultRepo`. If the likely memory lives outside the default repo, use explicit repo selection instead of relying on auto-recall.
@@ -80,12 +83,17 @@ Bias toward saving, and use explicit retrieval whenever auto-recall is absent, w
 - When updating an existing memory, keep that node in its current language unless the user explicitly asks to rewrite it.
 - Keep schema labels and machine-oriented fields stable. Do not translate `type:*`, `kind:*`, `topic:*`, or other structural identifiers.
 - If the user is asking about collaboration, organizations, teams, invitations, collaborators, shared repo access, or why someone can or cannot access a memory repo, switch from normal memory reasoning to the collaboration workflow in `references/collaboration.md`.
+- If the user wants to bootstrap a multi-agent collaboration scaffold from scratch, read `references/collaboration_config.md` before taking action.
+- If the user wants to operate an already-bootstrapped team task workflow, or the current agent has a bound team config issue, read `references/team_collaboration.md`.
 
 ## Read the right reference
 
 - For user-facing runtime messaging, memory console links, and post-save confirmations, read [references/communication.md](references/communication.md).
 - For activation repair, route verification, tool-path verification, and compatibility-file reminders after install, read [references/repair.md](references/repair.md).
 - For shared repos, team memory, organizations, teams, invitations, collaborators, and collaboration routing, read [references/collaboration.md](references/collaboration.md).
+- For step-by-step team-collaboration scaffold setup, config issues, and agent binding, read [references/collaboration_config.md](references/collaboration_config.md).
+- For org-backed task queues, agent handoff, summary repos, generic issue routing, and comment-based task results, read [references/task-queue.md](references/task-queue.md).
+- For runtime team behavior once a scaffold already exists, read [references/team_collaboration.md](references/team_collaboration.md).
 - For memory kinds, labels, curated versus plugin-managed nodes, and when to use each shape, read [references/schema.md](references/schema.md).
 - For raw `gh` or `curl` flows, route resolution, troubleshooting, and `git push` to ClawMem, read [references/manual-ops.md](references/manual-ops.md).
 

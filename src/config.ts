@@ -12,13 +12,14 @@ export const LABEL_CLOSED = "status:closed";
 export const LABEL_MEMORY_ACTIVE = "memory-status:active";
 export const LABEL_MEMORY_STALE = "memory-status:stale";
 
-const MANAGED_PREFIXES = ["type:", "kind:", "session:", "date:", "topic:", "agent:"];
+const MANAGED_PREFIXES = ["type:", "kind:", "session:", "date:", "topic:", "agent:", "queue:", "task-status:", "assignee:"];
 const MANAGED_EXACT = new Set([LABEL_ACTIVE, LABEL_CLOSED, LABEL_MEMORY_ACTIVE, LABEL_MEMORY_STALE]);
 
 export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig {
   const raw = (api.pluginConfig ?? {}) as Record<string, unknown>;
   const str = (v: unknown) => typeof v === "string" && v.trim() ? v.trim() : undefined;
   const num = (v: unknown, d: number) => typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : d;
+  const positiveInt = (v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
   const float = (v: unknown, d: number) => typeof v === "number" && Number.isFinite(v) ? v : d;
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
   const baseUrl = (str(raw.baseUrl) ?? "https://git.clawmem.ai").replace(/\/+$/, "");
@@ -36,6 +37,8 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
       repo: str(agent.repo),
       token: str(agent.token),
       authScheme: agent.authScheme === "bearer" ? "bearer" : agent.authScheme === "token" ? "token" : undefined,
+      teamConfigRepo: normalizeRepoName(str(agent.teamConfigRepo)),
+      teamConfigIssueNumber: positiveInt(agent.teamConfigIssueNumber),
     };
   }
   return {
@@ -44,6 +47,8 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
     repo: normalizeRepoName(str(raw.repo)),
     token: str(raw.token),
     authScheme: raw.authScheme === "bearer" ? "bearer" : "token",
+    teamConfigRepo: normalizeRepoName(str(raw.teamConfigRepo)),
+    teamConfigIssueNumber: positiveInt(raw.teamConfigIssueNumber),
     agents,
     memoryRecallLimit: clamp(num(raw.memoryRecallLimit, 5), 1, 20),
     memoryAutoRecallLimit: clamp(num(raw.memoryAutoRecallLimit, 3), 1, 20),
@@ -65,6 +70,8 @@ export function resolveAgentRoute(config: ClawMemPluginConfig, agentId?: string,
     ...(repo ? { repo } : {}),
     token: agent.token?.trim() || config.token?.trim() || undefined,
     authScheme: agent.authScheme === "bearer" ? "bearer" : agent.authScheme === "token" ? "token" : config.authScheme,
+    ...(normalizeRepoName(agent.teamConfigRepo) ?? config.teamConfigRepo ? { teamConfigRepo: normalizeRepoName(agent.teamConfigRepo) ?? config.teamConfigRepo } : {}),
+    ...(agent.teamConfigIssueNumber ?? config.teamConfigIssueNumber ? { teamConfigIssueNumber: agent.teamConfigIssueNumber ?? config.teamConfigIssueNumber } : {}),
   };
 }
 
@@ -81,17 +88,20 @@ export function resolveLabelColor(label: string): string {
   if (label.startsWith("memory-status:")) return label.endsWith(":stale") ? "d93f0b" : "0e8a16";
   if (label.startsWith("type:")) return label === "type:memory" ? "5319e7" : "1d76db";
   if (label.startsWith("kind:")) return "5319e7";
+  if (label.startsWith("queue:")) return "0e8a16";
+  if (label.startsWith("task-status:")) return label.endsWith(":done") ? "0e8a16" : "d93f0b";
   if (label.startsWith("date:")) return "c5def5";
   if (label.startsWith("topic:")) return "fbca04";
   if (label.startsWith("session:")) return "bfdadc";
   if (label.startsWith("agent:")) return "1d76db";
+  if (label.startsWith("assignee:")) return "1d76db";
   return "0e8a16";
 }
 
 export function labelDescription(label: string): string {
   for (const [pfx, d] of [["type:", "Issue type"], ["kind:", "Memory kind"], ["memory-status:", "Memory lifecycle status"],
     ["status:", "Conversation lifecycle status"], ["session:", "Session association"],
-    ["date:", "Date"], ["topic:", "Topic"], ["agent:", "Agent"]] as const)
+    ["date:", "Date"], ["topic:", "Topic"], ["agent:", "Agent"], ["queue:", "Queue"], ["task-status:", "Task status"], ["assignee:", "Task assignee"]] as const)
     if (label.startsWith(pfx)) return `${d} label managed by clawmem.`;
   return "Label managed by clawmem.";
 }

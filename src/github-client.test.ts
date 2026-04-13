@@ -94,8 +94,80 @@ async function testRepoTransferRoute(): Promise<void> {
   }
 }
 
+async function testOrgRepoAndIssueRoutes(): Promise<void> {
+  const { client, calls, restore } = createClientRecorder();
+  try {
+    await client.createOrgRepo("acme", {
+      name: "team-workspace",
+      description: "Shared task queue",
+      private: true,
+      autoInit: true,
+      hasIssues: true,
+      hasWiki: false,
+    });
+    await client.createIssue({
+      title: "Review gh-server issues",
+      body: "List issues that can be closed.",
+      labels: ["queue:task", "task-status:handling", "assignee:agent-a"],
+      assignees: ["agent-a"],
+      state: "open",
+    });
+    await client.listIssues({
+      state: "open",
+      labels: ["queue:task", "task-status:handling"],
+      assignee: "agent-a",
+      sort: "updated",
+      direction: "desc",
+      since: "2026-04-13T00:00:00Z",
+      perPage: 5,
+    });
+    await client.getIssue(42);
+    await client.updateIssue(42, {
+      state: "closed",
+      stateReason: "completed",
+      labels: ["queue:task", "task-status:done", "assignee:agent-a"],
+      assignees: [],
+    });
+    await client.createComment(42, "Done. See the findings below.");
+    await client.listComments(42, {
+      perPage: 1,
+      sort: "updated",
+      direction: "desc",
+      since: "2026-04-13T00:00:00Z",
+      threaded: true,
+    });
+
+    assert(calls[0]?.url === "https://git.clawmem.ai/api/v3/orgs/acme/repos", "expected org repo create route");
+    assert(calls[0]?.init.method === "POST", "expected POST for org repo create");
+    assert(String(calls[0]?.init.body).includes("\"name\":\"team-workspace\""), "expected org repo create payload to include repo name");
+    assert(String(calls[0]?.init.body).includes("\"has_wiki\":false"), "expected org repo create payload to include has_wiki");
+
+    assert(calls[1]?.url === "https://git.clawmem.ai/api/v3/repos/alice/memory/issues", "expected issue create route");
+    assert(calls[1]?.init.method === "POST", "expected POST for issue create");
+    assert(String(calls[1]?.init.body).includes("\"labels\":[\"queue:task\",\"task-status:handling\",\"assignee:agent-a\"]"), "expected issue create payload to include labels");
+    assert(String(calls[1]?.init.body).includes("\"assignees\":[\"agent-a\"]"), "expected issue create payload to include assignees");
+
+    assert(
+      calls[2]?.url === "https://git.clawmem.ai/api/v3/repos/alice/memory/issues?state=open&page=1&per_page=5&labels=queue%3Atask%2Ctask-status%3Ahandling&assignee=agent-a&sort=updated&direction=desc&since=2026-04-13T00%3A00%3A00Z",
+      "expected issue list query params",
+    );
+    assert(calls[3]?.url === "https://git.clawmem.ai/api/v3/repos/alice/memory/issues/42", "expected issue get route");
+    assert(calls[4]?.url === "https://git.clawmem.ai/api/v3/repos/alice/memory/issues/42", "expected issue update route");
+    assert(calls[4]?.init.method === "PATCH", "expected PATCH for issue update");
+    assert(String(calls[4]?.init.body).includes("\"state_reason\":\"completed\""), "expected issue update payload to include state_reason");
+    assert(String(calls[4]?.init.body).includes("\"assignees\":[]"), "expected issue update payload to allow clearing assignees");
+
+    assert(calls[5]?.url === "https://git.clawmem.ai/api/v3/repos/alice/memory/issues/42/comments", "expected issue comment create route");
+    assert(calls[5]?.init.method === "POST", "expected POST for comment create");
+    assert(calls[6]?.url === "https://git.clawmem.ai/api/v3/repos/alice/memory/issues/42/comments?page=1&per_page=1&sort=updated&direction=desc&since=2026-04-13T00%3A00%3A00Z&threaded=true", "expected issue comments list query params");
+  } finally {
+    restore();
+  }
+}
+
 await testOrgGovernanceRoutes();
 await testTeamGovernanceRoutes();
 await testRepoTransferRoute();
+await testOrgRepoAndIssueRoutes();
 
 console.log("github client tests passed");

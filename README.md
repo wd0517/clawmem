@@ -5,8 +5,10 @@
 **What it does:**
 - Creates one `type:conversation` issue per session, mirrors the full transcript as comments.
 - On session start: searches active memories by relevance and injects them into context.
+- Before normal conversations, can also inject live team-collaboration state from a configured config issue.
 - On session reset/end: best-effort writes a final conversation summary/title and stores durable memory candidates as `type:memory` issues.
 - Lets agents inspect memory indexes and schema, fetch exact memories, update canonical facts in place, and write structured memories with `kind:*` and `topic:*` labels through plugin tools.
+- Adds collaboration, team-config binding, generic issue, and issue-comment tools so teams can run shared org repos and task queues through the same backend.
 
 ---
 
@@ -22,12 +24,16 @@ openclaw gateway restart
 
 After restart, confirm OpenClaw shows ClawMem as the active memory plugin. On first use, clawmem bootstraps each agent identity by calling `POST /api/v3/agents` on `git.clawmem.ai`, then writes the returned `token` plus `repo_full_name` back into your config under `plugins.entries.clawmem.config.agents.<agentId>` as that agent's `defaultRepo`. Automatic flows use that `defaultRepo`, while explicit memory tool calls may target other repos. When talking to an older backend that does not expose `POST /api/v3/agents`, the plugin falls back to the deprecated anonymous bootstrap path.
 
+If `teamConfigRepo` plus `teamConfigIssueNumber` are configured for an agent, ClawMem also fetches that config issue before each normal conversation and injects a compact runtime team-context block.
+
 The package now also ships a bundled `clawmem` skill for runtime memory behavior:
 - core recall and save loop
 - post-install repair and verification guidance
 - mental model, user-facing communication, and console-link guidance
 - schema and manual-ops references
 - collaboration routing for shared repos
+- team-collaboration bootstrap and runtime docs
+- shared task-queue workflow guidance for org-backed multi-agent teams
 
 The website `SKILL.md` should stay bootstrap-focused. Once the plugin is installed, rely on the bundled plugin skill for day-to-day memory behavior.
 
@@ -75,6 +81,7 @@ That bundled skill covers:
 - recall and save behavior
 - schema discipline and deliberate self-evolution
 - shared-memory and collaboration routing
+- team-collaboration scaffold setup plus runtime behavior
 - repair and verification guidance
 - raw `gh` / `curl` fallback flows
 
@@ -99,6 +106,8 @@ Minimal config (after auto-provisioning):
             main: {
               baseUrl: "https://git.clawmem.ai/api/v3",
               defaultRepo: "owner/main-memory",
+              teamConfigRepo: "owner/team-config",
+              teamConfigIssueNumber: 12,
               token: "<token>",
               authScheme: "token"
             }
@@ -127,6 +136,8 @@ Full config with all options:
             main: {
               baseUrl: "https://git.clawmem.ai/api/v3",
               defaultRepo: "owner/main-memory",
+              teamConfigRepo: "owner/team-config",
+              teamConfigIssueNumber: 12,
               token: "<token>",
               authScheme: "token"
             },
@@ -146,6 +157,8 @@ Full config with all options:
 }
 ```
 
+`teamConfigRepo` plus `teamConfigIssueNumber` are optional. When both are present for an agent, ClawMem reads that issue before every normal conversation and injects the parsed team-collaboration state as dynamic context. This does not change the agent's normal `defaultRepo`; it only helps the agent decide when to use a shared `summary` repo or another collaboration repo explicitly.
+
 ---
 
 ## Notes
@@ -159,7 +172,7 @@ Full config with all options:
 - Always-on ClawMem prompt guidance uses the dedicated memory prompt-registration API on OpenClaw `2026.3.22+`. On `2026.3.7` through `2026.3.21`, ClawMem falls back to `before_prompt_build` `prependSystemContext`. Older hosts still support auto-recall, tools, and conversation mirroring, but they cannot inject the static always-on guidance.
 - `memory_recall` uses the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`. When backend recall is unavailable, use `memory_list` or `memory_get` to inspect memories explicitly.
 - Automatic durable capture happens when the session resets or ends. If a fact must be available immediately for later turns, use `memory_store` or `memory_update` explicitly instead of waiting for finalization.
-- The plugin exposes `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
+- The plugin exposes memory tools, collaboration tools, a default-repo retarget tool, team-config binding tools, and generic issue/comment tools for mid-session use.
 - Route resolution is now: agent identity supplies credentials, `defaultRepo` is the fallback memory space, and explicit tool calls may override repo per operation.
 - `memory_store` accepts optional schema hints such as kind and topics; the plugin normalizes them into managed `kind:*` and `topic:*` labels.
 - Memory issues no longer use `session:*` labels. Session linkage remains a conversation concern, not part of the durable memory schema.
@@ -167,3 +180,5 @@ Full config with all options:
 - Conversation lifecycle is stored in native issue state (`open` while live, `closed` after finalize); memory lifecycle uses native issue state too (`open` active, `closed` stale).
 - Memory extraction now prefers one atomic fact per memory item instead of bundling whole sessions into a single node.
 - Memory issue bodies store the durable detail in a YAML `detail` field plus flat metadata such as `memory_hash` and logical `date`; this matches the current Console parser in `agent-git-service/web`.
+- Shared task queues use ordinary issues plus reserved labels such as `queue:task`, `task-status:handling`, `task-status:done`, and `assignee:<agent-name>`.
+- `team_collaboration_config_set` and `team_collaboration_config_clear` let each agent locally opt into or out of automatic team-state checks.
