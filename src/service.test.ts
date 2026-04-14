@@ -2,6 +2,7 @@ import {
   buildClawMemPromptSection,
   buildAutoRecallContext,
   buildTeamCollaborationContext,
+  buildTeamCollaborationIndexContext,
   createClawMemPlugin,
   extractPromptTextForRecall,
   parseTeamCollaborationConfigIssueBody,
@@ -86,6 +87,7 @@ function testParseAndBuildTeamCollaborationContext(): void {
     "```json",
     JSON.stringify({
       enabled: true,
+      teamId: "review-squad",
       teamName: "review-squad",
       summaryRepo: "acme/summary",
       configRepo: "acme/config",
@@ -102,8 +104,10 @@ function testParseAndBuildTeamCollaborationContext(): void {
   ].join("\n"), "agent-a");
 
   assert(parsed.enabled === true, "expected enabled team config to parse");
+  assert(parsed.teamId === "review-squad", "expected team id to parse");
   assert(parsed.teamName === "review-squad", "expected team name to parse");
   assert(parsed.summaryRepo === "acme/summary", "expected summary repo to parse");
+  assert(parsed.agent.listed === true, "expected the current agent to be marked as listed");
   assert(parsed.agent.role === "worker", "expected worker role to parse");
   assert(parsed.agent.assigneeLabel === "assignee:agent-a", "expected worker assignee label to default from the agent id");
 
@@ -113,9 +117,35 @@ function testParseAndBuildTeamCollaborationContext(): void {
     localDefaultRepo: "acme/agent-a-memory",
   });
   assert(context.includes("<clawmem-team-context>"), "expected a stable wrapper for injected team context");
+  assert(context.includes("Team ID: review-squad"), "expected team id to appear in team context");
   assert(context.includes("Summary repo: acme/summary"), "expected the summary repo to appear in team context");
   assert(context.includes("Worker queue labels: queue:task, task-status:handling, assignee:agent-a"), "expected queue routing guidance");
   assert(context.includes("Reply in concise bullet points."), "expected per-agent notes to survive into the rendered context");
+}
+
+function testBuildTeamCollaborationIndexContext(): void {
+  const parsed = parseTeamCollaborationConfigIssueBody(JSON.stringify({
+    enabled: true,
+    teamId: "review",
+    teamName: "Review Squad",
+    summaryRepo: "acme/review-summary",
+    configRepo: "acme/config",
+    agents: {
+      main: {
+        role: "worker",
+      },
+    },
+  }), "main");
+
+  const context = buildTeamCollaborationIndexContext([{
+    org: "acme",
+    configRepo: "acme/config",
+    issueNumber: 12,
+    config: parsed,
+  }]);
+  assert(context.includes("<clawmem-team-index>"), "expected a stable wrapper for discovered team bindings");
+  assert(context.includes("teamId=review"), "expected team id to appear in the team index");
+  assert(context.includes("summaryRepo=acme/review-summary"), "expected summary repo to appear in the team index");
 }
 
 function testBuildClawMemPromptSection(): void {
@@ -145,6 +175,7 @@ function testBuildClawMemPromptSection(): void {
   assert(prompt.includes("`memory_labels`"), "expected schema reuse guidance to mention memory_labels");
   assert(prompt.includes("translated or near-duplicate variant"), "expected anti-duplication schema guidance");
   assert(prompt.includes("<clawmem-team-context>"), "expected prompt guidance to mention the auto-injected team context block");
+  assert(prompt.includes("<clawmem-team-index>"), "expected prompt guidance to mention the auto-injected team index block");
 }
 
 function createFakePluginApi(options?: {
@@ -362,6 +393,182 @@ async function testBeforePromptBuildInjectsTeamCollaborationContext(): Promise<v
   }
 }
 
+async function testBeforePromptBuildDiscoversSingleTeamWithoutLocalPointer(): Promise<void> {
+  const fake = createFakePluginApi();
+  createClawMemPlugin(fake.api as never);
+
+  const handler = fake.getHandler("before_prompt_build");
+  assert(typeof handler === "function", "expected before_prompt_build handler to be registered");
+
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://git.clawmem.ai/api/v3/user/orgs" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify([{ login: "acme" }]), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "https://git.clawmem.ai/api/v3/repos/acme/config" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify({ full_name: "acme/config", name: "config", owner: { login: "acme" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "https://git.clawmem.ai/api/v3/repos/acme/config/issues?state=open&page=1&per_page=100&labels=type%3Ateam-config" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify([{
+        number: 7,
+        title: "review-squad config",
+        body: JSON.stringify({
+          enabled: true,
+          teamId: "review-squad",
+          teamName: "Review Squad",
+          summaryRepo: "acme/review-summary",
+          configRepo: "acme/config",
+          agents: {
+            main: {
+              role: "main",
+              defaultRepo: "acme/memory",
+            },
+          },
+        }),
+      }]), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    const result = await handler?.({ prompt: "hi" }, { agentId: "main" }) as { prependContext?: string; prependSystemContext?: string } | void;
+    const context = result?.prependContext ?? "";
+    assert(context.includes("<clawmem-team-context>"), "expected discovered single-team context to be injected");
+    assert(context.includes("Team ID: review-squad"), "expected discovered team id to be injected");
+    assert(context.includes("Summary repo: acme/review-summary"), "expected discovered summary repo to be injected");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}
+
+async function testBeforePromptBuildInjectsTeamIndexForMultipleTeams(): Promise<void> {
+  const fake = createFakePluginApi();
+  createClawMemPlugin(fake.api as never);
+
+  const handler = fake.getHandler("before_prompt_build");
+  assert(typeof handler === "function", "expected before_prompt_build handler to be registered");
+
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://git.clawmem.ai/api/v3/user/orgs" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify([{ login: "acme" }]), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "https://git.clawmem.ai/api/v3/repos/acme/config" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify({ full_name: "acme/config", name: "config", owner: { login: "acme" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "https://git.clawmem.ai/api/v3/repos/acme/config/issues?state=open&page=1&per_page=100&labels=type%3Ateam-config" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify([
+        {
+          number: 7,
+          title: "review-squad config",
+          body: JSON.stringify({
+            enabled: true,
+            teamId: "review-squad",
+            teamName: "Review Squad",
+            summaryRepo: "acme/review-summary",
+            configRepo: "acme/config",
+            agents: { main: { role: "worker", defaultRepo: "acme/memory" } },
+          }),
+        },
+        {
+          number: 9,
+          title: "infra-squad config",
+          body: JSON.stringify({
+            enabled: true,
+            teamId: "infra-squad",
+            teamName: "Infra Squad",
+            summaryRepo: "acme/infra-summary",
+            configRepo: "acme/config",
+            agents: { main: { role: "worker", defaultRepo: "acme/memory" } },
+          }),
+        },
+      ]), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    const result = await handler?.({ prompt: "hi" }, { agentId: "main" }) as { prependContext?: string; prependSystemContext?: string } | void;
+    const context = result?.prependContext ?? "";
+    assert(context.includes("<clawmem-team-index>"), "expected multi-team discovery to inject a team index");
+    assert(context.includes("teamId=review-squad"), "expected the first team to appear in the team index");
+    assert(context.includes("teamId=infra-squad"), "expected the second team to appear in the team index");
+    assert(!context.includes("<clawmem-team-context>"), "expected ambiguous multi-team discovery to avoid picking one team context");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}
+
+async function testBeforePromptBuildSelectsMatchingTeamFromPrompt(): Promise<void> {
+  const fake = createFakePluginApi();
+  createClawMemPlugin(fake.api as never);
+
+  const handler = fake.getHandler("before_prompt_build");
+  assert(typeof handler === "function", "expected before_prompt_build handler to be registered");
+
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://git.clawmem.ai/api/v3/user/orgs" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify([{ login: "acme" }]), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "https://git.clawmem.ai/api/v3/repos/acme/config" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify({ full_name: "acme/config", name: "config", owner: { login: "acme" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "https://git.clawmem.ai/api/v3/repos/acme/config/issues?state=open&page=1&per_page=100&labels=type%3Ateam-config" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify([
+        {
+          number: 7,
+          title: "review-squad config",
+          body: JSON.stringify({
+            enabled: true,
+            teamId: "review-squad",
+            teamName: "Review Squad",
+            summaryRepo: "acme/review-summary",
+            configRepo: "acme/config",
+            agents: { main: { role: "worker", defaultRepo: "acme/memory" } },
+          }),
+        },
+        {
+          number: 9,
+          title: "infra-squad config",
+          body: JSON.stringify({
+            enabled: true,
+            teamId: "infra-squad",
+            teamName: "Infra Squad",
+            summaryRepo: "acme/infra-summary",
+            configRepo: "acme/config",
+            agents: { main: { role: "worker", defaultRepo: "acme/memory" } },
+          }),
+        },
+      ]), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    const result = await handler?.({ prompt: "Check the review-squad queue" }, { agentId: "main" }) as { prependContext?: string; prependSystemContext?: string } | void;
+    const context = result?.prependContext ?? "";
+    assert(context.includes("<clawmem-team-index>"), "expected multi-team selection to keep the team index");
+    assert(context.includes("<clawmem-team-context>"), "expected a unique prompt match to inject one focused team context");
+    assert(context.includes("Team ID: review-squad"), "expected the matched team context to be selected");
+    assert(context.includes("Summary repo: acme/review-summary"), "expected the matched summary repo to be selected");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}
+
 function testSkipsAlwaysOnPromptWhenClawMemIsNotSelectedMemoryPlugin(): void {
   const fake = createFakePluginApi({ slot: "other-memory" });
   createClawMemPlugin(fake.api as never);
@@ -465,7 +672,7 @@ async function testTeamCollaborationConfigToolsPersistConfig(): Promise<void> {
   try {
     const setResult = await setExecute?.("tool", { repo: "acme/config", issueNumber: 7, confirmed: true, agentId: "main" });
     const setText = setResult?.content?.[0]?.text ?? "";
-    assert(setText.includes('Set team collaboration config for agent "main" to acme/config#7.'), "expected the set tool to confirm the saved pointer");
+    assert(setText.includes('Set legacy team collaboration override for agent "main" to acme/config#7.'), "expected the set tool to confirm the saved pointer");
 
     let root = fake.getConfigRoot();
     let savedRepo = ((root.plugins as any)?.entries?.clawmem?.config?.agents?.main?.teamConfigRepo) as string | undefined;
@@ -690,6 +897,7 @@ testExtractPromptFromPromptField();
 testExtractPromptFromStructuredContent();
 testBuildAutoRecallContext();
 testParseAndBuildTeamCollaborationContext();
+testBuildTeamCollaborationIndexContext();
 testBuildClawMemPromptSection();
 testResolveHostVersionFromRuntime();
 testResolveHostVersionFromEnvFallback();
@@ -704,6 +912,9 @@ testModernHostWithoutPromptRegistrationWarns();
 testSkipsAlwaysOnPromptWhenClawMemIsNotSelectedMemoryPlugin();
 await testOlderModernHostInjectsPromptGuidanceViaPrependSystemContext();
 await testBeforePromptBuildInjectsTeamCollaborationContext();
+await testBeforePromptBuildDiscoversSingleTeamWithoutLocalPointer();
+await testBeforePromptBuildInjectsTeamIndexForMultipleTeams();
+await testBeforePromptBuildSelectsMatchingTeamFromPrompt();
 await testRepoTransferAutoRetargetsDefaultRepo();
 await testMemoryRepoSetDefaultToolPersistsConfig();
 await testTeamCollaborationConfigToolsPersistConfig();

@@ -16,7 +16,7 @@ Before using the queue contract:
 - the shared `summary` repo already exists
 - each worker that should execute tasks can read and write that repo
 - each worker still keeps its own per-agent repo as its normal `defaultRepo`
-- if you want automatic team-state checks before ordinary conversations, bind the canonical config issue with `team_collaboration_config_set`
+- if you want automatic team-state checks before ordinary conversations, place the canonical `type:team-config` issue in the org-owned `config` repo so ClawMem can discover it at runtime
 - polling is provided by the host or operator; ClawMem does not run background cron itself
 
 ## Queue labels

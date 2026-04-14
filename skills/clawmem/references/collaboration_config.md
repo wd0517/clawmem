@@ -34,9 +34,9 @@ When the user says they want to build an agents-collaboration team, guide them t
 7. Verify that each transferred repo is still the correct `defaultRepo` for that worker.
 8. Grant the shared team access to `summary` and `config`.
 9. Create one canonical config issue in the `config` repo.
-10. Have each participating agent bind itself to that config issue with `team_collaboration_config_set`.
+10. Verify that each participating agent can read the org's `config` repo and the canonical config issue.
 
-The bind step is what enables automatic team-state checking before each normal conversation.
+The discovery step is what enables automatic team-state checking before each normal conversation. No `openclaw.json` team pointer is required on the normal path.
 
 ## Tool path
 
@@ -51,9 +51,18 @@ Use the built-in tools in this order:
 - transfer per-agent repos: `collaboration_repo_transfer`
 - retarget `defaultRepo` when needed: `memory_repo_set_default`
 - create canonical config issue: `issue_create`
-- bind each agent locally: `team_collaboration_config_set`
+- inspect the created config issue: `issue_get`
 
 ## Canonical config issue
+
+Runtime discovery rule:
+
+- for each visible org, ClawMem first checks `<org>/config`
+- if that repo does not exist or is not visible, it then checks `<org>/clawmem-config`
+- inside the discovered config repo, ClawMem scans open issues labeled `type:team-config`
+- any config issue whose `agents` map contains the current normalized agent id becomes a discovered team binding
+
+So the config issue is still the canonical team truth, but the pointer lives in the org config repo instead of `openclaw.json`.
 
 Create one issue in the `config` repo. Recommended title:
 
@@ -74,6 +83,7 @@ Update this issue body only from the main-agent side so the canonical config sta
 ```json
 {
   "enabled": true,
+  "teamId": "review-squad",
   "teamName": "review-squad",
   "summaryRepo": "acme/summary",
   "configRepo": "acme/config",
@@ -106,31 +116,30 @@ Update this issue body only from the main-agent side so the canonical config sta
 
 Rules:
 
+- Include a stable machine-readable `teamId`. This is how ClawMem disambiguates teams when one agent belongs to more than one team.
 - Use normalized agent ids that match `OPENCLAW_AGENT_ID` after normalization.
 - Keep the config issue body single-writer when possible. `issue_update.body` is a full replacement, not a merge.
 - Let workers report changes or onboarding completion through comments if you want to avoid body overwrite races.
 
-## Binding each agent
+## Discovery behavior
 
-After the config issue exists, each participating agent should bind itself locally:
+After the config issue exists, no local team-binding step is required.
 
-```json
-{
-  "repo": "acme/config",
-  "issueNumber": 12,
-  "confirmed": true
-}
-```
+What ClawMem does at runtime:
 
-Use that shape with `team_collaboration_config_set`.
+- lists visible orgs for the current agent identity
+- looks for the org-owned `config` repo, then `clawmem-config` as a fallback
+- scans open `type:team-config` issues in that repo
+- keeps only the issues whose `agents` map contains the current agent id
 
-What this does:
+Injection behavior:
 
-- stores the config-issue pointer in the local ClawMem plugin config for that agent
-- makes ClawMem fetch that issue before each normal conversation
-- injects a compact `<clawmem-team-context>` block into the turn
+- if one team matches, ClawMem injects one focused `<clawmem-team-context>` block
+- if multiple teams match, ClawMem injects a `<clawmem-team-index>` block and adds a focused team context only when the current request uniquely identifies one team
 
-To disable this behavior later, use `team_collaboration_config_clear`.
+Legacy note:
+
+- `team_collaboration_config_set` and `team_collaboration_config_clear` still exist as compatibility overrides, but normal setup should not require them
 
 ## Repo transfer reminder
 

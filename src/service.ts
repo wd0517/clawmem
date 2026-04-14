@@ -22,6 +22,7 @@ type MemoryPromptBuilderParams = Parameters<MemoryPromptBuilder>[0];
 type PromptBuildInjection = { prependContext?: string; prependSystemContext?: string };
 type TeamCollaborationRole = "main" | "worker";
 type TeamCollaborationAgentState = {
+  listed: boolean;
   role?: TeamCollaborationRole;
   defaultRepo?: string;
   assigneeLabel?: string;
@@ -30,6 +31,7 @@ type TeamCollaborationAgentState = {
 };
 type ParsedTeamCollaborationConfig = {
   enabled: boolean;
+  teamId?: string;
   teamName?: string;
   summaryRepo?: string;
   configRepo?: string;
@@ -39,9 +41,23 @@ type ParsedTeamCollaborationConfig = {
   agentId: string;
   agent: TeamCollaborationAgentState;
 };
+type DiscoveredTeamBinding = {
+  org: string;
+  configRepo: string;
+  issueNumber: number;
+  issueTitle?: string;
+  issueUpdatedAt?: string;
+  config: ParsedTeamCollaborationConfig;
+};
+type TeamDiscoveryCacheEntry = {
+  expiresAt: number;
+  bindings: DiscoveredTeamBinding[];
+};
 
 const MODERN_PROMPT_HOOK_MIN_HOST_VERSION = "2026.3.7";
 const MEMORY_PROMPT_REGISTRATION_MIN_HOST_VERSION = "2026.3.22";
+const TEAM_DISCOVERY_CACHE_TTL_MS = 30000;
+const TEAM_CONFIG_REPO_CANDIDATES = ["config", "clawmem-config"] as const;
 const CLAWMEM_PROMPT_GUIDANCE_TOOL_NAMES = [
   "memory_repos",
   "memory_repo_create",
@@ -61,6 +77,7 @@ class ClawMemService {
   private readonly repoWriteQueue = new KeyedAsyncQueue();
   private readonly stateQueue = new KeyedAsyncQueue();
   private readonly pending = new Set<Promise<unknown>>();
+  private readonly teamDiscoveryCache = new Map<string, TeamDiscoveryCacheEntry>();
   private statePath = "";
   private state: PluginState = { version: 4, sessions: {} };
   private unsubTranscript?: () => void;
@@ -305,7 +322,7 @@ class ClawMemService {
 
     this.api.registerTool({
       name: "team_collaboration_config_set",
-      description: "Bind this agent to a config-repo issue so ClawMem automatically checks team collaboration state before each normal conversation. Requires confirmed=true after explicit user approval.",
+      description: "Legacy compatibility override: bind this agent to one config-repo issue when automatic org/config discovery is unavailable or needs to be forced. Requires confirmed=true after explicit user approval.",
       required: true,
       parameters: {
         type: "object",
@@ -329,7 +346,7 @@ class ClawMemService {
         const agentId = this.resolveToolAgentId(p.agentId);
         try {
           const fullName = await this.setAgentTeamConfig(agentId, repo, issueNumber.value);
-          return toolText(`Set team collaboration config for agent "${agentId}" to ${fullName}#${issueNumber.value}. ClawMem will now check this issue before each normal conversation.`);
+          return toolText(`Set legacy team collaboration override for agent "${agentId}" to ${fullName}#${issueNumber.value}. Automatic org/config discovery remains the primary path; this pointer is used only as a compatibility fallback.`);
         } catch (error) {
           return toolText(`Unable to set team collaboration config for agent "${agentId}" to ${repo}#${issueNumber.value}: ${String(error)}`);
         }
@@ -338,7 +355,7 @@ class ClawMemService {
 
     this.api.registerTool({
       name: "team_collaboration_config_clear",
-      description: "Remove this agent's bound team collaboration config so ordinary ClawMem routing becomes the only automatic behavior again. Requires confirmed=true after explicit user approval.",
+      description: "Remove this agent's legacy team-collaboration override pointer so runtime org/config discovery is the only remaining path. Requires confirmed=true after explicit user approval.",
       required: true,
       parameters: {
         type: "object",
@@ -2315,7 +2332,7 @@ class ClawMemService {
 
   private async collectDynamicPromptContext(event: unknown, agentId?: string): Promise<string | undefined> {
     const [teamContext, recallContext] = await Promise.all([
-      this.collectTeamCollaborationContext(agentId),
+      this.collectTeamCollaborationContext(event, agentId),
       this.collectAutoRecallContext(event, agentId),
     ]);
     return joinContextBlocks(teamContext, recallContext);
@@ -2336,24 +2353,172 @@ class ClawMemService {
     }
   }
 
-  private async collectTeamCollaborationContext(agentId?: string): Promise<string | undefined> {
+  private async collectTeamCollaborationContext(event: unknown, agentId?: string): Promise<string | undefined> {
     const routeAgentId = normalizeAgentId(agentId);
     if (!(await this.ensureIdentityConfigured(routeAgentId))) return undefined;
     const { route } = this.getServices(routeAgentId);
+    const bindings = await this.discoverTeamBindings(routeAgentId);
+    if (bindings.length === 0) return undefined;
+    const indexContext = bindings.length > 1 ? buildTeamCollaborationIndexContext(bindings) : undefined;
+    const selected = this.selectRelevantTeamBinding(bindings, event) ?? (bindings.length === 1 ? bindings[0] : undefined);
+    const selectedContext = selected
+      ? buildTeamCollaborationContext(selected.config, {
+          configRepo: selected.configRepo,
+          issueNumber: selected.issueNumber,
+          localDefaultRepo: route.defaultRepo,
+        })
+      : undefined;
+    return joinContextBlocks(indexContext, selectedContext);
+  }
+
+  private async discoverTeamBindings(agentId: string): Promise<DiscoveredTeamBinding[]> {
+    const cached = this.teamDiscoveryCache.get(agentId);
+    if (cached && cached.expiresAt > Date.now()) return cached.bindings;
+
+    const discovered = await this.discoverTeamBindingsFromOrgs(agentId);
+    const bindings = discovered.length > 0 ? discovered : await this.discoverLegacyTeamBinding(agentId).then((binding) => binding ? [binding] : []);
+    const sorted = bindings.sort((left, right) => {
+      const leftKey = `${left.config.teamId ?? ""}:${left.config.teamName ?? ""}:${left.configRepo}#${left.issueNumber}`;
+      const rightKey = `${right.config.teamId ?? ""}:${right.config.teamName ?? ""}:${right.configRepo}#${right.issueNumber}`;
+      return leftKey.localeCompare(rightKey);
+    });
+    this.teamDiscoveryCache.set(agentId, {
+      expiresAt: Date.now() + TEAM_DISCOVERY_CACHE_TTL_MS,
+      bindings: sorted,
+    });
+    return sorted;
+  }
+
+  private async discoverTeamBindingsFromOrgs(agentId: string): Promise<DiscoveredTeamBinding[]> {
+    const { client } = this.getServices(agentId);
+    let orgs: Array<{ login?: string }> = [];
+    try {
+      const listed = await client.listUserOrgs();
+      orgs = Array.isArray(listed) ? listed : [];
+    } catch {
+      return [];
+    }
+
+    const discovered: DiscoveredTeamBinding[] = [];
+    for (const org of orgs) {
+      const orgLogin = org.login?.trim();
+      if (!orgLogin) continue;
+      let configRepo: string | undefined;
+      try {
+        configRepo = await this.findConfigRepoForOrg(agentId, orgLogin);
+      } catch {
+        continue;
+      }
+      if (!configRepo) continue;
+      discovered.push(...await this.discoverTeamBindingsFromConfigRepo(agentId, orgLogin, configRepo));
+    }
+    return discovered;
+  }
+
+  private async findConfigRepoForOrg(agentId: string, org: string): Promise<string | undefined> {
+    const { client } = this.getServices(agentId);
+    for (const repoName of TEAM_CONFIG_REPO_CANDIDATES) {
+      try {
+        const repo = await client.getRepo(org, repoName);
+        const fullName = repoSummaryFullName(repo) || `${org}/${repoName}`;
+        return fullName;
+      } catch (error) {
+        if (isHttpStatusError(error, 404)) continue;
+        throw error;
+      }
+    }
+    return undefined;
+  }
+
+  private async discoverTeamBindingsFromConfigRepo(agentId: string, org: string, configRepo: string): Promise<DiscoveredTeamBinding[]> {
+    const resolved = await this.requireRepoClient(agentId, configRepo);
+    if ("error" in resolved) return [];
+    let issues;
+    try {
+      issues = await resolved.client.listIssues({
+        state: "open",
+        labels: ["type:team-config"],
+        perPage: 100,
+      });
+    } catch {
+      return [];
+    }
+
+    const bindings: DiscoveredTeamBinding[] = [];
+    for (const issue of issues) {
+      const parsed = parseTeamCollaborationConfigIssueBody(issue.body, agentId);
+      if (!parsed.agent.listed) continue;
+      bindings.push({
+        org,
+        configRepo,
+        issueNumber: issue.number,
+        ...(issue.title?.trim() ? { issueTitle: issue.title.trim() } : {}),
+        ...(issue.updated_at ? { issueUpdatedAt: issue.updated_at } : {}),
+        config: {
+          ...parsed,
+          teamId: parsed.teamId ?? normalizeTeamIdentifier(issue.title) ?? normalizeTeamIdentifier(`${org}-${issue.number}`),
+          configRepo: parsed.configRepo ?? configRepo,
+        },
+      });
+    }
+    return bindings;
+  }
+
+  private async discoverLegacyTeamBinding(agentId: string): Promise<DiscoveredTeamBinding | undefined> {
+    const { route } = this.getServices(agentId);
     if (!route.teamConfigRepo || !route.teamConfigIssueNumber) return undefined;
     try {
-      const resolved = await this.requireRepoClient(routeAgentId, route.teamConfigRepo);
+      const resolved = await this.requireRepoClient(agentId, route.teamConfigRepo);
       if ("error" in resolved) return undefined;
       const issue = await resolved.client.getIssue(route.teamConfigIssueNumber);
-      const parsed = parseTeamCollaborationConfigIssueBody(issue.body, routeAgentId);
-      return buildTeamCollaborationContext(parsed, {
+      const parsed = parseTeamCollaborationConfigIssueBody(issue.body, agentId);
+      return {
+        org: route.teamConfigRepo.split("/")[0] ?? "",
         configRepo: route.teamConfigRepo,
         issueNumber: route.teamConfigIssueNumber,
-        localDefaultRepo: route.defaultRepo,
-      });
+        ...(issue.title?.trim() ? { issueTitle: issue.title.trim() } : {}),
+        ...(issue.updated_at ? { issueUpdatedAt: issue.updated_at } : {}),
+        config: {
+          ...parsed,
+          teamId: parsed.teamId ?? normalizeTeamIdentifier(issue.title) ?? normalizeTeamIdentifier(`${route.teamConfigRepo}-${route.teamConfigIssueNumber}`),
+          configRepo: parsed.configRepo ?? route.teamConfigRepo,
+        },
+      };
     } catch {
       return undefined;
     }
+  }
+
+  private selectRelevantTeamBinding(bindings: DiscoveredTeamBinding[], event: unknown): DiscoveredTeamBinding | undefined {
+    if (bindings.length === 0) return undefined;
+    if (bindings.length === 1) return bindings[0];
+    const prompt = extractPromptTextForRecall(event)?.toLowerCase();
+    if (!prompt) return undefined;
+    const matches = bindings.filter((binding) => this.promptMatchesTeamBinding(prompt, binding));
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  private promptMatchesTeamBinding(prompt: string, binding: DiscoveredTeamBinding): boolean {
+    const candidates = [
+      binding.config.teamId,
+      binding.config.teamName,
+      binding.config.summaryRepo,
+      binding.config.configRepo,
+      binding.issueTitle,
+      binding.config.agent.defaultRepo,
+    ].flatMap((value) => this.promptMatchCandidates(value));
+    return candidates.some((candidate) => prompt.includes(candidate));
+  }
+
+  private promptMatchCandidates(value: string | undefined): string[] {
+    if (!value?.trim()) return [];
+    const trimmed = value.trim().toLowerCase();
+    const candidates = new Set<string>([trimmed]);
+    if (trimmed.includes("/")) {
+      const [, repoName] = trimmed.split("/", 2);
+      if (repoName?.trim()) candidates.add(repoName.trim());
+    }
+    return [...candidates].filter((candidate) => candidate.length >= 3);
   }
 
   private async handleTranscript(sessionFile: string): Promise<void> {
@@ -2745,6 +2910,7 @@ class ClawMemService {
       },
     });
     this.applyAgentConfig(agentId, values);
+    this.invalidateTeamDiscoveryCache(agentId);
   }
   private async persistAgentTeamConfig(agentId: string, values: { teamConfigRepo: string; teamConfigIssueNumber: number } | null): Promise<void> {
     const root = this.api.runtime.config.loadConfig();
@@ -2782,6 +2948,14 @@ class ClawMemService {
     });
     if (values) this.applyAgentConfig(agentId, values);
     else this.clearAgentConfigFields(agentId, ["teamConfigRepo", "teamConfigIssueNumber"]);
+    this.invalidateTeamDiscoveryCache(agentId);
+  }
+  private invalidateTeamDiscoveryCache(agentId?: string): void {
+    if (!agentId) {
+      this.teamDiscoveryCache.clear();
+      return;
+    }
+    this.teamDiscoveryCache.delete(normalizeAgentId(agentId));
   }
   private applyAgentConfig(agentId: string, values: Partial<ClawMemAgentConfig>): void {
     this.config.agents[agentId] = {
@@ -3080,6 +3254,7 @@ export function parseTeamCollaborationConfigIssueBody(body: string | undefined, 
   if (!parsedDoc || typeof parsedDoc !== "object" || Array.isArray(parsedDoc)) {
     return {
       enabled: false,
+      teamId: undefined,
       teamName: undefined,
       summaryRepo: undefined,
       configRepo: undefined,
@@ -3088,6 +3263,7 @@ export function parseTeamCollaborationConfigIssueBody(body: string | undefined, 
       doneLabel: "task-status:done",
       agentId: normalizedAgentId,
       agent: {
+        listed: false,
         notes: ["The configured team config issue body is missing a valid JSON document."],
       },
     };
@@ -3098,13 +3274,16 @@ export function parseTeamCollaborationConfigIssueBody(body: string | undefined, 
   const agents = asRecord(doc.agents);
   const matchedAgent = resolveNormalizedAgentEntry(agents, normalizedAgentId);
   const matchedAgentRecord = matchedAgent ? asRecord(matchedAgent) : {};
+  const teamName = typeof doc.teamName === "string" && doc.teamName.trim() ? doc.teamName.trim() : undefined;
+  const teamId = normalizeTeamIdentifier(doc.teamId) ?? normalizeTeamIdentifier(teamName);
   const role = normalizeTeamRole(matchedAgentRecord.role);
   const pollEnabled = typeof matchedAgentRecord.pollEnabled === "boolean" ? matchedAgentRecord.pollEnabled : undefined;
   const assigneeLabel = normalizeAssigneeLabel(matchedAgentRecord.assigneeLabel, normalizedAgentId, role);
 
   return {
     enabled: doc.enabled !== false,
-    teamName: typeof doc.teamName === "string" && doc.teamName.trim() ? doc.teamName.trim() : undefined,
+    teamId,
+    teamName,
     summaryRepo: normalizeRepoReference(doc.summaryRepo),
     configRepo: normalizeRepoReference(doc.configRepo),
     taskLabel: normalizeLabelString(queue.taskLabel, "queue:task"),
@@ -3112,6 +3291,7 @@ export function parseTeamCollaborationConfigIssueBody(body: string | undefined, 
     doneLabel: normalizeLabelString(queue.doneLabel, "task-status:done"),
     agentId: normalizedAgentId,
     agent: {
+      listed: matchedAgent !== undefined,
       role,
       defaultRepo: normalizeRepoReference(matchedAgentRecord.defaultRepo),
       assigneeLabel,
@@ -3119,6 +3299,28 @@ export function parseTeamCollaborationConfigIssueBody(body: string | undefined, 
       notes: normalizeStringArray(matchedAgentRecord.notes),
     },
   };
+}
+
+export function buildTeamCollaborationIndexContext(bindings: DiscoveredTeamBinding[]): string {
+  const lines = [
+    "<clawmem-team-index>",
+    "ClawMem discovered team bindings for this agent:",
+  ];
+  for (const binding of bindings) {
+    const parts = [
+      binding.config.teamId ? `teamId=${binding.config.teamId}` : "",
+      binding.config.teamName && binding.config.teamName !== binding.config.teamId ? `team=${binding.config.teamName}` : "",
+      binding.config.agent.role ? `role=${binding.config.agent.role}` : "role=unregistered",
+      binding.config.enabled ? "" : "status=disabled",
+      binding.config.summaryRepo ? `summaryRepo=${binding.config.summaryRepo}` : "summaryRepo=(missing)",
+      `config=${binding.configRepo}#${binding.issueNumber}`,
+    ].filter(Boolean);
+    lines.push(`- ${parts.join(" | ")}`);
+  }
+  lines.push("If the current request belongs to one team only, select that team before using shared issue/comment workflows.");
+  lines.push("If the target team is ambiguous, ask a short clarification question instead of guessing a summary repo.");
+  lines.push("</clawmem-team-index>");
+  return lines.join("\n");
 }
 
 export function buildTeamCollaborationContext(
@@ -3139,6 +3341,7 @@ export function buildTeamCollaborationContext(
     return lines.join("\n");
   }
 
+  if (config.teamId) lines.push(`- Team ID: ${config.teamId}`);
   lines.push(`- Team: ${config.teamName ?? "(unnamed team)"}`);
   lines.push(`- Current agent: ${config.agentId}`);
   lines.push(`- Role: ${config.agent.role ?? "unregistered"}`);
@@ -3193,7 +3396,7 @@ export function buildClawMemPromptSection(params: MemoryPromptBuilderParams): st
     "Core loop:",
     "- Before answering, ask whether prior memory could improve the answer. Default to yes for preferences, project history, decisions, lessons, workflows, conventions, recurring problems, and active tasks.",
     `- Treat auto-injected ClawMem context as a hint, not proof of absence.${retrievalTools.length > 0 ? ` If relevant memory may exist and the hint is weak or missing, retrieve explicitly with ${joinNaturalLanguageList(retrievalTools)}.` : ""}`,
-    "- If a `<clawmem-team-context>` block is injected, treat it as live collaboration state for this turn. Use it to decide whether the work belongs in the personal defaultRepo, a shared summary repo, or another explicitly targeted repo.",
+    "- If a `<clawmem-team-context>` or `<clawmem-team-index>` block is injected, treat it as live collaboration state for this turn. Use it to decide whether the work belongs in the personal defaultRepo, a shared summary repo, or another explicitly targeted repo.",
     `${routingTools.length > 0 ? `- Before explicit memory work, choose the right repo. If unclear, inspect ${joinNaturalLanguageList(routingTools)} and then fall back to the agent's default repo.` : "- Before explicit memory work, choose the right repo instead of assuming every memory belongs in the default repo."}`,
     `${writeTools.length > 0 || hasForgetTool
       ? `- After answering, ask whether this turn created durable knowledge. If yes or unsure, write it now${writeTools.length > 0 ? ` with ${joinNaturalLanguageList(writeTools)}` : ""}${hasForgetTool ? `${writeTools.length > 0 ? "; " : " "}use \`memory_forget\` for stale or superseded memories` : ""} instead of waiting for background extraction.`
@@ -3365,6 +3568,12 @@ function normalizeRepoReference(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim().replace(/^\/+|\/+$/g, "");
   return /^[^/\s]+\/[^/\s]+$/.test(trimmed) ? trimmed : undefined;
+}
+
+function normalizeTeamIdentifier(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const normalized = normalizeAgentId(value);
+  return normalized || undefined;
 }
 
 function normalizeLabelString(value: unknown, fallback: string): string {

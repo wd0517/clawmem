@@ -2,28 +2,34 @@
 
 Use this reference when the scaffold already exists and the current agent needs to operate inside that scaffold.
 
-This workflow assumes the current agent already has a local binding to a canonical team config issue through `team_collaboration_config_set`.
+This workflow assumes the current agent can discover one or more canonical team config issues by scanning visible org-owned `config` or `clawmem-config` repos for open `type:team-config` issues.
 
 ## Automatic team-state check
 
-When the current agent config contains:
+Before each normal conversation, ClawMem now does one extra step:
 
-- `teamConfigRepo`
-- `teamConfigIssueNumber`
+1. list visible orgs for the current agent identity
+2. look for `<org>/config` first and then `<org>/clawmem-config`
+3. scan open `type:team-config` issues in that repo
+4. keep only the issues whose `agents` map contains the current agent
+5. inject discovered team state into the turn
 
-ClawMem now does one extra step before each normal conversation:
+Injected state is live runtime state, not historical memory.
 
-1. fetch the configured issue from the config repo
-2. parse the JSON document in that issue body
-3. inject a compact `<clawmem-team-context>` block into the turn
+If one team matches:
 
-That injected block is live runtime state, not historical memory.
+- inject one focused `<clawmem-team-context>` block
+
+If multiple teams match:
+
+- inject a `<clawmem-team-index>` block listing the discovered teams
+- inject one focused `<clawmem-team-context>` only when the current request uniquely identifies a team by `teamId`, `teamName`, `summaryRepo`, or another unambiguous hint
 
 Important compatibility rule:
 
 - ordinary ClawMem memory recall still uses the current agent's `defaultRepo`
 - ordinary conversation mirroring still writes to the current agent's `defaultRepo`
-- the team context only helps the agent decide when to use the shared `summary` repo or another explicit repo for collaboration work
+- the discovered team state only helps the agent decide when to use a shared `summary` repo or another explicit repo for collaboration work
 
 So this is additive. It does not replace the normal ClawMem flow.
 
@@ -72,6 +78,7 @@ State meaning:
 When the human asks the main agent to delegate work:
 
 1. read the injected team context
+   - if only a `<clawmem-team-index>` is present, select the target team first
 2. confirm the `summary` repo and the target worker
 3. create an issue in the `summary` repo with:
    - a precise title
@@ -98,13 +105,13 @@ Worker polling is outside the plugin. The host or operator provides cron or anot
 
 Each polling cycle should:
 
-1. read the injected team context or the canonical config issue directly
-2. resolve the `summary` repo and the worker's own `assignee:<agent-name>` label
-3. call `issue_list` for open issues matching:
-   - `queue:task`
-   - `task-status:handling`
-   - that worker's `assignee:<agent-name>`
-4. if nothing matches, exit
+1. discover all team configs that list this worker
+2. keep the bindings where `role=worker`
+3. for each discovered worker team:
+   - resolve that team's `summary` repo
+   - resolve that worker's own `assignee:<agent-name>` label
+   - call `issue_list` for open issues matching `queue:task`, `task-status:handling`, and that assignee label
+4. if nothing matches in a given team, continue to the next team
 5. for each matching issue:
    - `issue_get`
    - do the work
@@ -134,6 +141,8 @@ If the injected team context says:
 - the local `defaultRepo` does not match the team-declared default repo
 
 then do not silently guess. Prefer ordinary ClawMem behavior plus a short note that the team config needs repair.
+
+If only a team index is injected and the request could belong to more than one team, do not guess a `summary` repo. Ask a short clarification question or wait for the operator to select the team explicitly.
 
 ## Related references
 
