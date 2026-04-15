@@ -1,6 +1,7 @@
 // Shared types for the clawmem plugin.
 export type ClawMemAgentConfig = {
   baseUrl?: string;
+  login?: string;
   defaultRepo?: string;
   repo?: string;
   token?: string;
@@ -11,6 +12,7 @@ export type ClawMemAgentConfig = {
 
 export type ClawMemPluginConfig = {
   baseUrl: string;
+  login?: string;
   defaultRepo?: string;
   repo?: string;
   token?: string;
@@ -27,6 +29,7 @@ export type ClawMemPluginConfig = {
 export type ClawMemResolvedRoute = {
   agentId: string;
   baseUrl: string;
+  login?: string;
   defaultRepo?: string;
   repo?: string;
   token?: string;

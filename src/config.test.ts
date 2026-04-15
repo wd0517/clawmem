@@ -9,12 +9,14 @@ function assert(condition: unknown, message: string): void {
 function baseConfig(): ClawMemPluginConfig {
   return {
     baseUrl: "https://git.clawmem.ai/api/v3",
+    login: "global-login",
     authScheme: "token",
     token: "top-token",
     defaultRepo: "global/default-memory",
     repo: "global/legacy-memory",
     agents: {
       main: {
+        login: "main-login",
         token: "agent-token",
         defaultRepo: "main/private-memory",
       },
@@ -38,6 +40,7 @@ function testDefaultRepoResolution(): void {
   assert(route.defaultRepo === "main/private-memory", "expected per-agent defaultRepo to be preferred");
   assert(route.repo === "main/private-memory", "expected selected repo to default to defaultRepo");
   assert(route.token === "agent-token", "expected per-agent token to be preferred");
+  assert(route.login === "main-login", "expected per-agent login to be preferred");
 }
 
 function testRepoOverride(): void {
@@ -59,6 +62,7 @@ function testIdentityOnlyStillConfigured(): void {
   const route = resolveAgentRoute(config, "identityOnly");
   assert(isAgentConfigured(route) === true, "expected an identity with baseUrl and token to count as configured");
   assert(hasDefaultRepo(route) === false, "expected no default repo when only credentials are present");
+  assert(route.login === "global-login", "expected global login to flow into resolved routes");
 }
 
 function testBootstrapRegistrationUsesStableDefaults(): void {
@@ -78,9 +82,11 @@ function testTaskQueueLabelsAreManaged(): void {
   assert(isManagedLabel("task-status:handling"), "expected task status label to be managed");
   assert(isManagedLabel("task-status:done"), "expected done label to be managed");
   assert(isManagedLabel("assignee:agent-a"), "expected assignee label to be managed");
+  assert(isManagedLabel("team:reviewing"), "expected team labels to be managed");
   assert(resolveLabelColor("queue:task") === "0e8a16", "expected queue labels to use a stable color");
   assert(resolveLabelColor("task-status:done") === "0e8a16", "expected done labels to use the done color");
   assert(resolveLabelColor("task-status:handling") === "d93f0b", "expected handling labels to use the in-progress color");
+  assert(resolveLabelColor("team:reviewing") === "1d76db", "expected team labels to use the collaboration color");
 }
 
 function testTeamConfigResolution(): void {

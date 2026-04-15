@@ -60,7 +60,8 @@ Runtime discovery rule:
 - for each visible org, ClawMem first checks `<org>/config`
 - if that repo does not exist or is not visible, it then checks `<org>/clawmem-config`
 - inside the discovered config repo, ClawMem scans open issues labeled `type:team-config`
-- any config issue whose `agents` map contains the current normalized agent id becomes a discovered team binding
+- any config issue whose `agents` map contains the current backend login becomes a discovered team binding
+- for compatibility, legacy agent-id keyed entries still match as a fallback
 
 So the config issue is still the canonical team truth, but the pointer lives in the org config repo instead of `openclaw.json`.
 
@@ -71,6 +72,7 @@ Create one issue in the `config` repo. Recommended title:
 Recommended label:
 
 - `type:team-config`
+- `team:<teamId>`
 
 Keep one human-readable intro above the machine-readable block, then embed one JSON document in a fenced `json` block.
 
@@ -93,20 +95,23 @@ Update this issue body only from the main-agent side so the canonical config sta
     "doneLabel": "task-status:done"
   },
   "agents": {
-    "main-agent": {
+    "main-b54ea6": {
+      "agentId": "main-agent",
       "role": "main",
-      "defaultRepo": "acme/repo-main-agent"
+      "defaultRepo": "acme/main-b54ea6"
     },
-    "agent-a": {
+    "hazel-e23778": {
+      "agentId": "agent-a",
       "role": "worker",
-      "defaultRepo": "acme/repo-agent-a",
-      "assigneeLabel": "assignee:agent-a",
+      "defaultRepo": "acme/hazel-e23778",
+      "assigneeLabel": "assignee:hazel-e23778",
       "pollEnabled": true
     },
-    "agent-b": {
+    "ivy-c912ab": {
+      "agentId": "agent-b",
       "role": "worker",
-      "defaultRepo": "acme/repo-agent-b",
-      "assigneeLabel": "assignee:agent-b",
+      "defaultRepo": "acme/ivy-c912ab",
+      "assigneeLabel": "assignee:ivy-c912ab",
       "pollEnabled": true
     }
   }
@@ -117,7 +122,9 @@ Update this issue body only from the main-agent side so the canonical config sta
 Rules:
 
 - Include a stable machine-readable `teamId`. This is how ClawMem disambiguates teams when one agent belongs to more than one team.
-- Use normalized agent ids that match `OPENCLAW_AGENT_ID` after normalization.
+- Use backend login names as the `agents` map keys. These are the same identities used for org invitations and team membership.
+- Optionally keep `agentId` inside each agent entry for readability and debugging.
+- Add both `type:team-config` and `team:<teamId>` labels to the issue.
 - Keep the config issue body single-writer when possible. `issue_update.body` is a full replacement, not a merge.
 - Let workers report changes or onboarding completion through comments if you want to avoid body overwrite races.
 
@@ -130,7 +137,8 @@ What ClawMem does at runtime:
 - lists visible orgs for the current agent identity
 - looks for the org-owned `config` repo, then `clawmem-config` as a fallback
 - scans open `type:team-config` issues in that repo
-- keeps only the issues whose `agents` map contains the current agent id
+- keeps only the issues whose `agents` map contains the current backend login
+- if the current login is unavailable or the config is older, it falls back to legacy agent-id matching
 
 Injection behavior:
 
@@ -146,6 +154,7 @@ Legacy note:
 After `collaboration_repo_transfer`:
 
 - if the transferred repo was already the worker's current `defaultRepo`, the plugin now retargets it automatically
+- when moving a personal bootstrap repo such as `<login>/memory` into an org, the preferred destination name is `<org>/<login>`
 - otherwise, call `memory_repo_set_default` explicitly if that transferred repo should become the worker's automatic home
 
 Each worker's per-agent repo should remain that worker's normal home for:

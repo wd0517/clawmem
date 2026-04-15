@@ -10,7 +10,7 @@ import { sanitizeRecallQueryInput } from "./recall-sanitize.js";
 import { loadState, resolveStatePath, saveState } from "./state.js";
 import { readTranscriptSnapshot } from "./transcript.js";
 import type { BootstrapIdentityResponse, ClawMemAgentConfig, ClawMemPluginConfig, ClawMemResolvedRoute, MemoryCandidate, PluginState, SessionDerivedState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
-import { buildAgentBootstrapRegistration, inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
+import { DEFAULT_BOOTSTRAP_REPO_NAME, buildAgentBootstrapRegistration, inferAgentIdFromTranscriptPath, normalizeAgentId, normalizeLoginName, sessionScopeKey } from "./utils.js";
 import { getOpenClawAgentIdFromEnv, getOpenClawHostVersionFromEnv } from "./runtime-env.js";
 
 type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; messages: unknown[] };
@@ -26,6 +26,7 @@ type TeamCollaborationAgentState = {
   role?: TeamCollaborationRole;
   defaultRepo?: string;
   assigneeLabel?: string;
+  compatibleAssigneeLabels: string[];
   pollEnabled?: boolean;
   notes: string[];
 };
@@ -39,6 +40,7 @@ type ParsedTeamCollaborationConfig = {
   handlingLabel: string;
   doneLabel: string;
   agentId: string;
+  agentLogin?: string;
   agent: TeamCollaborationAgentState;
 };
 type DiscoveredTeamBinding = {
@@ -1453,12 +1455,13 @@ class ClawMemService {
         properties: {
           org: { type: "string", minLength: 1, description: "Organization login." },
           teamSlug: { type: "string", minLength: 1, description: "Team slug." },
-          username: { type: "string", minLength: 1, description: "Username to add or update." },
+          username: { type: "string", minLength: 1, description: "Optional backend login to add or update." },
+          memberAgentId: { type: "string", minLength: 1, description: "Optional OpenClaw agent id to resolve into the target backend login." },
           role: { type: "string", enum: ["member", "maintainer"], description: "Membership role. Defaults to member." },
           confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
           agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
         },
-        required: ["org", "teamSlug", "username"],
+        required: ["org", "teamSlug"],
       },
       execute: async (_id: string, params: unknown) => {
         const p = asRecord(params);
@@ -1467,16 +1470,19 @@ class ClawMemService {
         const org = typeof p.org === "string" ? p.org.trim() : "";
         const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
         const username = typeof p.username === "string" ? p.username.trim() : "";
-        if (!org || !teamSlug || !username) return toolText("org, teamSlug, and username are required.");
+        const memberAgentId = typeof p.memberAgentId === "string" ? p.memberAgentId.trim() : "";
+        if (!org || !teamSlug) return toolText("org and teamSlug are required.");
         const role: CollaborationTeamRole = p.role === "maintainer" ? "maintainer" : "member";
         const agentId = this.resolveToolAgentId(p.agentId);
         const resolved = await this.requireToolIdentity(agentId);
         if ("error" in resolved) return toolText(resolved.error);
+        const memberLogin = username || await this.resolveAgentLoginReference(memberAgentId);
+        if (!memberLogin) return toolText("username or memberAgentId is required.");
         try {
-          const membership = await resolved.client.setTeamMembership(org, teamSlug, username, role);
-          return toolText(`Set ${username} in ${org}/${teamSlug} to role=${membership.role || role}, state=${membership.state || "active"}.`);
+          const membership = await resolved.client.setTeamMembership(org, teamSlug, memberLogin, role);
+          return toolText(`Set ${memberLogin} in ${org}/${teamSlug} to role=${membership.role || role}, state=${membership.state || "active"}.`);
         } catch (error) {
-          return toolText(`Unable to set membership for ${username} in ${org}/${teamSlug}: ${String(error)}`);
+          return toolText(`Unable to set membership for ${memberLogin} in ${org}/${teamSlug}: ${String(error)}`);
         }
       },
     });
@@ -1491,11 +1497,12 @@ class ClawMemService {
         properties: {
           org: { type: "string", minLength: 1, description: "Organization login." },
           teamSlug: { type: "string", minLength: 1, description: "Team slug." },
-          username: { type: "string", minLength: 1, description: "Username to remove." },
+          username: { type: "string", minLength: 1, description: "Optional backend login to remove." },
+          memberAgentId: { type: "string", minLength: 1, description: "Optional OpenClaw agent id to resolve into the target backend login." },
           confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
           agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
         },
-        required: ["org", "teamSlug", "username"],
+        required: ["org", "teamSlug"],
       },
       execute: async (_id: string, params: unknown) => {
         const p = asRecord(params);
@@ -1504,15 +1511,18 @@ class ClawMemService {
         const org = typeof p.org === "string" ? p.org.trim() : "";
         const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
         const username = typeof p.username === "string" ? p.username.trim() : "";
-        if (!org || !teamSlug || !username) return toolText("org, teamSlug, and username are required.");
+        const memberAgentId = typeof p.memberAgentId === "string" ? p.memberAgentId.trim() : "";
+        if (!org || !teamSlug) return toolText("org and teamSlug are required.");
         const agentId = this.resolveToolAgentId(p.agentId);
         const resolved = await this.requireToolIdentity(agentId);
         if ("error" in resolved) return toolText(resolved.error);
+        const memberLogin = username || await this.resolveAgentLoginReference(memberAgentId);
+        if (!memberLogin) return toolText("username or memberAgentId is required.");
         try {
-          await resolved.client.removeTeamMembership(org, teamSlug, username);
-          return toolText(`Removed ${username} from ${org}/${teamSlug}.`);
+          await resolved.client.removeTeamMembership(org, teamSlug, memberLogin);
+          return toolText(`Removed ${memberLogin} from ${org}/${teamSlug}.`);
         } catch (error) {
-          return toolText(`Unable to remove ${username} from ${org}/${teamSlug}: ${String(error)}`);
+          return toolText(`Unable to remove ${memberLogin} from ${org}/${teamSlug}: ${String(error)}`);
         }
       },
     });
@@ -1635,6 +1645,7 @@ class ClawMemService {
         properties: {
           repo: { type: "string", minLength: 3, description: "Optional source repo in owner/repo form. Defaults to the agent's defaultRepo." },
           newOwner: { type: "string", minLength: 1, description: "Destination owner login, often an organization login." },
+          newName: { type: "string", minLength: 1, description: "Optional destination repo name. Defaults to the current repo name, except personal `memory` repos are auto-renamed to the agent login when available." },
           confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
           agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
         },
@@ -1645,13 +1656,39 @@ class ClawMemService {
         const blocked = this.requireMutationConfirmation(p, "transfer a repository");
         if (blocked) return toolText(blocked);
         const newOwner = typeof p.newOwner === "string" ? p.newOwner.trim() : "";
+        const requestedNewName = typeof p.newName === "string" && p.newName.trim() ? p.newName.trim() : undefined;
         if (!newOwner) return toolText("newOwner is empty.");
         const agentId = this.resolveToolAgentId(p.agentId);
         const target = await this.requireCollaborationRepo(agentId, p.repo);
         if ("error" in target) return toolText(target.error);
+        const login = await this.ensureAgentLoginConfigured(agentId);
+        const autoRename = !requestedNewName && target.repo === DEFAULT_BOOTSTRAP_REPO_NAME && login ? login : undefined;
+        const desiredRepoName = requestedNewName ?? autoRename ?? target.repo;
         try {
-          const transferred = await target.client.transferRepo(target.owner, target.repo, newOwner);
-          const nextFullName = repoSummaryFullName(transferred) || `${newOwner}/${target.repo}`;
+          if (desiredRepoName !== target.repo) {
+            try {
+              await target.client.getRepo(newOwner, desiredRepoName);
+              return toolText(`Unable to transfer ${target.fullName} to ${newOwner}: destination repo ${newOwner}/${desiredRepoName} already exists.`);
+            } catch (error) {
+              if (!isHttpStatusError(error, 404)) {
+                return toolText(`Unable to verify destination repo ${newOwner}/${desiredRepoName}: ${String(error)}`);
+              }
+            }
+          }
+
+          let transferred = await target.client.transferRepo(
+            target.owner,
+            target.repo,
+            newOwner,
+            desiredRepoName !== target.repo ? desiredRepoName : undefined,
+          );
+          let nextFullName = repoSummaryFullName(transferred) || `${newOwner}/${desiredRepoName}`;
+          if (desiredRepoName !== target.repo && nextFullName !== `${newOwner}/${desiredRepoName}`) {
+            const currentRepoName = repoSummaryName(transferred) || target.repo;
+            transferred = await target.client.renameRepo(newOwner, currentRepoName, desiredRepoName);
+            nextFullName = repoSummaryFullName(transferred) || `${newOwner}/${desiredRepoName}`;
+          }
+
           if (target.route.defaultRepo === target.fullName) {
             try {
               await this.setAgentDefaultRepo(agentId, nextFullName);
@@ -1946,7 +1983,8 @@ class ClawMemService {
         additionalProperties: false,
         properties: {
           org: { type: "string", minLength: 1, description: "Organization login." },
-          inviteeLogin: { type: "string", minLength: 1, description: "Username to invite." },
+          inviteeLogin: { type: "string", minLength: 1, description: "Optional backend login to invite." },
+          inviteeAgentId: { type: "string", minLength: 1, description: "Optional OpenClaw agent id to resolve into the target backend login." },
           role: { type: "string", enum: ["member", "owner"], description: "Org role for the invitation. Defaults to member." },
           teamIds: {
             type: "array",
@@ -1959,7 +1997,7 @@ class ClawMemService {
           confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
           agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
         },
-        required: ["org", "inviteeLogin"],
+        required: ["org"],
       },
       execute: async (_id: string, params: unknown) => {
         const p = asRecord(params);
@@ -1967,7 +2005,8 @@ class ClawMemService {
         if (blocked) return toolText(blocked);
         const org = typeof p.org === "string" ? p.org.trim() : "";
         const inviteeLogin = typeof p.inviteeLogin === "string" ? p.inviteeLogin.trim() : "";
-        if (!org || !inviteeLogin) return toolText("org and inviteeLogin are required.");
+        const inviteeAgentId = typeof p.inviteeAgentId === "string" ? p.inviteeAgentId.trim() : "";
+        if (!org) return toolText("org is required.");
         const role = resolveOrgInvitationRole(p.role, "member");
         if ("error" in role) return toolText(role.error);
         const teamIds = Array.isArray(p.teamIds)
@@ -1978,16 +2017,18 @@ class ClawMemService {
         const agentId = this.resolveToolAgentId(p.agentId);
         const resolved = await this.requireToolIdentity(agentId);
         if ("error" in resolved) return toolText(resolved.error);
+        const targetLogin = inviteeLogin || await this.resolveAgentLoginReference(inviteeAgentId);
+        if (!targetLogin) return toolText("inviteeLogin or inviteeAgentId is required.");
         try {
           const invitation = await resolved.client.createOrgInvitation(org, {
-            inviteeLogin,
+            inviteeLogin: targetLogin,
             role: role.role,
             ...(teamIds && teamIds.length > 0 ? { teamIds } : {}),
             ...(expiresInDays ? { expiresInDays } : {}),
           });
           return toolText(`Created invitation in "${org}": ${renderInvitationLine(invitation)}.`);
         } catch (error) {
-          return toolText(`Unable to create invitation for ${inviteeLogin} in org "${org}": ${String(error)}`);
+          return toolText(`Unable to create invitation for ${targetLogin} in org "${org}": ${String(error)}`);
         }
       },
     });
@@ -2433,6 +2474,7 @@ class ClawMemService {
   private async discoverTeamBindingsFromConfigRepo(agentId: string, org: string, configRepo: string): Promise<DiscoveredTeamBinding[]> {
     const resolved = await this.requireRepoClient(agentId, configRepo);
     if ("error" in resolved) return [];
+    const login = await this.ensureAgentLoginConfigured(agentId);
     let issues;
     try {
       issues = await resolved.client.listIssues({
@@ -2446,7 +2488,7 @@ class ClawMemService {
 
     const bindings: DiscoveredTeamBinding[] = [];
     for (const issue of issues) {
-      const parsed = parseTeamCollaborationConfigIssueBody(issue.body, agentId);
+      const parsed = parseTeamCollaborationConfigIssueBody(issue.body, { agentId, login });
       if (!parsed.agent.listed) continue;
       bindings.push({
         org,
@@ -2471,7 +2513,10 @@ class ClawMemService {
       const resolved = await this.requireRepoClient(agentId, route.teamConfigRepo);
       if ("error" in resolved) return undefined;
       const issue = await resolved.client.getIssue(route.teamConfigIssueNumber);
-      const parsed = parseTeamCollaborationConfigIssueBody(issue.body, agentId);
+      const parsed = parseTeamCollaborationConfigIssueBody(issue.body, {
+        agentId,
+        login: route.login ?? await this.ensureAgentLoginConfigured(agentId),
+      });
       return {
         org: route.teamConfigRepo.split("/")[0] ?? "",
         configRepo: route.teamConfigRepo,
@@ -2830,6 +2875,23 @@ class ClawMemService {
     if (!(await this.ensureIdentityConfigured(id))) return false;
     return hasDefaultRepo(resolveAgentRoute(this.config, id));
   }
+  private async ensureAgentLoginConfigured(agentId?: string): Promise<string | undefined> {
+    const id = normalizeAgentId(agentId);
+    if (!(await this.ensureIdentityConfigured(id))) return undefined;
+    const route = resolveAgentRoute(this.config, id);
+    if (route.login) return route.login;
+    try {
+      const client = new GitHubIssueClient(route, this.api.logger);
+      const user = await client.getCurrentUser();
+      const login = normalizeLoginName(user.login);
+      if (!login) return undefined;
+      await this.persistAgentLogin(id, login);
+      return login;
+    } catch (error) {
+      this.api.logger.warn?.(`clawmem: unable to resolve backend login for agent ${id}: ${String(error)}`);
+      return undefined;
+    }
+  }
   private async bootstrap(agentId: string): Promise<boolean> {
     const route = resolveAgentRoute(this.config, agentId);
     if (!route.baseUrl) { this.api.logger.warn(`clawmem: cannot provision Git credentials for ${agentId} without a baseUrl`); return false; }
@@ -2841,6 +2903,7 @@ class ClawMemService {
         authScheme: "token",
         token: bootstrap.identity.token,
         defaultRepo: bootstrap.identity.repo_full_name,
+        ...(bootstrap.login ? { login: bootstrap.login } : {}),
       });
       this.api.logger.info?.(
         `clawmem: provisioned Git credentials for agent ${agentId} with default repo ${bootstrap.identity.repo_full_name} via ${route.baseUrl} (${bootstrap.method})`,
@@ -2848,11 +2911,11 @@ class ClawMemService {
       return true;
     } catch (error) { this.api.logger.warn(`clawmem: failed to provision Git credentials for agent ${agentId} via ${route.baseUrl}: ${String(error)}`); return false; }
   }
-  private async provisionAgentIdentity(client: GitHubIssueClient, agentId: string): Promise<{ identity: BootstrapIdentityResponse; method: string }> {
+  private async provisionAgentIdentity(client: GitHubIssueClient, agentId: string): Promise<{ identity: BootstrapIdentityResponse; method: string; login?: string }> {
     const registration = buildAgentBootstrapRegistration(agentId);
     try {
       const identity = await client.registerAgent(registration.prefixLogin, registration.defaultRepoName);
-      return { identity, method: "/api/v3/agents" };
+      return { identity, method: "/api/v3/agents", login: normalizeLoginName(identity.login) };
     } catch (error) {
       if (!shouldFallbackToAnonymousBootstrap(error)) throw error;
       this.api.logger.warn?.(`clawmem: /api/v3/agents is unavailable for agent ${agentId}; falling back to deprecated anonymous bootstrap`);
@@ -2860,7 +2923,7 @@ class ClawMemService {
 
     const locale = Intl?.DateTimeFormat?.()?.resolvedOptions?.()?.locale ?? "";
     const identity = await client.createAnonymousSession(locale);
-    return { identity, method: "/api/v3/anonymous/session" };
+    return { identity, method: "/api/v3/anonymous/session", login: normalizeLoginName(identity.owner_login) };
   }
   private warnIfInactiveMemorySlot(): void {
     try {
@@ -2883,7 +2946,7 @@ class ClawMemService {
       this.api.logger.warn(`clawmem: memory slot check failed: ${String(error)}`);
     }
   }
-  private async persistAgentConfig(agentId: string, values: { baseUrl: string; authScheme: "token" | "bearer"; token: string; defaultRepo: string }): Promise<void> {
+  private async persistAgentConfig(agentId: string, values: { baseUrl: string; authScheme: "token" | "bearer"; token: string; defaultRepo: string; login?: string }): Promise<void> {
     const root = this.api.runtime.config.loadConfig();
     const plugins = root.plugins;
     const entries = plugins?.entries && typeof plugins.entries === "object" && !Array.isArray(plugins.entries) ? (plugins.entries as Record<string, unknown>) : {};
@@ -2910,6 +2973,35 @@ class ClawMemService {
       },
     });
     this.applyAgentConfig(agentId, values);
+    this.invalidateTeamDiscoveryCache(agentId);
+  }
+  private async persistAgentLogin(agentId: string, login: string): Promise<void> {
+    const root = this.api.runtime.config.loadConfig();
+    const plugins = root.plugins;
+    const entries = plugins?.entries && typeof plugins.entries === "object" && !Array.isArray(plugins.entries) ? (plugins.entries as Record<string, unknown>) : {};
+    const ex = asRecord(entries[this.api.id]), exCfg = asRecord(ex.config);
+    const agents = exCfg.agents && typeof exCfg.agents === "object" && !Array.isArray(exCfg.agents) ? (exCfg.agents as Record<string, unknown>) : {};
+    const existingAgent = asRecord(agents[agentId]);
+    await this.api.runtime.config.writeConfigFile({
+      ...root,
+      plugins: {
+        ...(plugins ?? {}),
+        entries: {
+          ...entries,
+          [this.api.id]: {
+            ...ex,
+            config: {
+              ...exCfg,
+              agents: {
+                ...agents,
+                [agentId]: { ...existingAgent, login },
+              },
+            },
+          },
+        },
+      },
+    });
+    this.applyAgentConfig(agentId, { login });
     this.invalidateTeamDiscoveryCache(agentId);
   }
   private async persistAgentTeamConfig(agentId: string, values: { teamConfigRepo: string; teamConfigIssueNumber: number } | null): Promise<void> {
@@ -3008,6 +3100,10 @@ class ClawMemService {
   }
   private async clearAgentTeamConfig(agentId: string): Promise<void> {
     await this.persistAgentTeamConfig(agentId, null);
+  }
+  private async resolveAgentLoginReference(agentId: string | undefined): Promise<string | undefined> {
+    if (!agentId) return undefined;
+    return this.ensureAgentLoginConfigured(agentId);
   }
   private resolveToolAgentId(agentId: unknown): string {
     return normalizeAgentId(typeof agentId === "string" && agentId.trim() ? agentId : getOpenClawAgentIdFromEnv());
@@ -3247,8 +3343,12 @@ export function buildAutoRecallContext(memories: Array<{
   ].join("\n");
 }
 
-export function parseTeamCollaborationConfigIssueBody(body: string | undefined, agentId: string): ParsedTeamCollaborationConfig {
-  const normalizedAgentId = normalizeAgentId(agentId);
+export function parseTeamCollaborationConfigIssueBody(
+  body: string | undefined,
+  identity: string | { agentId: string; login?: string },
+): ParsedTeamCollaborationConfig {
+  const normalizedAgentId = normalizeAgentId(typeof identity === "string" ? identity : identity.agentId);
+  const normalizedLogin = normalizeLoginName(typeof identity === "string" ? undefined : identity.login);
   const rawBody = typeof body === "string" ? body.trim() : "";
   const parsedDoc = parseJsonLikeDocument(rawBody);
   if (!parsedDoc || typeof parsedDoc !== "object" || Array.isArray(parsedDoc)) {
@@ -3262,8 +3362,10 @@ export function parseTeamCollaborationConfigIssueBody(body: string | undefined, 
       handlingLabel: "task-status:handling",
       doneLabel: "task-status:done",
       agentId: normalizedAgentId,
+      agentLogin: normalizedLogin,
       agent: {
         listed: false,
+        compatibleAssigneeLabels: [],
         notes: ["The configured team config issue body is missing a valid JSON document."],
       },
     };
@@ -3272,13 +3374,24 @@ export function parseTeamCollaborationConfigIssueBody(body: string | undefined, 
   const doc = asRecord(parsedDoc);
   const queue = asRecord(doc.queue);
   const agents = asRecord(doc.agents);
-  const matchedAgent = resolveNormalizedAgentEntry(agents, normalizedAgentId);
-  const matchedAgentRecord = matchedAgent ? asRecord(matchedAgent) : {};
+  const match = resolveTeamAgentConfig(agents, {
+    agentId: normalizedAgentId,
+    login: normalizedLogin,
+  });
+  const matchedAgentRecord = match ? asRecord(match.entry) : {};
   const teamName = typeof doc.teamName === "string" && doc.teamName.trim() ? doc.teamName.trim() : undefined;
   const teamId = normalizeTeamIdentifier(doc.teamId) ?? normalizeTeamIdentifier(teamName);
   const role = normalizeTeamRole(matchedAgentRecord.role);
   const pollEnabled = typeof matchedAgentRecord.pollEnabled === "boolean" ? matchedAgentRecord.pollEnabled : undefined;
-  const assigneeLabel = normalizeAssigneeLabel(matchedAgentRecord.assigneeLabel, normalizedAgentId, role);
+  const fallbackAssigneeIdentity = match?.assigneeIdentity ?? normalizedLogin ?? normalizedAgentId;
+  const assigneeLabel = normalizeAssigneeLabel(matchedAgentRecord.assigneeLabel, fallbackAssigneeIdentity, role);
+  const compatibleAssigneeLabels = role === "worker"
+    ? [...new Set([
+        assigneeLabel,
+        normalizedLogin ? `assignee:${normalizedLogin}` : undefined,
+        normalizedAgentId ? `assignee:${normalizedAgentId}` : undefined,
+      ].filter((value): value is string => Boolean(value)))]
+    : [];
 
   return {
     enabled: doc.enabled !== false,
@@ -3290,11 +3403,13 @@ export function parseTeamCollaborationConfigIssueBody(body: string | undefined, 
     handlingLabel: normalizeLabelString(queue.handlingLabel, "task-status:handling"),
     doneLabel: normalizeLabelString(queue.doneLabel, "task-status:done"),
     agentId: normalizedAgentId,
+    agentLogin: normalizedLogin,
     agent: {
-      listed: matchedAgent !== undefined,
+      listed: match !== undefined,
       role,
       defaultRepo: normalizeRepoReference(matchedAgentRecord.defaultRepo),
       assigneeLabel,
+      compatibleAssigneeLabels,
       pollEnabled,
       notes: normalizeStringArray(matchedAgentRecord.notes),
     },
@@ -3344,6 +3459,7 @@ export function buildTeamCollaborationContext(
   if (config.teamId) lines.push(`- Team ID: ${config.teamId}`);
   lines.push(`- Team: ${config.teamName ?? "(unnamed team)"}`);
   lines.push(`- Current agent: ${config.agentId}`);
+  if (config.agentLogin && config.agentLogin !== config.agentId) lines.push(`- Collaboration login: ${config.agentLogin}`);
   lines.push(`- Role: ${config.agent.role ?? "unregistered"}`);
   if (config.summaryRepo) lines.push(`- Summary repo: ${config.summaryRepo}`);
   if (config.configRepo && config.configRepo !== source.configRepo) lines.push(`- Team config repo: ${config.configRepo}`);
@@ -3363,6 +3479,9 @@ export function buildTeamCollaborationContext(
   } else if (config.agent.role === "worker") {
     lines.push(`- Worker queue labels: ${config.taskLabel}, ${config.handlingLabel}, ${config.agent.assigneeLabel ?? `assignee:${config.agentId}`}`);
     lines.push(`- After finishing a queued task, post the result as an issue comment, then switch the status label to ${config.doneLabel}.`);
+    if (config.agent.compatibleAssigneeLabels.length > 1) {
+      lines.push(`- Legacy compatible assignee labels: ${config.agent.compatibleAssigneeLabels.join(", ")}`);
+    }
     if (config.agent.pollEnabled === true) lines.push("- Worker polling is enabled in the team config.");
     if (config.agent.pollEnabled === false) lines.push("- Worker polling is disabled in the team config.");
   } else {
@@ -3564,6 +3683,36 @@ function resolveNormalizedAgentEntry(agents: Record<string, unknown>, agentId: s
   return undefined;
 }
 
+function resolveNormalizedLoginEntry(agents: Record<string, unknown>, login: string): unknown {
+  for (const [rawLogin, agentConfig] of Object.entries(agents)) {
+    if (normalizeLoginName(rawLogin) === login) return agentConfig;
+  }
+  return undefined;
+}
+
+function resolveEntryByAgentIdField(agents: Record<string, unknown>, agentId: string): unknown {
+  for (const agentConfig of Object.values(agents)) {
+    const record = asRecord(agentConfig);
+    if (normalizeAgentId(record.agentId) === agentId) return agentConfig;
+  }
+  return undefined;
+}
+
+function resolveTeamAgentConfig(
+  agents: Record<string, unknown>,
+  identity: { agentId: string; login?: string },
+): { entry: unknown; assigneeIdentity: string } | undefined {
+  if (identity.login) {
+    const byLogin = resolveNormalizedLoginEntry(agents, identity.login);
+    if (byLogin !== undefined) return { entry: byLogin, assigneeIdentity: identity.login };
+  }
+  const byAgentKey = resolveNormalizedAgentEntry(agents, identity.agentId);
+  if (byAgentKey !== undefined) return { entry: byAgentKey, assigneeIdentity: identity.agentId };
+  const byAgentField = resolveEntryByAgentIdField(agents, identity.agentId);
+  if (byAgentField !== undefined) return { entry: byAgentField, assigneeIdentity: identity.login ?? identity.agentId };
+  return undefined;
+}
+
 function normalizeRepoReference(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim().replace(/^\/+|\/+$/g, "");
@@ -3592,9 +3741,9 @@ function normalizeTeamRole(value: unknown): TeamCollaborationRole | undefined {
   return normalized === "main" || normalized === "worker" ? normalized : undefined;
 }
 
-function normalizeAssigneeLabel(value: unknown, agentId: string, role: TeamCollaborationRole | undefined): string | undefined {
+function normalizeAssigneeLabel(value: unknown, identity: string, role: TeamCollaborationRole | undefined): string | undefined {
   if (typeof value === "string" && value.trim()) return value.trim();
-  return role === "worker" ? `assignee:${agentId}` : undefined;
+  return role === "worker" ? `assignee:${identity}` : undefined;
 }
 
 function getCachedFinalArtifacts(
@@ -3717,6 +3866,11 @@ function renderTeamLine(team: { slug?: string; name?: string; description?: stri
   const permissionText = permission !== "unknown" ? ` [perm:${permission}]` : "";
   const description = team.description?.trim() ? ` - ${team.description.trim()}` : "";
   return `${slug}${name}${privacy}${permissionText}${description}`;
+}
+
+function repoSummaryName(repo?: { name?: string }): string | undefined {
+  const name = repo?.name?.trim();
+  return name || undefined;
 }
 
 function repoSummaryFullName(repo?: { full_name?: string; owner?: { login?: string }; name?: string }): string | undefined {

@@ -69,6 +69,11 @@ type CollaboratorResponse = {
   outside_collaborator?: boolean;
   type?: string;
 };
+type CurrentUserResponse = {
+  id?: number;
+  login?: string;
+  name?: string;
+};
 type RepositoryInvitationResponse = {
   id?: number;
   created_at?: string;
@@ -252,6 +257,9 @@ export class GitHubIssueClient {
   async listUserOrgs(): Promise<OrgResponse[]> {
     return this.req<OrgResponse[]>("user/orgs", { method: "GET" });
   }
+  async getCurrentUser(): Promise<CurrentUserResponse> {
+    return this.req<CurrentUserResponse>("user", { method: "GET" });
+  }
   async createUserOrg(params: { login: string; name?: string; defaultRepositoryPermission?: string }): Promise<OrgResponse> {
     return this.req<OrgResponse>("user/orgs", {
       method: "POST",
@@ -417,10 +425,19 @@ export class GitHubIssueClient {
   async declineUserOrgInvitation(invitationId: number): Promise<void> {
     await this.req(`user/organization_invitations/${invitationId}`, { method: "DELETE" });
   }
-  async transferRepo(owner: string, repo: string, newOwner: string): Promise<RepoResponse> {
+  async transferRepo(owner: string, repo: string, newOwner: string, newRepoName?: string): Promise<RepoResponse> {
     return this.req<RepoResponse>(`repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/transfer`, {
       method: "POST",
-      body: JSON.stringify({ new_owner: newOwner }),
+      body: JSON.stringify({
+        new_owner: newOwner,
+        ...(newRepoName ? { new_repo_name: newRepoName } : {}),
+      }),
+    });
+  }
+  async renameRepo(owner: string, repo: string, newName: string): Promise<RepoResponse> {
+    return this.req<RepoResponse>(`repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name: newName }),
     });
   }
   async ensureLabels(labels: string[]): Promise<void> {

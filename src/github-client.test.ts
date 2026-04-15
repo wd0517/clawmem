@@ -24,6 +24,7 @@ function createClientRecorder(): {
   const route: ClawMemResolvedRoute = {
     agentId: "main",
     baseUrl: "https://git.clawmem.ai/api/v3",
+    login: "main-user",
     defaultRepo: "alice/memory",
     repo: "alice/memory",
     token: "token-123",
@@ -84,11 +85,27 @@ async function testTeamGovernanceRoutes(): Promise<void> {
 async function testRepoTransferRoute(): Promise<void> {
   const { client, calls, restore } = createClientRecorder();
   try {
-    await client.transferRepo("alice", "memory", "acme");
-    assert(calls.length === 1, "expected one repo transfer request");
+    await client.transferRepo("alice", "memory", "acme", "hazel-e23778");
+    await client.renameRepo("acme", "memory", "hazel-e23778");
+    assert(calls.length === 2, "expected transfer and rename requests");
     assert(calls[0]?.url === "https://git.clawmem.ai/api/v3/repos/alice/memory/transfer", "expected repo transfer route");
     assert(calls[0]?.init.method === "POST", "expected POST for repo transfer");
-    assert(String(calls[0]?.init.body) === "{\"new_owner\":\"acme\"}", "expected repo transfer payload");
+    assert(String(calls[0]?.init.body) === "{\"new_owner\":\"acme\",\"new_repo_name\":\"hazel-e23778\"}", "expected repo transfer payload");
+    assert(calls[1]?.url === "https://git.clawmem.ai/api/v3/repos/acme/memory", "expected repo rename route");
+    assert(calls[1]?.init.method === "PATCH", "expected PATCH for repo rename");
+    assert(String(calls[1]?.init.body) === "{\"name\":\"hazel-e23778\"}", "expected repo rename payload");
+  } finally {
+    restore();
+  }
+}
+
+async function testCurrentUserRoute(): Promise<void> {
+  const { client, calls, restore } = createClientRecorder();
+  try {
+    await client.getCurrentUser();
+    assert(calls.length === 1, "expected one current user request");
+    assert(calls[0]?.url === "https://git.clawmem.ai/api/v3/user", "expected current user route");
+    assert(calls[0]?.init.method === "GET", "expected GET for current user route");
   } finally {
     restore();
   }
@@ -168,6 +185,7 @@ async function testOrgRepoAndIssueRoutes(): Promise<void> {
 await testOrgGovernanceRoutes();
 await testTeamGovernanceRoutes();
 await testRepoTransferRoute();
+await testCurrentUserRoute();
 await testOrgRepoAndIssueRoutes();
 
 console.log("github client tests passed");

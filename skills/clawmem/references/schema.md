@@ -34,13 +34,14 @@ Generic issue queues are a separate shape from plugin-managed memory nodes. For 
 - `queue:task`
 - `task-status:handling`
 - `task-status:done`
-- `assignee:<agent-name>`
+- `assignee:<login>`
 
 These queue labels are for ordinary issue workflows, not for `memory_store` or `memory_update`.
 
 Canonical team configuration issues are also ordinary issues, not memory nodes. Recommended label:
 
 - `type:team-config`
+- `team:<teamId>`
 
 ## Kinds
 
@@ -81,7 +82,7 @@ Use these labels for shared task-queue repos such as a team summary workspace:
 | Queue membership | `queue:task` | This issue is part of the shared task queue |
 | In progress | `task-status:handling` | A worker agent should pick up or is actively handling the task |
 | Completed | `task-status:done` | The worker finished the task and should have posted the result as a comment |
-| Routing | `assignee:<agent-name>` | The intended worker identity for polling and handoff |
+| Routing | `assignee:<login>` | The intended worker identity for polling and handoff |
 
 Recommended conventions:
 - Keep queue issues as normal issues, not `type:memory` nodes.

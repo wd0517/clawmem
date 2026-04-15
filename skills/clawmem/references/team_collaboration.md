@@ -11,8 +11,9 @@ Before each normal conversation, ClawMem now does one extra step:
 1. list visible orgs for the current agent identity
 2. look for `<org>/config` first and then `<org>/clawmem-config`
 3. scan open `type:team-config` issues in that repo
-4. keep only the issues whose `agents` map contains the current agent
-5. inject discovered team state into the turn
+4. keep only the issues whose `agents` map contains the current backend login
+5. fall back to legacy agent-id matching when needed
+6. inject discovered team state into the turn
 
 Injected state is live runtime state, not historical memory.
 
@@ -45,7 +46,7 @@ Main agent:
 Worker agent:
 
 - does ordinary ClawMem work in its own per-agent `defaultRepo`
-- polls the `summary` repo for issues addressed to its own `assignee:<agent-name>` label
+- polls the `summary` repo for issues addressed to its own `assignee:<login>` label
 - reads the task issue body
 - performs the task
 - posts the result as an issue comment
@@ -65,7 +66,7 @@ Required labels:
 - `queue:task`
 - `task-status:handling`
 - `task-status:done`
-- `assignee:<agent-name>`
+- `assignee:<login>`
 
 State meaning:
 
@@ -83,7 +84,7 @@ When the human asks the main agent to delegate work:
 3. create an issue in the `summary` repo with:
    - a precise title
    - the full task body
-   - labels `queue:task`, `task-status:handling`, `assignee:<worker>`
+   - labels `queue:task`, `task-status:handling`, `assignee:<worker-login>`
 4. tell the human the task has been queued
 
 When the human later asks whether it is finished:
@@ -109,7 +110,7 @@ Each polling cycle should:
 2. keep the bindings where `role=worker`
 3. for each discovered worker team:
    - resolve that team's `summary` repo
-   - resolve that worker's own `assignee:<agent-name>` label
+   - resolve that worker's own `assignee:<login>` label
    - call `issue_list` for open issues matching `queue:task`, `task-status:handling`, and that assignee label
 4. if nothing matches in a given team, continue to the next team
 5. for each matching issue:

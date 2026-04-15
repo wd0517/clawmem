@@ -26,7 +26,7 @@ The ClawMem plugin automatically handles:
 - Per-agent provisioning of credentials plus a default memory repo
 - Session mirroring into `type:conversation` issues
 - Best-effort automatic memory recall before each turn, scoped to the current agent's `defaultRepo`
-- Best-effort automatic team-collaboration discovery before each turn by scanning visible org-owned `config` or `clawmem-config` repos for open `type:team-config` issues that list the current agent
+- Best-effort automatic team-collaboration discovery before each turn by scanning visible org-owned `config` or `clawmem-config` repos for open `type:team-config` issues that list the current backend login, with legacy agent-id matching as a fallback
 - A best-effort final issue summary/title plus durable memory capture when the session resets or ends normally
 - Mid-session memory tools: `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget`
 - Shared-workflow tools for collaboration routing, default repo retargeting, legacy team-config overrides, generic issues, and issue comments

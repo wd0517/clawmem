@@ -22,9 +22,9 @@ openclaw config validate
 openclaw gateway restart
 ```
 
-After restart, confirm OpenClaw shows ClawMem as the active memory plugin. On first use, clawmem bootstraps each agent identity by calling `POST /api/v3/agents` on `git.clawmem.ai`, then writes the returned `token` plus `repo_full_name` back into your config under `plugins.entries.clawmem.config.agents.<agentId>` as that agent's `defaultRepo`. Automatic flows use that `defaultRepo`, while explicit memory tool calls may target other repos. When talking to an older backend that does not expose `POST /api/v3/agents`, the plugin falls back to the deprecated anonymous bootstrap path.
+After restart, confirm OpenClaw shows ClawMem as the active memory plugin. On first use, clawmem bootstraps each agent identity by calling `POST /api/v3/agents` on `git.clawmem.ai`, then writes the returned `token`, backend `login`, and `repo_full_name` back into your config under `plugins.entries.clawmem.config.agents.<agentId>` as that agent's `defaultRepo`. Automatic flows use that `defaultRepo`, while explicit memory tool calls may target other repos. When talking to an older backend that does not expose `POST /api/v3/agents`, the plugin falls back to the deprecated anonymous bootstrap path.
 
-For team collaboration, ClawMem now auto-discovers org-owned config repos at runtime. It checks visible orgs for `<org>/config` first and then `<org>/clawmem-config`, scans open `type:team-config` issues, and selects the ones that list the current agent. If exactly one team matches, ClawMem injects a focused `<clawmem-team-context>` block. If multiple teams match, it injects a `<clawmem-team-index>` block and only adds one focused team context when the current request uniquely identifies the target team. Legacy `teamConfigRepo` plus `teamConfigIssueNumber` overrides are still accepted as a compatibility fallback, but they are no longer required or recommended.
+For team collaboration, ClawMem now auto-discovers org-owned config repos at runtime. It checks visible orgs for `<org>/config` first and then `<org>/clawmem-config`, scans open `type:team-config` issues, and selects the ones that list the current backend login. If exactly one team matches, ClawMem injects a focused `<clawmem-team-context>` block. If multiple teams match, it injects a `<clawmem-team-index>` block and only adds one focused team context when the current request uniquely identifies the target team. Legacy `teamConfigRepo` plus `teamConfigIssueNumber` overrides and agent-id keyed configs are still accepted as compatibility fallbacks, but they are no longer the recommended setup.
 
 The package now also ships a bundled `clawmem` skill for runtime memory behavior:
 - core recall and save loop
@@ -105,6 +105,7 @@ Minimal config (after auto-provisioning):
           agents: {
             main: {
               baseUrl: "https://git.clawmem.ai/api/v3",
+              login: "main-b54ea6",
               defaultRepo: "owner/main-memory",
               token: "<token>",
               authScheme: "token"
@@ -133,11 +134,13 @@ Full config with all options:
           agents: {
             main: {
               baseUrl: "https://git.clawmem.ai/api/v3",
+              login: "main-b54ea6",
               defaultRepo: "owner/main-memory",
               token: "<token>",
               authScheme: "token"
             },
             coder: {
+              login: "hazel-e23778",
               defaultRepo: "owner/coder-memory",
               token: "<token>"
             }
@@ -176,5 +179,5 @@ Team collaboration no longer requires `openclaw.json` pointers. The normal path 
 - Conversation lifecycle is stored in native issue state (`open` while live, `closed` after finalize); memory lifecycle uses native issue state too (`open` active, `closed` stale).
 - Memory extraction now prefers one atomic fact per memory item instead of bundling whole sessions into a single node.
 - Memory issue bodies store the durable detail in a YAML `detail` field plus flat metadata such as `memory_hash` and logical `date`; this matches the current Console parser in `agent-git-service/web`.
-- Shared task queues use ordinary issues plus reserved labels such as `queue:task`, `task-status:handling`, `task-status:done`, and `assignee:<agent-name>`.
+- Shared task queues use ordinary issues plus reserved labels such as `queue:task`, `task-status:handling`, `task-status:done`, and `assignee:<login>`.
 - `team_collaboration_config_set` and `team_collaboration_config_clear` remain available as legacy compatibility overrides, but normal team collaboration should rely on runtime org/config discovery instead of `openclaw.json` pointers.

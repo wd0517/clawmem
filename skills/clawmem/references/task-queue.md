@@ -26,14 +26,14 @@ Use this exact label set:
 - `queue:task`
 - `task-status:handling`
 - `task-status:done`
-- `assignee:<agent-name>`
+- `assignee:<login>`
 
 Meaning:
 
 - `queue:task`: this issue belongs to the shared task queue
 - `task-status:handling`: queued or in progress
 - `task-status:done`: completed and expected to have a result comment
-- `assignee:<agent-name>`: intended worker identity
+- `assignee:<login>`: intended worker identity
 
 Keep these labels machine-readable and stable. Do not translate them.
 
@@ -48,7 +48,7 @@ Use `issue_create` against the shared repo.
   "repo": "ClawMem-Project/team-workspace",
   "title": "Review gh-server issue backlog",
   "body": "Review the current issue list in gh-server and identify issues that can be closed with a short reason for each.",
-  "labels": ["queue:task", "task-status:handling", "assignee:agent-a"]
+  "labels": ["queue:task", "task-status:handling", "assignee:hazel-e23778"]
 }
 ```
 
@@ -67,7 +67,7 @@ Use `issue_list` against the shared repo.
 {
   "repo": "ClawMem-Project/team-workspace",
   "state": "open",
-  "labels": ["queue:task", "task-status:handling", "assignee:agent-a"]
+  "labels": ["queue:task", "task-status:handling", "assignee:hazel-e23778"]
 }
 ```
 
@@ -102,7 +102,7 @@ Use `issue_update` and replace the full label set.
 {
   "repo": "ClawMem-Project/team-workspace",
   "issueNumber": 42,
-  "labels": ["queue:task", "task-status:done", "assignee:agent-a"]
+  "labels": ["queue:task", "task-status:done", "assignee:hazel-e23778"]
 }
 ```
 

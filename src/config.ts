@@ -1,7 +1,7 @@
 // Hardcoded label/prefix constants and plugin config resolution.
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import type { ClawMemAgentConfig, ClawMemPluginConfig, ClawMemResolvedRoute } from "./types.js";
-import { normalizeAgentId } from "./utils.js";
+import { normalizeAgentId, normalizeLoginName } from "./utils.js";
 
 export const SESSION_TITLE_PREFIX = "Session: ";
 export const MEMORY_TITLE_PREFIX = "Memory: ";
@@ -12,7 +12,7 @@ export const LABEL_CLOSED = "status:closed";
 export const LABEL_MEMORY_ACTIVE = "memory-status:active";
 export const LABEL_MEMORY_STALE = "memory-status:stale";
 
-const MANAGED_PREFIXES = ["type:", "kind:", "session:", "date:", "topic:", "agent:", "queue:", "task-status:", "assignee:"];
+const MANAGED_PREFIXES = ["type:", "kind:", "session:", "date:", "topic:", "agent:", "queue:", "task-status:", "assignee:", "team:"];
 const MANAGED_EXACT = new Set([LABEL_ACTIVE, LABEL_CLOSED, LABEL_MEMORY_ACTIVE, LABEL_MEMORY_STALE]);
 
 export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig {
@@ -33,6 +33,7 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
     const agent = rawAgentConfig as Record<string, unknown>;
     agents[agentId] = {
       baseUrl: str(agent.baseUrl)?.replace(/\/+$/, ""),
+      login: normalizeLoginName(str(agent.login)),
       defaultRepo: normalizeRepoName(str(agent.defaultRepo) ?? str(agent.repo)),
       repo: str(agent.repo),
       token: str(agent.token),
@@ -43,6 +44,7 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
   }
   return {
     baseUrl: baseUrl.endsWith("/api/v3") ? baseUrl : `${baseUrl}/api/v3`,
+    login: normalizeLoginName(str(raw.login)),
     defaultRepo: normalizeRepoName(str(raw.defaultRepo) ?? str(raw.repo)),
     repo: normalizeRepoName(str(raw.repo)),
     token: str(raw.token),
@@ -66,6 +68,7 @@ export function resolveAgentRoute(config: ClawMemPluginConfig, agentId?: string,
   return {
     agentId: id,
     baseUrl: baseUrl.endsWith("/api/v3") ? baseUrl : `${baseUrl}/api/v3`,
+    ...(normalizeLoginName(agent.login) ?? normalizeLoginName(config.login) ? { login: normalizeLoginName(agent.login) ?? normalizeLoginName(config.login) } : {}),
     ...(defaultRepo ? { defaultRepo } : {}),
     ...(repo ? { repo } : {}),
     token: agent.token?.trim() || config.token?.trim() || undefined,
@@ -95,13 +98,14 @@ export function resolveLabelColor(label: string): string {
   if (label.startsWith("session:")) return "bfdadc";
   if (label.startsWith("agent:")) return "1d76db";
   if (label.startsWith("assignee:")) return "1d76db";
+  if (label.startsWith("team:")) return "1d76db";
   return "0e8a16";
 }
 
 export function labelDescription(label: string): string {
   for (const [pfx, d] of [["type:", "Issue type"], ["kind:", "Memory kind"], ["memory-status:", "Memory lifecycle status"],
     ["status:", "Conversation lifecycle status"], ["session:", "Session association"],
-    ["date:", "Date"], ["topic:", "Topic"], ["agent:", "Agent"], ["queue:", "Queue"], ["task-status:", "Task status"], ["assignee:", "Task assignee"]] as const)
+    ["date:", "Date"], ["topic:", "Topic"], ["agent:", "Agent"], ["queue:", "Queue"], ["task-status:", "Task status"], ["assignee:", "Task assignee"], ["team:", "Team binding"]] as const)
     if (label.startsWith(pfx)) return `${d} label managed by clawmem.`;
   return "Label managed by clawmem.";
 }

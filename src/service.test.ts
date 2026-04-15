@@ -92,7 +92,8 @@ function testParseAndBuildTeamCollaborationContext(): void {
       summaryRepo: "acme/summary",
       configRepo: "acme/config",
       agents: {
-        "agent-a": {
+        "hazel-e23778": {
+          agentId: "agent-a",
           role: "worker",
           defaultRepo: "acme/agent-a-memory",
           pollEnabled: true,
@@ -101,7 +102,7 @@ function testParseAndBuildTeamCollaborationContext(): void {
       },
     }, null, 2),
     "```",
-  ].join("\n"), "agent-a");
+  ].join("\n"), { agentId: "agent-a", login: "hazel-e23778" });
 
   assert(parsed.enabled === true, "expected enabled team config to parse");
   assert(parsed.teamId === "review-squad", "expected team id to parse");
@@ -109,7 +110,8 @@ function testParseAndBuildTeamCollaborationContext(): void {
   assert(parsed.summaryRepo === "acme/summary", "expected summary repo to parse");
   assert(parsed.agent.listed === true, "expected the current agent to be marked as listed");
   assert(parsed.agent.role === "worker", "expected worker role to parse");
-  assert(parsed.agent.assigneeLabel === "assignee:agent-a", "expected worker assignee label to default from the agent id");
+  assert(parsed.agent.assigneeLabel === "assignee:hazel-e23778", "expected worker assignee label to default from the login-first key");
+  assert(parsed.agent.compatibleAssigneeLabels.includes("assignee:agent-a"), "expected legacy agent-id assignee compatibility");
 
   const context = buildTeamCollaborationContext(parsed, {
     configRepo: "acme/config",
@@ -119,8 +121,29 @@ function testParseAndBuildTeamCollaborationContext(): void {
   assert(context.includes("<clawmem-team-context>"), "expected a stable wrapper for injected team context");
   assert(context.includes("Team ID: review-squad"), "expected team id to appear in team context");
   assert(context.includes("Summary repo: acme/summary"), "expected the summary repo to appear in team context");
-  assert(context.includes("Worker queue labels: queue:task, task-status:handling, assignee:agent-a"), "expected queue routing guidance");
+  assert(context.includes("Collaboration login: hazel-e23778"), "expected the collaboration login to appear in team context");
+  assert(context.includes("Worker queue labels: queue:task, task-status:handling, assignee:hazel-e23778"), "expected queue routing guidance");
+  assert(context.includes("Legacy compatible assignee labels: assignee:hazel-e23778, assignee:agent-a"), "expected compatibility queue guidance");
   assert(context.includes("Reply in concise bullet points."), "expected per-agent notes to survive into the rendered context");
+}
+
+function testParseTeamCollaborationConfigFallbacksToLegacyAgentId(): void {
+  const parsed = parseTeamCollaborationConfigIssueBody(JSON.stringify({
+    enabled: true,
+    teamId: "review-squad",
+    teamName: "Review Squad",
+    summaryRepo: "acme/review-summary",
+    configRepo: "acme/config",
+    agents: {
+      "agent-a": {
+        role: "worker",
+        defaultRepo: "acme/agent-a-memory",
+      },
+    },
+  }), { agentId: "agent-a", login: "hazel-e23778" });
+
+  assert(parsed.agent.listed === true, "expected legacy agent-id keyed config to remain discoverable");
+  assert(parsed.agent.assigneeLabel === "assignee:agent-a", "expected legacy agent-id keyed configs to preserve their default assignee label");
 }
 
 function testBuildTeamCollaborationIndexContext(): void {
@@ -194,6 +217,7 @@ function createFakePluginApi(options?: {
   const pluginConfig = options?.pluginConfig ?? {
     agents: {
       main: {
+        login: "main-user",
         token: "test-token",
         defaultRepo: "acme/memory",
       },
@@ -445,6 +469,123 @@ async function testBeforePromptBuildDiscoversSingleTeamWithoutLocalPointer(): Pr
   }
 }
 
+async function testBeforePromptBuildDiscoversLoginFirstTeamConfig(): Promise<void> {
+  const fake = createFakePluginApi();
+  createClawMemPlugin(fake.api as never);
+
+  const handler = fake.getHandler("before_prompt_build");
+  assert(typeof handler === "function", "expected before_prompt_build handler to be registered");
+
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://git.clawmem.ai/api/v3/user/orgs" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify([{ login: "acme" }]), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "https://git.clawmem.ai/api/v3/repos/acme/config" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify({ full_name: "acme/config", name: "config", owner: { login: "acme" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "https://git.clawmem.ai/api/v3/repos/acme/config/issues?state=open&page=1&per_page=100&labels=type%3Ateam-config" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify([{
+        number: 7,
+        title: "review-squad config",
+        body: JSON.stringify({
+          enabled: true,
+          teamId: "review-squad",
+          teamName: "Review Squad",
+          summaryRepo: "acme/review-summary",
+          configRepo: "acme/config",
+          agents: {
+            "main-user": {
+              role: "main",
+              defaultRepo: "acme/memory",
+            },
+          },
+        }),
+      }]), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    const result = await handler?.({ prompt: "hi" }, { agentId: "main" }) as { prependContext?: string; prependSystemContext?: string } | void;
+    const context = result?.prependContext ?? "";
+    assert(context.includes("<clawmem-team-context>"), "expected login-first team config to be injected");
+    assert(context.includes("Collaboration login: main-user"), "expected login-first discovery to surface the collaboration login");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}
+
+async function testBeforePromptBuildPersistsResolvedLoginForDiscovery(): Promise<void> {
+  const fake = createFakePluginApi({
+    pluginConfig: {
+      agents: {
+        main: {
+          token: "test-token",
+          defaultRepo: "acme/memory",
+        },
+      },
+    },
+  });
+  createClawMemPlugin(fake.api as never);
+
+  const handler = fake.getHandler("before_prompt_build");
+  assert(typeof handler === "function", "expected before_prompt_build handler to be registered");
+
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://git.clawmem.ai/api/v3/user" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify({ login: "main-user" }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "https://git.clawmem.ai/api/v3/user/orgs" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify([{ login: "acme" }]), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "https://git.clawmem.ai/api/v3/repos/acme/config" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify({ full_name: "acme/config", name: "config", owner: { login: "acme" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "https://git.clawmem.ai/api/v3/repos/acme/config/issues?state=open&page=1&per_page=100&labels=type%3Ateam-config" && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify([{
+        number: 7,
+        title: "review-squad config",
+        body: JSON.stringify({
+          enabled: true,
+          teamId: "review-squad",
+          teamName: "Review Squad",
+          summaryRepo: "acme/review-summary",
+          configRepo: "acme/config",
+          agents: {
+            "main-user": {
+              role: "main",
+              defaultRepo: "acme/memory",
+            },
+          },
+        }),
+      }]), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    const result = await handler?.({ prompt: "hi" }, { agentId: "main" }) as { prependContext?: string; prependSystemContext?: string } | void;
+    const context = result?.prependContext ?? "";
+    assert(context.includes("<clawmem-team-context>"), "expected discovery to succeed after resolving login from the backend");
+
+    const root = fake.getConfigRoot();
+    const savedLogin = ((root.plugins as any)?.entries?.clawmem?.config?.agents?.main?.login) as string | undefined;
+    assert(savedLogin === "main-user", "expected resolved backend login to be persisted");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}
+
 async function testBeforePromptBuildInjectsTeamIndexForMultipleTeams(): Promise<void> {
   const fake = createFakePluginApi();
   createClawMemPlugin(fake.api as never);
@@ -585,16 +726,20 @@ async function testRepoTransferAutoRetargetsDefaultRepo(): Promise<void> {
   assert(typeof transferExecute === "function", "expected collaboration_repo_transfer tool to be registered");
 
   const previousFetch = globalThis.fetch;
+  let destinationRepoChecks = 0;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (url === "https://git.clawmem.ai/api/v3/repos/acme/memory/transfer") {
-      return new Response(JSON.stringify({ full_name: "test-org/memory", name: "memory", owner: { login: "test-org" } }), {
+      const payload = JSON.parse(String(init?.body ?? "{}")) as { new_repo_name?: string };
+      return new Response(JSON.stringify({ full_name: `test-org/${payload.new_repo_name ?? "memory"}`, name: payload.new_repo_name ?? "memory", owner: { login: "test-org" } }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
     }
-    if (url === "https://git.clawmem.ai/api/v3/repos/test-org/memory" && (init?.method ?? "GET") === "GET") {
-      return new Response(JSON.stringify({ full_name: "test-org/memory", name: "memory", owner: { login: "test-org" } }), {
+    if (url === "https://git.clawmem.ai/api/v3/repos/test-org/main-user" && (init?.method ?? "GET") === "GET") {
+      destinationRepoChecks += 1;
+      if (destinationRepoChecks === 1) return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+      return new Response(JSON.stringify({ full_name: "test-org/main-user", name: "main-user", owner: { login: "test-org" } }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
@@ -605,11 +750,11 @@ async function testRepoTransferAutoRetargetsDefaultRepo(): Promise<void> {
   try {
     const result = await transferExecute?.("tool", { newOwner: "test-org", confirmed: true, agentId: "main" });
     const text = result?.content?.[0]?.text ?? "";
-    assert(text.includes('retargeted agent "main" defaultRepo to test-org/memory'), "expected transfer tool to report automatic defaultRepo retarget");
+    assert(text.includes('retargeted agent "main" defaultRepo to test-org/main-user'), "expected transfer tool to report automatic login-based repo rename");
 
     const root = fake.getConfigRoot();
     const nextRepo = ((root.plugins as any)?.entries?.clawmem?.config?.agents?.main?.defaultRepo) as string | undefined;
-    assert(nextRepo === "test-org/memory", "expected persisted config to update defaultRepo after transfer");
+    assert(nextRepo === "test-org/main-user", "expected persisted config to update defaultRepo after transfer");
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -692,6 +837,82 @@ async function testTeamCollaborationConfigToolsPersistConfig(): Promise<void> {
   } finally {
     globalThis.fetch = previousFetch;
   }
+}
+
+async function testCollaborationToolsResolveTargetAgentLogin(): Promise<void> {
+  const fake = createFakePluginApi({
+    pluginConfig: {
+      agents: {
+        main: {
+          login: "main-user",
+          token: "main-token",
+          defaultRepo: "acme/memory",
+        },
+        "worker-da4462": {
+          login: "hazel-e23778",
+          token: "worker-token",
+          defaultRepo: "hazel-e23778/memory",
+        },
+      },
+    },
+  });
+  createClawMemPlugin(fake.api as never);
+
+  const inviteTool = fake.getTool("collaboration_org_invitation_create");
+  const teamMembershipTool = fake.getTool("collaboration_team_membership_set");
+  const inviteExecute = inviteTool?.execute as ((id: string, params: unknown) => Promise<{ content?: Array<{ text?: string }> }>) | undefined;
+  const membershipExecute = teamMembershipTool?.execute as ((id: string, params: unknown) => Promise<{ content?: Array<{ text?: string }> }>) | undefined;
+  assert(typeof inviteExecute === "function", "expected collaboration_org_invitation_create tool to be registered");
+  assert(typeof membershipExecute === "function", "expected collaboration_team_membership_set tool to be registered");
+
+  type FetchCall = { url: string; init: RequestInit | undefined };
+  const calls: FetchCall[] = [];
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    calls.push({ url, init });
+    if (url === "https://git.clawmem.ai/api/v3/orgs/claw-org/invitations" && (init?.method ?? "GET") === "POST") {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { invitee_login?: string };
+      return new Response(JSON.stringify({ id: 11, invitee: { login: body.invitee_login } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "https://git.clawmem.ai/api/v3/orgs/claw-org/teams/reviewing/memberships/hazel-e23778" && (init?.method ?? "GET") === "PUT") {
+      return new Response(JSON.stringify({ state: "active", role: "member" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    const inviteResult = await inviteExecute?.("tool", {
+      org: "claw-org",
+      inviteeAgentId: "worker-da4462",
+      confirmed: true,
+      agentId: "main",
+    });
+    const inviteText = inviteResult?.content?.[0]?.text ?? "";
+    assert(inviteText.includes('Created invitation in "claw-org"'), "expected invitation creation to succeed");
+
+    const membershipResult = await membershipExecute?.("tool", {
+      org: "claw-org",
+      teamSlug: "reviewing",
+      memberAgentId: "worker-da4462",
+      confirmed: true,
+      agentId: "main",
+    });
+    const membershipText = membershipResult?.content?.[0]?.text ?? "";
+    assert(membershipText.includes("Set hazel-e23778 in claw-org/reviewing"), "expected membership update to target the backend login");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  const inviteCall = calls.find((call) => call.url === "https://git.clawmem.ai/api/v3/orgs/claw-org/invitations");
+  assert(Boolean(inviteCall), "expected invitation request to be sent");
+  assert(String(inviteCall?.init?.body).includes("\"invitee_login\":\"hazel-e23778\""), "expected invitation payload to use the resolved backend login");
 }
 
 async function testOrgRepoCreateAndIssueCommentWorkflowTools(): Promise<void> {
@@ -897,6 +1118,7 @@ testExtractPromptFromPromptField();
 testExtractPromptFromStructuredContent();
 testBuildAutoRecallContext();
 testParseAndBuildTeamCollaborationContext();
+testParseTeamCollaborationConfigFallbacksToLegacyAgentId();
 testBuildTeamCollaborationIndexContext();
 testBuildClawMemPromptSection();
 testResolveHostVersionFromRuntime();
@@ -913,11 +1135,14 @@ testSkipsAlwaysOnPromptWhenClawMemIsNotSelectedMemoryPlugin();
 await testOlderModernHostInjectsPromptGuidanceViaPrependSystemContext();
 await testBeforePromptBuildInjectsTeamCollaborationContext();
 await testBeforePromptBuildDiscoversSingleTeamWithoutLocalPointer();
+await testBeforePromptBuildDiscoversLoginFirstTeamConfig();
+await testBeforePromptBuildPersistsResolvedLoginForDiscovery();
 await testBeforePromptBuildInjectsTeamIndexForMultipleTeams();
 await testBeforePromptBuildSelectsMatchingTeamFromPrompt();
 await testRepoTransferAutoRetargetsDefaultRepo();
 await testMemoryRepoSetDefaultToolPersistsConfig();
 await testTeamCollaborationConfigToolsPersistConfig();
+await testCollaborationToolsResolveTargetAgentLogin();
 await testOrgRepoCreateAndIssueCommentWorkflowTools();
 
 console.log("service tests passed");
