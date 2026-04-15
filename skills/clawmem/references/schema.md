@@ -30,19 +30,6 @@ If you create a curated memory manually, include:
 - one `kind:*` label
 - optional `topic:*` labels, usually no more than two or three
 
-Generic issue queues are a separate shape from plugin-managed memory nodes. For shared task routing and handoff issues, use these reserved labels:
-- `queue:task`
-- `task-status:handling`
-- `task-status:done`
-- `assignee:<login>`
-
-These queue labels are for ordinary issue workflows, not for `memory_store` or `memory_update`.
-
-Canonical team configuration issues are also ordinary issues, not memory nodes. Recommended label:
-
-- `type:team-config`
-- `team:<teamId>`
-
 ## Kinds
 
 | Kind | Label | Use it for |
@@ -71,26 +58,6 @@ Canonical team configuration issues are also ordinary issues, not memory nodes. 
 - Do not create translated variants or near-duplicate synonyms of an existing label. Prefer reuse first, then one canonical new label if needed.
 - New labels should be short, general, and likely to apply again across future memories or agents.
 - For plugin-managed memory schema, do not invent random label prefixes. Memory schema evolution must stay within `kind:*` and `topic:*`.
-- For generic issue-queue workflows, reuse the reserved queue labels above instead of inventing alternate prefixes.
-
-## Task Queue Labels
-
-Use these labels for shared task-queue repos such as a team summary workspace:
-
-| Purpose | Label | Meaning |
-|---|---|---|
-| Queue membership | `queue:task` | This issue is part of the shared task queue |
-| In progress | `task-status:handling` | A worker agent should pick up or is actively handling the task |
-| Completed | `task-status:done` | The worker finished the task and should have posted the result as a comment |
-| Routing | `assignee:<login>` | The intended worker identity for polling and handoff |
-
-Recommended conventions:
-- Keep queue issues as normal issues, not `type:memory` nodes.
-- Keep `queue:task` stable across the task lifecycle.
-- Switch between `task-status:handling` and `task-status:done` instead of creating new status prefixes.
-- Use issue comments for task output, handoff notes, and final results.
-- Close the issue only when the task record should leave the active queue; until then, native open/closed state and `task-status:*` should mean different things.
-
 ## Storage language
 
 - For new memory nodes, write the human-readable title and body in the user's current language by default.

@@ -2,8 +2,6 @@
 
 Use this reference when memory should live in a shared repo instead of one agent's private default repo, or when multiple agents or teammates need to read and write the same memory space. Use it for both `collaboration` and `collabration` requests.
 
-If the user is not just changing access but wants to bootstrap a whole multi-agent collaboration scaffold, read [collaboration_config.md](collaboration_config.md) as well.
-
 ## Contents
 
 - When to use

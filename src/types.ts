@@ -6,8 +6,6 @@ export type ClawMemAgentConfig = {
   repo?: string;
   token?: string;
   authScheme?: "token" | "bearer";
-  teamConfigRepo?: string;
-  teamConfigIssueNumber?: number;
 };
 
 export type ClawMemPluginConfig = {
@@ -17,8 +15,6 @@ export type ClawMemPluginConfig = {
   repo?: string;
   token?: string;
   authScheme: "token" | "bearer";
-  teamConfigRepo?: string;
-  teamConfigIssueNumber?: number;
   agents: Record<string, ClawMemAgentConfig>;
   memoryRecallLimit: number;
   memoryAutoRecallLimit: number;
@@ -34,8 +30,6 @@ export type ClawMemResolvedRoute = {
   repo?: string;
   token?: string;
   authScheme: "token" | "bearer";
-  teamConfigRepo?: string;
-  teamConfigIssueNumber?: number;
 };
 
 export type BootstrapIdentityResponse = { token: string; repo_full_name: string };

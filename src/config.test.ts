@@ -78,30 +78,11 @@ function testBootstrapRegistrationTrimsLongPrefixes(): void {
 }
 
 function testTaskQueueLabelsAreManaged(): void {
-  assert(isManagedLabel("queue:task"), "expected queue label to be managed");
-  assert(isManagedLabel("task-status:handling"), "expected task status label to be managed");
-  assert(isManagedLabel("task-status:done"), "expected done label to be managed");
-  assert(isManagedLabel("assignee:agent-a"), "expected assignee label to be managed");
-  assert(isManagedLabel("team:reviewing"), "expected team labels to be managed");
-  assert(resolveLabelColor("queue:task") === "0e8a16", "expected queue labels to use a stable color");
-  assert(resolveLabelColor("task-status:done") === "0e8a16", "expected done labels to use the done color");
-  assert(resolveLabelColor("task-status:handling") === "d93f0b", "expected handling labels to use the in-progress color");
-  assert(resolveLabelColor("team:reviewing") === "1d76db", "expected team labels to use the collaboration color");
-}
-
-function testTeamConfigResolution(): void {
-  const config = baseConfig();
-  config.teamConfigRepo = "acme/config";
-  config.teamConfigIssueNumber = 7;
-  config.agents.main.teamConfigIssueNumber = 11;
-
-  const mainRoute = resolveAgentRoute(config, "main");
-  assert(mainRoute.teamConfigRepo === "acme/config", "expected team config repo to fall back from the global config");
-  assert(mainRoute.teamConfigIssueNumber === 11, "expected the per-agent issue number to override the global value");
-
-  const legacyRoute = resolveAgentRoute(config, "legacy");
-  assert(legacyRoute.teamConfigRepo === "acme/config", "expected other agents to inherit the global team config repo");
-  assert(legacyRoute.teamConfigIssueNumber === 7, "expected other agents to inherit the global team config issue number");
+  assert(isManagedLabel("type:memory"), "expected type label to be managed");
+  assert(isManagedLabel("kind:decision"), "expected kind label to be managed");
+  assert(isManagedLabel("topic:redis"), "expected topic label to be managed");
+  assert(resolveLabelColor("type:memory") === "5319e7", "expected memory type labels to use a stable color");
+  assert(resolveLabelColor("topic:redis") === "fbca04", "expected topic labels to use the topic color");
 }
 
 testDefaultRepoResolution();
@@ -111,6 +92,5 @@ testIdentityOnlyStillConfigured();
 testBootstrapRegistrationUsesStableDefaults();
 testBootstrapRegistrationTrimsLongPrefixes();
 testTaskQueueLabelsAreManaged();
-testTeamConfigResolution();
 
 console.log("config tests passed");
