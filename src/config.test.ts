@@ -1,4 +1,4 @@
-import { hasDefaultRepo, isAgentConfigured, resolveAgentRoute } from "./config.js";
+import { hasDefaultRepo, isAgentConfigured, isManagedLabel, resolveAgentRoute, resolveLabelColor } from "./config.js";
 import type { ClawMemPluginConfig } from "./types.js";
 import { buildAgentBootstrapRegistration, DEFAULT_BOOTSTRAP_REPO_NAME } from "./utils.js";
 
@@ -9,12 +9,14 @@ function assert(condition: unknown, message: string): void {
 function baseConfig(): ClawMemPluginConfig {
   return {
     baseUrl: "https://git.clawmem.ai/api/v3",
+    login: "global-login",
     authScheme: "token",
     token: "top-token",
     defaultRepo: "global/default-memory",
     repo: "global/legacy-memory",
     agents: {
       main: {
+        login: "main-login",
         token: "agent-token",
         defaultRepo: "main/private-memory",
       },
@@ -38,6 +40,7 @@ function testDefaultRepoResolution(): void {
   assert(route.defaultRepo === "main/private-memory", "expected per-agent defaultRepo to be preferred");
   assert(route.repo === "main/private-memory", "expected selected repo to default to defaultRepo");
   assert(route.token === "agent-token", "expected per-agent token to be preferred");
+  assert(route.login === "main-login", "expected per-agent login to be preferred");
 }
 
 function testRepoOverride(): void {
@@ -59,6 +62,7 @@ function testIdentityOnlyStillConfigured(): void {
   const route = resolveAgentRoute(config, "identityOnly");
   assert(isAgentConfigured(route) === true, "expected an identity with baseUrl and token to count as configured");
   assert(hasDefaultRepo(route) === false, "expected no default repo when only credentials are present");
+  assert(route.login === "global-login", "expected global login to flow into resolved routes");
 }
 
 function testBootstrapRegistrationUsesStableDefaults(): void {
@@ -73,11 +77,20 @@ function testBootstrapRegistrationTrimsLongPrefixes(): void {
   assert(registration.prefixLogin.length <= 32, "expected bootstrap login prefix to fit backend max length");
 }
 
+function testTaskQueueLabelsAreManaged(): void {
+  assert(isManagedLabel("type:memory"), "expected type label to be managed");
+  assert(isManagedLabel("kind:decision"), "expected kind label to be managed");
+  assert(isManagedLabel("topic:redis"), "expected topic label to be managed");
+  assert(resolveLabelColor("type:memory") === "5319e7", "expected memory type labels to use a stable color");
+  assert(resolveLabelColor("topic:redis") === "fbca04", "expected topic labels to use the topic color");
+}
+
 testDefaultRepoResolution();
 testRepoOverride();
 testLegacyRepoFallback();
 testIdentityOnlyStillConfigured();
 testBootstrapRegistrationUsesStableDefaults();
 testBootstrapRegistrationTrimsLongPrefixes();
+testTaskQueueLabelsAreManaged();
 
 console.log("config tests passed");

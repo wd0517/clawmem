@@ -2,12 +2,38 @@
 import { resolveLabelColor, labelDescription, extractLabelNames, isManagedLabel } from "./config.js";
 import type { AgentRegistrationResponse, AnonymousSessionResponse, ClawMemResolvedRoute } from "./types.js";
 
-type IssueResponse = { number: number; title?: string; body?: string; state?: string; labels?: Array<{ name?: string } | string> };
+export type IssueResponse = {
+  id?: number;
+  number: number;
+  title?: string;
+  body?: string;
+  state?: string;
+  state_reason?: string | null;
+  locked?: boolean;
+  labels?: Array<{ name?: string } | string>;
+  assignees?: Array<{ login?: string; name?: string }>;
+  user?: { login?: string; name?: string };
+  comments?: number;
+  created_at?: string;
+  updated_at?: string;
+  closed_at?: string | null;
+  html_url?: string;
+  url?: string;
+};
 type SearchIssuesResponse = { items?: IssueResponse[]; total_count?: number; incomplete_results?: boolean };
-type CommentResponse = { id?: number; body?: string; created_at?: string };
+export type CommentResponse = {
+  id?: number;
+  body?: string;
+  created_at?: string;
+  updated_at?: string;
+  html_url?: string;
+  url?: string;
+  in_reply_to_id?: number | null;
+  user?: { login?: string; name?: string };
+};
 type LabelResponse = { name?: string; color?: string; description?: string };
 type PermissionMap = Record<string, boolean | undefined>;
-type RepoResponse = {
+export type RepoResponse = {
   name?: string;
   full_name?: string;
   description?: string;
@@ -42,6 +68,11 @@ type CollaboratorResponse = {
   organization_member?: boolean;
   outside_collaborator?: boolean;
   type?: string;
+};
+type CurrentUserResponse = {
+  id?: number;
+  login?: string;
+  name?: string;
 };
 type RepositoryInvitationResponse = {
   id?: number;
@@ -83,28 +114,100 @@ export class GitHubIssueClient {
     return this.config.defaultRepo?.trim() || undefined;
   }
 
-  async createIssue(params: { title: string; body: string; labels: string[] }): Promise<IssueResponse> {
-    return this.req<IssueResponse>(this.repoPath("issues"), { method: "POST", body: JSON.stringify(params) });
+  async createIssue(params: {
+    title: string;
+    body?: string;
+    labels?: string[];
+    assignees?: string[];
+    assignee?: string;
+    state?: "open" | "closed";
+    stateReason?: string;
+  }): Promise<IssueResponse> {
+    return this.req<IssueResponse>(this.repoPath("issues"), {
+      method: "POST",
+      body: JSON.stringify({
+        title: params.title,
+        ...(params.body !== undefined ? { body: params.body } : {}),
+        ...(params.labels && params.labels.length > 0 ? { labels: params.labels } : {}),
+        ...(params.assignees && params.assignees.length > 0 ? { assignees: params.assignees } : {}),
+        ...(params.assignee ? { assignee: params.assignee } : {}),
+        ...(params.state ? { state: params.state } : {}),
+        ...(params.stateReason ? { state_reason: params.stateReason } : {}),
+      }),
+    });
   }
-  async updateIssue(n: number, params: { title?: string; body?: string; state?: "open" | "closed"; labels?: string[] }): Promise<IssueResponse> {
-    return this.req<IssueResponse>(this.repoPath(`issues/${n}`), { method: "PATCH", body: JSON.stringify(params) });
+  async updateIssue(n: number, params: {
+    title?: string;
+    body?: string;
+    state?: "open" | "closed";
+    stateReason?: string;
+    labels?: string[];
+    assignees?: string[];
+    locked?: boolean;
+  }): Promise<IssueResponse> {
+    return this.req<IssueResponse>(this.repoPath(`issues/${n}`), {
+      method: "PATCH",
+      body: JSON.stringify({
+        ...(params.title !== undefined ? { title: params.title } : {}),
+        ...(params.body !== undefined ? { body: params.body } : {}),
+        ...(params.state !== undefined ? { state: params.state } : {}),
+        ...(params.stateReason !== undefined ? { state_reason: params.stateReason } : {}),
+        ...(params.labels !== undefined ? { labels: params.labels } : {}),
+        ...(params.assignees !== undefined ? { assignees: params.assignees } : {}),
+        ...(params.locked !== undefined ? { locked: params.locked } : {}),
+      }),
+    });
   }
   async getIssue(n: number): Promise<IssueResponse> {
     return this.req<IssueResponse>(this.repoPath(`issues/${n}`), { method: "GET" });
   }
-  async createComment(issueNumber: number, body: string): Promise<void> {
-    await this.req(this.repoPath(`issues/${issueNumber}/comments`), { method: "POST", body: JSON.stringify({ body }) });
+  async createComment(issueNumber: number, body: string, params?: { inReplyTo?: number }): Promise<CommentResponse> {
+    return this.req<CommentResponse>(this.repoPath(`issues/${issueNumber}/comments`), {
+      method: "POST",
+      body: JSON.stringify({
+        body,
+        ...(typeof params?.inReplyTo === "number" ? { in_reply_to: params.inReplyTo } : {}),
+      }),
+    });
   }
-  async listComments(issueNumber: number, params?: { page?: number; perPage?: number }): Promise<CommentResponse[]> {
+  async listComments(issueNumber: number, params?: {
+    page?: number;
+    perPage?: number;
+    sort?: "created" | "updated";
+    direction?: "asc" | "desc";
+    since?: string;
+    threaded?: boolean;
+  }): Promise<CommentResponse[]> {
     const q = new URLSearchParams();
     q.set("page", String(params?.page ?? 1));
     q.set("per_page", String(params?.perPage ?? 100));
+    if (params?.sort) q.set("sort", params.sort);
+    if (params?.direction) q.set("direction", params.direction);
+    if (params?.since) q.set("since", params.since);
+    if (params?.threaded) q.set("threaded", "true");
     return this.req<CommentResponse[]>(`${this.repoPath(`issues/${issueNumber}/comments`)}?${q}`, { method: "GET" });
   }
-  async listIssues(params: { labels?: string[]; state?: "open" | "closed" | "all"; page?: number; perPage?: number }): Promise<IssueResponse[]> {
+  async listIssues(params: {
+    labels?: string[];
+    state?: "open" | "closed" | "all";
+    assignee?: string;
+    creator?: string;
+    mentioned?: string;
+    sort?: "created" | "updated" | "comments";
+    direction?: "asc" | "desc";
+    since?: string;
+    page?: number;
+    perPage?: number;
+  }): Promise<IssueResponse[]> {
     const q = new URLSearchParams();
     q.set("state", params.state ?? "open"); q.set("page", String(params.page ?? 1)); q.set("per_page", String(params.perPage ?? 100));
     if (params.labels?.length) q.set("labels", params.labels.join(","));
+    if (params.assignee) q.set("assignee", params.assignee);
+    if (params.creator) q.set("creator", params.creator);
+    if (params.mentioned) q.set("mentioned", params.mentioned);
+    if (params.sort) q.set("sort", params.sort);
+    if (params.direction) q.set("direction", params.direction);
+    if (params.since) q.set("since", params.since);
     return this.req<IssueResponse[]>(`${this.repoPath("issues")}?${q}`, { method: "GET" });
   }
   async searchIssues(query: string, params?: { page?: number; perPage?: number }): Promise<IssueResponse[]> {
@@ -135,8 +238,27 @@ export class GitHubIssueClient {
       }),
     });
   }
+  async createOrgRepo(
+    org: string,
+    params: { name: string; description?: string; private?: boolean; autoInit?: boolean; hasIssues?: boolean; hasWiki?: boolean },
+  ): Promise<RepoResponse> {
+    return this.req<RepoResponse>(`orgs/${encodeURIComponent(org)}/repos`, {
+      method: "POST",
+      body: JSON.stringify({
+        name: params.name,
+        ...(params.description ? { description: params.description } : {}),
+        private: params.private ?? true,
+        auto_init: params.autoInit ?? false,
+        ...(params.hasIssues !== undefined ? { has_issues: params.hasIssues } : {}),
+        ...(params.hasWiki !== undefined ? { has_wiki: params.hasWiki } : {}),
+      }),
+    });
+  }
   async listUserOrgs(): Promise<OrgResponse[]> {
     return this.req<OrgResponse[]>("user/orgs", { method: "GET" });
+  }
+  async getCurrentUser(): Promise<CurrentUserResponse> {
+    return this.req<CurrentUserResponse>("user", { method: "GET" });
   }
   async createUserOrg(params: { login: string; name?: string; defaultRepositoryPermission?: string }): Promise<OrgResponse> {
     return this.req<OrgResponse>("user/orgs", {
@@ -303,10 +425,19 @@ export class GitHubIssueClient {
   async declineUserOrgInvitation(invitationId: number): Promise<void> {
     await this.req(`user/organization_invitations/${invitationId}`, { method: "DELETE" });
   }
-  async transferRepo(owner: string, repo: string, newOwner: string): Promise<RepoResponse> {
+  async transferRepo(owner: string, repo: string, newOwner: string, newRepoName?: string): Promise<RepoResponse> {
     return this.req<RepoResponse>(`repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/transfer`, {
       method: "POST",
-      body: JSON.stringify({ new_owner: newOwner }),
+      body: JSON.stringify({
+        new_owner: newOwner,
+        ...(newRepoName ? { new_repo_name: newRepoName } : {}),
+      }),
+    });
+  }
+  async renameRepo(owner: string, repo: string, newName: string): Promise<RepoResponse> {
+    return this.req<RepoResponse>(`repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name: newName }),
     });
   }
   async ensureLabels(labels: string[]): Promise<void> {

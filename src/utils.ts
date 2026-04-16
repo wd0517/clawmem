@@ -16,6 +16,11 @@ export function normalizeAgentId(value: string | undefined | null): string {
   return trimmed.replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64) || DEFAULT_AGENT_ID;
 }
 
+export function normalizeLoginName(value: string | undefined | null): string | undefined {
+  const trimmed = (value ?? "").trim().toLowerCase();
+  return trimmed || undefined;
+}
+
 export function buildAgentBootstrapRegistration(agentId: string): { prefixLogin: string; defaultRepoName: string } {
   const prefixLogin = normalizeAgentId(agentId)
     .replace(/_/g, "-")

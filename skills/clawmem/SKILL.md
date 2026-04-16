@@ -1,6 +1,6 @@
 ---
 name: clawmem
-description: Durable memory workflows for the ClawMem OpenClaw plugin. Use when ClawMem is installed and you need to recall prior preferences, project history, facts, decisions, lessons, workflows, active tasks, or shared/team memory; save or update durable knowledge with the ClawMem memory tools; choose the right memory repo; manage shared memory spaces, organizations, teams, collaborators, invitations, outside collaborators, or repo-access governance in the ClawMem backend; or troubleshoot ClawMem setup and manual repo-backed operations.
+description: Durable memory workflows for the ClawMem OpenClaw plugin. Use when ClawMem is installed and you need to recall prior preferences, project history, facts, decisions, lessons, workflows, active tasks, or shared memory; save or update durable knowledge with the ClawMem memory tools; choose the right memory repo; manage shared memory spaces, organizations, teams, collaborators, invitations, outside collaborators, or repo-access governance in the ClawMem backend; or troubleshoot ClawMem setup and manual repo-backed operations.
 ---
 
 # ClawMem
@@ -28,6 +28,7 @@ The ClawMem plugin automatically handles:
 - Best-effort automatic memory recall before each turn, scoped to the current agent's `defaultRepo`
 - A best-effort final issue summary/title plus durable memory capture when the session resets or ends normally
 - Mid-session memory tools: `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget`
+- Shared-workflow tools for collaboration routing, default repo retargeting, generic issues, and issue comments
 
 ## Mandatory turn loop
 
@@ -36,8 +37,7 @@ On every user turn, run this loop:
 1. Before answering, ask: could ClawMem improve this answer?
    - Default to yes for user preferences, project history, prior decisions, lessons, conventions, terminology, recurring problems, and active tasks.
    - Auto-recall may already inject useful context from the current agent's `defaultRepo`, but it is only a hint. Do not treat missing auto-recall context as proof that no relevant memory exists.
-   - If the injected context already answers the question, you do not need to immediately call `memory_recall` again.
-   - Auto-recall does not currently fan out across every accessible repo. Shared organization memory, team memory, and project memory outside the current `defaultRepo` will not be recalled automatically.
+   - Auto-recall does not currently fan out across every accessible repo. Shared organization memory and project memory outside the current `defaultRepo` will not be recalled automatically.
    - Before explicit memory work, choose the right repo. If unclear, inspect `memory_repos` and fall back to the agent's `defaultRepo`. If the likely memory lives outside the default repo, use explicit repo selection instead of relying on auto-recall.
    - Use `memory_recall` when injected context is missing, weak, cross-repo, high-stakes, or when you need an explicit retrieval trace.
    - Write `memory_recall.query` as a short natural-language intent. Do not paste long code blocks, full logs, tool chatter, or system prompt text unless the exact wording is necessary.
@@ -80,6 +80,7 @@ Bias toward saving, and use explicit retrieval whenever auto-recall is absent, w
 - When updating an existing memory, keep that node in its current language unless the user explicitly asks to rewrite it.
 - Keep schema labels and machine-oriented fields stable. Do not translate `type:*`, `kind:*`, `topic:*`, or other structural identifiers.
 - If the user is asking about collaboration, organizations, teams, invitations, collaborators, shared repo access, or why someone can or cannot access a memory repo, switch from normal memory reasoning to the collaboration workflow in `references/collaboration.md`.
+- If the user wants Team design, Team setup, or a Team workflow template, use an external ClawMem Team skill pack such as `clawmem-team-skills` instead of inventing an in-plugin workflow.
 
 ## Read the right reference
 

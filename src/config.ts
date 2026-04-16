@@ -1,7 +1,7 @@
 // Hardcoded label/prefix constants and plugin config resolution.
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import type { ClawMemAgentConfig, ClawMemPluginConfig, ClawMemResolvedRoute } from "./types.js";
-import { normalizeAgentId } from "./utils.js";
+import { normalizeAgentId, normalizeLoginName } from "./utils.js";
 
 export const SESSION_TITLE_PREFIX = "Session: ";
 export const MEMORY_TITLE_PREFIX = "Memory: ";
@@ -19,6 +19,7 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
   const raw = (api.pluginConfig ?? {}) as Record<string, unknown>;
   const str = (v: unknown) => typeof v === "string" && v.trim() ? v.trim() : undefined;
   const num = (v: unknown, d: number) => typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : d;
+  const positiveInt = (v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
   const float = (v: unknown, d: number) => typeof v === "number" && Number.isFinite(v) ? v : d;
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
   const baseUrl = (str(raw.baseUrl) ?? "https://git.clawmem.ai").replace(/\/+$/, "");
@@ -32,6 +33,7 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
     const agent = rawAgentConfig as Record<string, unknown>;
     agents[agentId] = {
       baseUrl: str(agent.baseUrl)?.replace(/\/+$/, ""),
+      login: normalizeLoginName(str(agent.login)),
       defaultRepo: normalizeRepoName(str(agent.defaultRepo) ?? str(agent.repo)),
       repo: str(agent.repo),
       token: str(agent.token),
@@ -40,6 +42,7 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
   }
   return {
     baseUrl: baseUrl.endsWith("/api/v3") ? baseUrl : `${baseUrl}/api/v3`,
+    login: normalizeLoginName(str(raw.login)),
     defaultRepo: normalizeRepoName(str(raw.defaultRepo) ?? str(raw.repo)),
     repo: normalizeRepoName(str(raw.repo)),
     token: str(raw.token),
@@ -61,6 +64,7 @@ export function resolveAgentRoute(config: ClawMemPluginConfig, agentId?: string,
   return {
     agentId: id,
     baseUrl: baseUrl.endsWith("/api/v3") ? baseUrl : `${baseUrl}/api/v3`,
+    ...(normalizeLoginName(agent.login) ?? normalizeLoginName(config.login) ? { login: normalizeLoginName(agent.login) ?? normalizeLoginName(config.login) } : {}),
     ...(defaultRepo ? { defaultRepo } : {}),
     ...(repo ? { repo } : {}),
     token: agent.token?.trim() || config.token?.trim() || undefined,

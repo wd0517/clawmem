@@ -1,6 +1,6 @@
 // Thin orchestrator: wires conversation mirroring, memory store, and plugin lifecycle.
 import type { MemoryPluginCapability, OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { hasDefaultRepo, isAgentConfigured, resolveAgentRoute, resolvePluginConfig } from "./config.js";
+import { extractLabelNames, hasDefaultRepo, isAgentConfigured, resolveAgentRoute, resolvePluginConfig } from "./config.js";
 import { filterDirectCollaborators, listRepoAccessTeams, resolveOrgInvitationRole } from "./collaboration.js";
 import { ConversationMirror } from "./conversation.js";
 import { GitHubIssueClient } from "./github-client.js";
@@ -9,8 +9,8 @@ import { MemoryStore } from "./memory.js";
 import { sanitizeRecallQueryInput } from "./recall-sanitize.js";
 import { loadState, resolveStatePath, saveState } from "./state.js";
 import { readTranscriptSnapshot } from "./transcript.js";
-import type { BootstrapIdentityResponse, ClawMemPluginConfig, ClawMemResolvedRoute, MemoryCandidate, PluginState, SessionDerivedState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
-import { buildAgentBootstrapRegistration, inferAgentIdFromTranscriptPath, normalizeAgentId, sessionScopeKey } from "./utils.js";
+import type { BootstrapIdentityResponse, ClawMemAgentConfig, ClawMemPluginConfig, ClawMemResolvedRoute, MemoryCandidate, PluginState, SessionDerivedState, SessionMirrorState, TranscriptSnapshot } from "./types.js";
+import { DEFAULT_BOOTSTRAP_REPO_NAME, buildAgentBootstrapRegistration, inferAgentIdFromTranscriptPath, normalizeAgentId, normalizeLoginName, sessionScopeKey } from "./utils.js";
 import { getOpenClawAgentIdFromEnv, getOpenClawHostVersionFromEnv } from "./runtime-env.js";
 
 type TurnPayload = { sessionId?: string; sessionKey?: string; agentId?: string; messages: unknown[] };
@@ -248,10 +248,39 @@ class ClawMemService {
             token: resolved.route.token!,
             defaultRepo: fullName,
           });
-          this.config.agents[agentId] = { ...(this.config.agents[agentId] ?? {}), defaultRepo: fullName };
           defaultNote = resolved.route.defaultRepo ? "\nSet as default repo for this agent." : "\nSet as the first default repo for this agent.";
         }
         return toolText(`Created memory repo ${fullName}.${defaultNote}`);
+      },
+    });
+
+    this.api.registerTool({
+      name: "memory_repo_set_default",
+      description: "Retarget the current agent's defaultRepo so automatic conversation and memory flows follow a new repo. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          repo: { type: "string", minLength: 3, description: "The new default repo in owner/repo form." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact config change." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["repo"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "retarget an agent defaultRepo");
+        if (blocked) return toolText(blocked);
+        const repo = typeof p.repo === "string" ? p.repo.trim() : "";
+        if (!repo) return toolText("repo is empty.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        try {
+          const fullName = await this.setAgentDefaultRepo(agentId, repo);
+          return toolText(`Set defaultRepo for agent "${agentId}" to ${fullName}.`);
+        } catch (error) {
+          return toolText(`Unable to set defaultRepo for agent "${agentId}" to ${repo}: ${String(error)}`);
+        }
       },
     });
 
@@ -520,6 +549,319 @@ class ClawMemService {
       },
     });
 
+    this.api.registerTool({
+      name: "issue_create",
+      description: "Create a generic issue in a target repo for queueing work, coordination, or shared tracking outside the structured memory schema.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          title: { type: "string", minLength: 1, description: "Issue title." },
+          body: { type: "string", description: "Optional issue body." },
+          labels: {
+            type: "array",
+            description: "Optional labels to attach to the issue.",
+            items: { type: "string", minLength: 1 },
+            minItems: 0,
+            maxItems: 50,
+          },
+          assignees: {
+            type: "array",
+            description: "Optional GitHub-style assignee usernames.",
+            items: { type: "string", minLength: 1 },
+            minItems: 0,
+            maxItems: 20,
+          },
+          state: { type: "string", enum: ["open", "closed"], description: "Optional initial issue state. Defaults to open." },
+          stateReason: { type: "string", minLength: 1, description: "Optional GitHub-compatible state_reason value." },
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["title"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const title = typeof p.title === "string" ? p.title.trim() : "";
+        if (!title) return toolText("title is empty.");
+        const body = typeof p.body === "string" ? p.body : undefined;
+        const labelsResult = normalizeOptionalStringArrayParam(p.labels, "labels");
+        if ("error" in labelsResult) return toolText(labelsResult.error);
+        const assigneesResult = normalizeOptionalStringArrayParam(p.assignees, "assignees");
+        if ("error" in assigneesResult) return toolText(assigneesResult.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireRepoClient(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const issue = await this.enqueueRepoWrite(this.repoWriteKey(resolved.route), async () => {
+            if (labelsResult.present && labelsResult.value.length > 0) await resolved.client.ensureLabels(labelsResult.value);
+            return resolved.client.createIssue({
+              title,
+              ...(body !== undefined ? { body } : {}),
+              ...(labelsResult.present ? { labels: labelsResult.value } : {}),
+              ...(assigneesResult.present ? { assignees: assigneesResult.value } : {}),
+              ...(p.state === "closed" ? { state: "closed" as const } : {}),
+              ...(typeof p.stateReason === "string" && p.stateReason.trim() ? { stateReason: p.stateReason.trim() } : {}),
+            });
+          });
+          return toolText(`Created issue in ${resolved.route.repo}.\n${renderIssueBlock(issue)}`);
+        } catch (error) {
+          return toolText(`Unable to create issue in ${resolved.route.repo}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "issue_list",
+      description: "List generic issues in a target repo with optional label and assignment filters.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          state: { type: "string", enum: ["open", "closed", "all"], description: "Which issues to list. Defaults to open." },
+          labels: {
+            type: "array",
+            description: "Optional labels; only issues matching all listed labels are returned.",
+            items: { type: "string", minLength: 1 },
+            minItems: 0,
+            maxItems: 50,
+          },
+          assignee: { type: "string", minLength: 1, description: "Optional GitHub-style assignee filter." },
+          creator: { type: "string", minLength: 1, description: "Optional creator login filter." },
+          mentioned: { type: "string", minLength: 1, description: "Optional mentioned-login filter." },
+          sort: { type: "string", enum: ["created", "updated", "comments"], description: "Optional sort key." },
+          direction: { type: "string", enum: ["asc", "desc"], description: "Optional sort direction." },
+          since: { type: "string", minLength: 1, description: "Optional ISO 8601 lower bound for updated timestamps." },
+          limit: { type: "integer", minimum: 1, maximum: 200, description: "Maximum number of issues to return." },
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const labelsResult = normalizeOptionalStringArrayParam(p.labels, "labels");
+        if ("error" in labelsResult) return toolText(labelsResult.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireRepoClient(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
+        const limit = typeof p.limit === "number" && Number.isFinite(p.limit) ? Math.max(1, Math.min(200, Math.floor(p.limit))) : 20;
+        try {
+          const issues = await resolved.client.listIssues({
+            state: p.state === "closed" || p.state === "all" ? p.state : "open",
+            ...(labelsResult.present ? { labels: labelsResult.value } : {}),
+            ...(typeof p.assignee === "string" && p.assignee.trim() ? { assignee: p.assignee.trim() } : {}),
+            ...(typeof p.creator === "string" && p.creator.trim() ? { creator: p.creator.trim() } : {}),
+            ...(typeof p.mentioned === "string" && p.mentioned.trim() ? { mentioned: p.mentioned.trim() } : {}),
+            ...(p.sort === "created" || p.sort === "updated" || p.sort === "comments" ? { sort: p.sort } : {}),
+            ...(p.direction === "asc" || p.direction === "desc" ? { direction: p.direction } : {}),
+            ...(typeof p.since === "string" && p.since.trim() ? { since: p.since.trim() } : {}),
+            perPage: limit,
+          });
+          if (issues.length === 0) return toolText(`No issues matched in ${resolved.route.repo}.`);
+          return toolText([
+            `Found ${issues.length} issue${issues.length === 1 ? "" : "s"} in ${resolved.route.repo}:`,
+            ...issues.map((issue) => `- ${renderIssueLine(issue)}`),
+          ].join("\n"));
+        } catch (error) {
+          return toolText(`Unable to list issues in ${resolved.route.repo}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "issue_get",
+      description: "Fetch one generic issue by issue number from a target repo.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          issueNumber: { type: "integer", minimum: 1, description: "Issue number." },
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["issueNumber"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const issueNumber = this.resolvePositiveInteger(p.issueNumber, "issueNumber");
+        if ("error" in issueNumber) return toolText(issueNumber.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireRepoClient(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const issue = await resolved.client.getIssue(issueNumber.value);
+          return toolText(`Repo: ${resolved.route.repo}\n${renderIssueBlock(issue)}`);
+        } catch (error) {
+          return toolText(`Unable to fetch issue #${issueNumber.value} in ${resolved.route.repo}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "issue_update",
+      description: "Update a generic issue in place, including title, body, state, labels, assignees, and lock status.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          issueNumber: { type: "integer", minimum: 1, description: "Issue number." },
+          title: { type: "string", minLength: 1, description: "Optional replacement title." },
+          body: { type: "string", description: "Optional replacement body." },
+          state: { type: "string", enum: ["open", "closed"], description: "Optional replacement state." },
+          stateReason: { type: "string", minLength: 1, description: "Optional replacement state_reason value." },
+          labels: {
+            type: "array",
+            description: "Optional full replacement label set. Pass an empty array to clear labels.",
+            items: { type: "string", minLength: 1 },
+            minItems: 0,
+            maxItems: 50,
+          },
+          assignees: {
+            type: "array",
+            description: "Optional full replacement assignee set. Pass an empty array to clear assignees.",
+            items: { type: "string", minLength: 1 },
+            minItems: 0,
+            maxItems: 20,
+          },
+          locked: { type: "boolean", description: "Optional lock toggle." },
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["issueNumber"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const issueNumber = this.resolvePositiveInteger(p.issueNumber, "issueNumber");
+        if ("error" in issueNumber) return toolText(issueNumber.error);
+        const labelsResult = normalizeOptionalStringArrayParam(p.labels, "labels");
+        if ("error" in labelsResult) return toolText(labelsResult.error);
+        const assigneesResult = normalizeOptionalStringArrayParam(p.assignees, "assignees");
+        if ("error" in assigneesResult) return toolText(assigneesResult.error);
+        const title = typeof p.title === "string" && p.title.trim() ? p.title.trim() : undefined;
+        const body = typeof p.body === "string" ? p.body : undefined;
+        const state = p.state === "open" || p.state === "closed" ? p.state : undefined;
+        const stateReason = typeof p.stateReason === "string" && p.stateReason.trim() ? p.stateReason.trim() : undefined;
+        const locked = typeof p.locked === "boolean" ? p.locked : undefined;
+        if (
+          title === undefined &&
+          body === undefined &&
+          state === undefined &&
+          stateReason === undefined &&
+          !labelsResult.present &&
+          !assigneesResult.present &&
+          locked === undefined
+        ) return toolText("Provide at least one issue field to update.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireRepoClient(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const issue = await this.enqueueRepoWrite(this.repoWriteKey(resolved.route), async () => {
+            if (labelsResult.present && labelsResult.value.length > 0) await resolved.client.ensureLabels(labelsResult.value);
+            return resolved.client.updateIssue(issueNumber.value, {
+              ...(title !== undefined ? { title } : {}),
+              ...(body !== undefined ? { body } : {}),
+              ...(state !== undefined ? { state } : {}),
+              ...(stateReason !== undefined ? { stateReason } : {}),
+              ...(labelsResult.present ? { labels: labelsResult.value } : {}),
+              ...(assigneesResult.present ? { assignees: assigneesResult.value } : {}),
+              ...(locked !== undefined ? { locked } : {}),
+            });
+          });
+          return toolText(`Updated issue in ${resolved.route.repo}.\n${renderIssueBlock(issue)}`);
+        } catch (error) {
+          return toolText(`Unable to update issue #${issueNumber.value} in ${resolved.route.repo}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "issue_comment_add",
+      description: "Add a comment to an issue so agents can post task output, status, or handoff notes.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          issueNumber: { type: "integer", minimum: 1, description: "Issue number." },
+          body: { type: "string", minLength: 1, description: "Comment body." },
+          replyToCommentId: { type: "integer", minimum: 1, description: "Optional parent comment id for a threaded reply." },
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["issueNumber", "body"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const issueNumber = this.resolvePositiveInteger(p.issueNumber, "issueNumber");
+        if ("error" in issueNumber) return toolText(issueNumber.error);
+        const body = typeof p.body === "string" ? p.body.trim() : "";
+        if (!body) return toolText("body is empty.");
+        const replyToCommentId = p.replyToCommentId === undefined ? undefined : this.resolvePositiveInteger(p.replyToCommentId, "replyToCommentId");
+        if (replyToCommentId && "error" in replyToCommentId) return toolText(replyToCommentId.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireRepoClient(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const comment = await this.enqueueRepoWrite(
+            this.repoWriteKey(resolved.route),
+            () => resolved.client.createComment(issueNumber.value, body, replyToCommentId ? { inReplyTo: replyToCommentId.value } : undefined),
+          );
+          return toolText(`Added comment to issue #${issueNumber.value} in ${resolved.route.repo}.\n${renderIssueCommentBlock(comment)}`);
+        } catch (error) {
+          return toolText(`Unable to add a comment to issue #${issueNumber.value} in ${resolved.route.repo}: ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "issue_comments_list",
+      description: "List issue comments so agents can inspect task output, the latest handoff, or completion notes.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          issueNumber: { type: "integer", minimum: 1, description: "Issue number." },
+          sort: { type: "string", enum: ["created", "updated"], description: "Optional sort key." },
+          direction: { type: "string", enum: ["asc", "desc"], description: "Optional sort direction." },
+          since: { type: "string", minLength: 1, description: "Optional ISO 8601 lower bound for updated timestamps." },
+          threaded: { type: "boolean", description: "Whether to return threaded comment order." },
+          limit: { type: "integer", minimum: 1, maximum: 200, description: "Maximum number of comments to return." },
+          repo: { type: "string", minLength: 3, description: "Optional target repo in owner/repo form. Defaults to the agent's defaultRepo." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["issueNumber"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const issueNumber = this.resolvePositiveInteger(p.issueNumber, "issueNumber");
+        if ("error" in issueNumber) return toolText(issueNumber.error);
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireRepoClient(agentId, p.repo);
+        if ("error" in resolved) return toolText(resolved.error);
+        const limit = typeof p.limit === "number" && Number.isFinite(p.limit) ? Math.max(1, Math.min(200, Math.floor(p.limit))) : 20;
+        try {
+          const comments = await resolved.client.listComments(issueNumber.value, {
+            ...(p.sort === "created" || p.sort === "updated" ? { sort: p.sort } : {}),
+            ...(p.direction === "asc" || p.direction === "desc" ? { direction: p.direction } : {}),
+            ...(typeof p.since === "string" && p.since.trim() ? { since: p.since.trim() } : {}),
+            ...(typeof p.threaded === "boolean" ? { threaded: p.threaded } : {}),
+            perPage: limit,
+          });
+          if (comments.length === 0) return toolText(`No comments were found for issue #${issueNumber.value} in ${resolved.route.repo}.`);
+          return toolText([
+            `Found ${comments.length} comment${comments.length === 1 ? "" : "s"} on issue #${issueNumber.value} in ${resolved.route.repo}:`,
+            ...comments.map((comment) => renderIssueCommentBlock(comment)),
+          ].join("\n\n"));
+        } catch (error) {
+          return toolText(`Unable to list comments for issue #${issueNumber.value} in ${resolved.route.repo}: ${String(error)}`);
+        }
+      },
+    });
+
     this.registerCollaborationTools();
   }
 
@@ -593,6 +935,53 @@ class ClawMemService {
           return toolText(`Created organization ${renderOrgLine(created)}.`);
         } catch (error) {
           return toolText(`Unable to create organization "${login}": ${String(error)}`);
+        }
+      },
+    });
+
+    this.api.registerTool({
+      name: "collaboration_org_repo_create",
+      description: "Create a new org-owned repo so shared memory or other collaboration artifacts can live under organization governance. Requires confirmed=true after explicit user approval.",
+      required: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          org: { type: "string", minLength: 1, description: "Organization login." },
+          name: { type: "string", minLength: 1, description: "Repository name without owner prefix." },
+          description: { type: "string", minLength: 1, description: "Optional repo description." },
+          private: { type: "boolean", description: "Whether the repo should be private. Defaults to true." },
+          autoInit: { type: "boolean", description: "Whether to auto-initialize the repo. Defaults to false." },
+          hasIssues: { type: "boolean", description: "Whether issues should be enabled. Defaults to true." },
+          hasWiki: { type: "boolean", description: "Whether wiki should be enabled. Defaults to true." },
+          confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
+          agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
+        },
+        required: ["org", "name"],
+      },
+      execute: async (_id: string, params: unknown) => {
+        const p = asRecord(params);
+        const blocked = this.requireMutationConfirmation(p, "create an organization repo");
+        if (blocked) return toolText(blocked);
+        const org = typeof p.org === "string" ? p.org.trim() : "";
+        const name = typeof p.name === "string" ? p.name.trim() : "";
+        if (!org || !name) return toolText("org and name are required.");
+        const agentId = this.resolveToolAgentId(p.agentId);
+        const resolved = await this.requireToolIdentity(agentId);
+        if ("error" in resolved) return toolText(resolved.error);
+        try {
+          const repo = await resolved.client.createOrgRepo(org, {
+            name,
+            ...(typeof p.description === "string" && p.description.trim() ? { description: p.description.trim() } : {}),
+            ...(typeof p.private === "boolean" ? { private: p.private } : {}),
+            ...(typeof p.autoInit === "boolean" ? { autoInit: p.autoInit } : {}),
+            ...(typeof p.hasIssues === "boolean" ? { hasIssues: p.hasIssues } : {}),
+            ...(typeof p.hasWiki === "boolean" ? { hasWiki: p.hasWiki } : {}),
+          });
+          const fullName = repo.full_name?.trim() || `${org}/${name}`;
+          return toolText(`Created org repo ${fullName}.`);
+        } catch (error) {
+          return toolText(`Unable to create repo "${org}/${name}": ${String(error)}`);
         }
       },
     });
@@ -969,12 +1358,13 @@ class ClawMemService {
         properties: {
           org: { type: "string", minLength: 1, description: "Organization login." },
           teamSlug: { type: "string", minLength: 1, description: "Team slug." },
-          username: { type: "string", minLength: 1, description: "Username to add or update." },
+          username: { type: "string", minLength: 1, description: "Optional backend login to add or update." },
+          memberAgentId: { type: "string", minLength: 1, description: "Optional OpenClaw agent id to resolve into the target backend login." },
           role: { type: "string", enum: ["member", "maintainer"], description: "Membership role. Defaults to member." },
           confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
           agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
         },
-        required: ["org", "teamSlug", "username"],
+        required: ["org", "teamSlug"],
       },
       execute: async (_id: string, params: unknown) => {
         const p = asRecord(params);
@@ -983,16 +1373,19 @@ class ClawMemService {
         const org = typeof p.org === "string" ? p.org.trim() : "";
         const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
         const username = typeof p.username === "string" ? p.username.trim() : "";
-        if (!org || !teamSlug || !username) return toolText("org, teamSlug, and username are required.");
+        const memberAgentId = typeof p.memberAgentId === "string" ? p.memberAgentId.trim() : "";
+        if (!org || !teamSlug) return toolText("org and teamSlug are required.");
         const role: CollaborationTeamRole = p.role === "maintainer" ? "maintainer" : "member";
         const agentId = this.resolveToolAgentId(p.agentId);
         const resolved = await this.requireToolIdentity(agentId);
         if ("error" in resolved) return toolText(resolved.error);
+        const memberLogin = username || await this.resolveAgentLoginReference(memberAgentId);
+        if (!memberLogin) return toolText("username or memberAgentId is required.");
         try {
-          const membership = await resolved.client.setTeamMembership(org, teamSlug, username, role);
-          return toolText(`Set ${username} in ${org}/${teamSlug} to role=${membership.role || role}, state=${membership.state || "active"}.`);
+          const membership = await resolved.client.setTeamMembership(org, teamSlug, memberLogin, role);
+          return toolText(`Set ${memberLogin} in ${org}/${teamSlug} to role=${membership.role || role}, state=${membership.state || "active"}.`);
         } catch (error) {
-          return toolText(`Unable to set membership for ${username} in ${org}/${teamSlug}: ${String(error)}`);
+          return toolText(`Unable to set membership for ${memberLogin} in ${org}/${teamSlug}: ${String(error)}`);
         }
       },
     });
@@ -1007,11 +1400,12 @@ class ClawMemService {
         properties: {
           org: { type: "string", minLength: 1, description: "Organization login." },
           teamSlug: { type: "string", minLength: 1, description: "Team slug." },
-          username: { type: "string", minLength: 1, description: "Username to remove." },
+          username: { type: "string", minLength: 1, description: "Optional backend login to remove." },
+          memberAgentId: { type: "string", minLength: 1, description: "Optional OpenClaw agent id to resolve into the target backend login." },
           confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
           agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
         },
-        required: ["org", "teamSlug", "username"],
+        required: ["org", "teamSlug"],
       },
       execute: async (_id: string, params: unknown) => {
         const p = asRecord(params);
@@ -1020,15 +1414,18 @@ class ClawMemService {
         const org = typeof p.org === "string" ? p.org.trim() : "";
         const teamSlug = typeof p.teamSlug === "string" ? p.teamSlug.trim() : "";
         const username = typeof p.username === "string" ? p.username.trim() : "";
-        if (!org || !teamSlug || !username) return toolText("org, teamSlug, and username are required.");
+        const memberAgentId = typeof p.memberAgentId === "string" ? p.memberAgentId.trim() : "";
+        if (!org || !teamSlug) return toolText("org and teamSlug are required.");
         const agentId = this.resolveToolAgentId(p.agentId);
         const resolved = await this.requireToolIdentity(agentId);
         if ("error" in resolved) return toolText(resolved.error);
+        const memberLogin = username || await this.resolveAgentLoginReference(memberAgentId);
+        if (!memberLogin) return toolText("username or memberAgentId is required.");
         try {
-          await resolved.client.removeTeamMembership(org, teamSlug, username);
-          return toolText(`Removed ${username} from ${org}/${teamSlug}.`);
+          await resolved.client.removeTeamMembership(org, teamSlug, memberLogin);
+          return toolText(`Removed ${memberLogin} from ${org}/${teamSlug}.`);
         } catch (error) {
-          return toolText(`Unable to remove ${username} from ${org}/${teamSlug}: ${String(error)}`);
+          return toolText(`Unable to remove ${memberLogin} from ${org}/${teamSlug}: ${String(error)}`);
         }
       },
     });
@@ -1151,6 +1548,7 @@ class ClawMemService {
         properties: {
           repo: { type: "string", minLength: 3, description: "Optional source repo in owner/repo form. Defaults to the agent's defaultRepo." },
           newOwner: { type: "string", minLength: 1, description: "Destination owner login, often an organization login." },
+          newName: { type: "string", minLength: 1, description: "Optional destination repo name. Defaults to the current repo name, except personal `memory` repos are auto-renamed to the agent login when available." },
           confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
           agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
         },
@@ -1161,14 +1559,48 @@ class ClawMemService {
         const blocked = this.requireMutationConfirmation(p, "transfer a repository");
         if (blocked) return toolText(blocked);
         const newOwner = typeof p.newOwner === "string" ? p.newOwner.trim() : "";
+        const requestedNewName = typeof p.newName === "string" && p.newName.trim() ? p.newName.trim() : undefined;
         if (!newOwner) return toolText("newOwner is empty.");
         const agentId = this.resolveToolAgentId(p.agentId);
         const target = await this.requireCollaborationRepo(agentId, p.repo);
         if ("error" in target) return toolText(target.error);
+        const login = await this.ensureAgentLoginConfigured(agentId);
+        const autoRename = !requestedNewName && target.repo === DEFAULT_BOOTSTRAP_REPO_NAME && login ? login : undefined;
+        const desiredRepoName = requestedNewName ?? autoRename ?? target.repo;
         try {
-          const transferred = await target.client.transferRepo(target.owner, target.repo, newOwner);
-          const nextFullName = repoSummaryFullName(transferred) || `${newOwner}/${target.repo}`;
-          return toolText(`Transferred ${target.fullName} to ${nextFullName}. If this repo was your configured defaultRepo, retarget future memory operations to ${nextFullName} explicitly until config is updated.`);
+          if (desiredRepoName !== target.repo) {
+            try {
+              await target.client.getRepo(newOwner, desiredRepoName);
+              return toolText(`Unable to transfer ${target.fullName} to ${newOwner}: destination repo ${newOwner}/${desiredRepoName} already exists.`);
+            } catch (error) {
+              if (!isHttpStatusError(error, 404)) {
+                return toolText(`Unable to verify destination repo ${newOwner}/${desiredRepoName}: ${String(error)}`);
+              }
+            }
+          }
+
+          let transferred = await target.client.transferRepo(
+            target.owner,
+            target.repo,
+            newOwner,
+            desiredRepoName !== target.repo ? desiredRepoName : undefined,
+          );
+          let nextFullName = repoSummaryFullName(transferred) || `${newOwner}/${desiredRepoName}`;
+          if (desiredRepoName !== target.repo && nextFullName !== `${newOwner}/${desiredRepoName}`) {
+            const currentRepoName = repoSummaryName(transferred) || target.repo;
+            transferred = await target.client.renameRepo(newOwner, currentRepoName, desiredRepoName);
+            nextFullName = repoSummaryFullName(transferred) || `${newOwner}/${desiredRepoName}`;
+          }
+
+          if (target.route.defaultRepo === target.fullName) {
+            try {
+              await this.setAgentDefaultRepo(agentId, nextFullName);
+              return toolText(`Transferred ${target.fullName} to ${nextFullName} and retargeted agent "${agentId}" defaultRepo to ${nextFullName}.`);
+            } catch (retargetError) {
+              return toolText(`Transferred ${target.fullName} to ${nextFullName}, but failed to retarget agent "${agentId}" defaultRepo: ${String(retargetError)}`);
+            }
+          }
+          return toolText(`Transferred ${target.fullName} to ${nextFullName}.`);
         } catch (error) {
           return toolText(`Unable to transfer ${target.fullName} to ${newOwner}: ${String(error)}`);
         }
@@ -1454,7 +1886,8 @@ class ClawMemService {
         additionalProperties: false,
         properties: {
           org: { type: "string", minLength: 1, description: "Organization login." },
-          inviteeLogin: { type: "string", minLength: 1, description: "Username to invite." },
+          inviteeLogin: { type: "string", minLength: 1, description: "Optional backend login to invite." },
+          inviteeAgentId: { type: "string", minLength: 1, description: "Optional OpenClaw agent id to resolve into the target backend login." },
           role: { type: "string", enum: ["member", "owner"], description: "Org role for the invitation. Defaults to member." },
           teamIds: {
             type: "array",
@@ -1467,7 +1900,7 @@ class ClawMemService {
           confirmed: { type: "boolean", description: "Must be true after the user approves the exact write action." },
           agentId: { type: "string", minLength: 1, description: "Optional agent identity override. Defaults to the current agent when available." },
         },
-        required: ["org", "inviteeLogin"],
+        required: ["org"],
       },
       execute: async (_id: string, params: unknown) => {
         const p = asRecord(params);
@@ -1475,7 +1908,8 @@ class ClawMemService {
         if (blocked) return toolText(blocked);
         const org = typeof p.org === "string" ? p.org.trim() : "";
         const inviteeLogin = typeof p.inviteeLogin === "string" ? p.inviteeLogin.trim() : "";
-        if (!org || !inviteeLogin) return toolText("org and inviteeLogin are required.");
+        const inviteeAgentId = typeof p.inviteeAgentId === "string" ? p.inviteeAgentId.trim() : "";
+        if (!org) return toolText("org is required.");
         const role = resolveOrgInvitationRole(p.role, "member");
         if ("error" in role) return toolText(role.error);
         const teamIds = Array.isArray(p.teamIds)
@@ -1486,16 +1920,18 @@ class ClawMemService {
         const agentId = this.resolveToolAgentId(p.agentId);
         const resolved = await this.requireToolIdentity(agentId);
         if ("error" in resolved) return toolText(resolved.error);
+        const targetLogin = inviteeLogin || await this.resolveAgentLoginReference(inviteeAgentId);
+        if (!targetLogin) return toolText("inviteeLogin or inviteeAgentId is required.");
         try {
           const invitation = await resolved.client.createOrgInvitation(org, {
-            inviteeLogin,
+            inviteeLogin: targetLogin,
             role: role.role,
             ...(teamIds && teamIds.length > 0 ? { teamIds } : {}),
             ...(expiresInDays ? { expiresInDays } : {}),
           });
           return toolText(`Created invitation in "${org}": ${renderInvitationLine(invitation)}.`);
         } catch (error) {
-          return toolText(`Unable to create invitation for ${inviteeLogin} in org "${org}": ${String(error)}`);
+          return toolText(`Unable to create invitation for ${targetLogin} in org "${org}": ${String(error)}`);
         }
       },
     });
@@ -1811,7 +2247,7 @@ class ClawMemService {
   }
 
   private async handleBeforePromptBuild(event: unknown, agentId?: string): Promise<PromptBuildInjection | void> {
-    const context = await this.collectAutoRecallContext(event, agentId);
+    const context = await this.collectDynamicPromptContext(event, agentId);
     const systemContext = this.injectPromptGuidanceViaSystemContext ? buildFallbackPromptGuidanceText(event) : undefined;
     // Auto-recall is per-turn dynamic context, so keep it out of the system prompt.
     // OpenClaw documents dynamic context on `prependContext`: https://github.com/maweibin/openclaw/blob/d9a2869ad69db9449336a2e2846bd9de0e647ac6/docs/concepts/agent-loop.md?plain=1#L85
@@ -1824,7 +2260,7 @@ class ClawMemService {
   }
 
   private async handleBeforeAgentStart(event: unknown, agentId?: string): Promise<{ prependContext: string } | void> {
-    const context = await this.collectAutoRecallContext(event, agentId);
+    const context = await this.collectDynamicPromptContext(event, agentId);
     return context ? { prependContext: context } : undefined;
   }
 
@@ -1836,6 +2272,10 @@ class ClawMemService {
   private async handleFinalize(payload: FinalizePayload): Promise<void> {
     if (!payload.sessionId) return;
     await this.enqueueSessionIo(sessionScopeKey(payload.sessionId, payload.agentId), () => this.finalize(payload));
+  }
+
+  private async collectDynamicPromptContext(event: unknown, agentId?: string): Promise<string | undefined> {
+    return this.collectAutoRecallContext(event, agentId);
   }
 
   private async collectAutoRecallContext(event: unknown, agentId?: string): Promise<string | undefined> {
@@ -2162,6 +2602,23 @@ class ClawMemService {
     if (!(await this.ensureIdentityConfigured(id))) return false;
     return hasDefaultRepo(resolveAgentRoute(this.config, id));
   }
+  private async ensureAgentLoginConfigured(agentId?: string): Promise<string | undefined> {
+    const id = normalizeAgentId(agentId);
+    if (!(await this.ensureIdentityConfigured(id))) return undefined;
+    const route = resolveAgentRoute(this.config, id);
+    if (route.login) return route.login;
+    try {
+      const client = new GitHubIssueClient(route, this.api.logger);
+      const user = await client.getCurrentUser();
+      const login = normalizeLoginName(user.login);
+      if (!login) return undefined;
+      await this.persistAgentLogin(id, login);
+      return login;
+    } catch (error) {
+      this.api.logger.warn?.(`clawmem: unable to resolve backend login for agent ${id}: ${String(error)}`);
+      return undefined;
+    }
+  }
   private async bootstrap(agentId: string): Promise<boolean> {
     const route = resolveAgentRoute(this.config, agentId);
     if (!route.baseUrl) { this.api.logger.warn(`clawmem: cannot provision Git credentials for ${agentId} without a baseUrl`); return false; }
@@ -2173,25 +2630,19 @@ class ClawMemService {
         authScheme: "token",
         token: bootstrap.identity.token,
         defaultRepo: bootstrap.identity.repo_full_name,
+        ...(bootstrap.login ? { login: bootstrap.login } : {}),
       });
-      this.config.agents[agentId] = {
-        ...(this.config.agents[agentId] ?? {}),
-        baseUrl: route.baseUrl,
-        authScheme: "token",
-        token: bootstrap.identity.token,
-        defaultRepo: bootstrap.identity.repo_full_name,
-      };
       this.api.logger.info?.(
         `clawmem: provisioned Git credentials for agent ${agentId} with default repo ${bootstrap.identity.repo_full_name} via ${route.baseUrl} (${bootstrap.method})`,
       );
       return true;
     } catch (error) { this.api.logger.warn(`clawmem: failed to provision Git credentials for agent ${agentId} via ${route.baseUrl}: ${String(error)}`); return false; }
   }
-  private async provisionAgentIdentity(client: GitHubIssueClient, agentId: string): Promise<{ identity: BootstrapIdentityResponse; method: string }> {
+  private async provisionAgentIdentity(client: GitHubIssueClient, agentId: string): Promise<{ identity: BootstrapIdentityResponse; method: string; login?: string }> {
     const registration = buildAgentBootstrapRegistration(agentId);
     try {
       const identity = await client.registerAgent(registration.prefixLogin, registration.defaultRepoName);
-      return { identity, method: "/api/v3/agents" };
+      return { identity, method: "/api/v3/agents", login: normalizeLoginName(identity.login) };
     } catch (error) {
       if (!shouldFallbackToAnonymousBootstrap(error)) throw error;
       this.api.logger.warn?.(`clawmem: /api/v3/agents is unavailable for agent ${agentId}; falling back to deprecated anonymous bootstrap`);
@@ -2199,7 +2650,7 @@ class ClawMemService {
 
     const locale = Intl?.DateTimeFormat?.()?.resolvedOptions?.()?.locale ?? "";
     const identity = await client.createAnonymousSession(locale);
-    return { identity, method: "/api/v3/anonymous/session" };
+    return { identity, method: "/api/v3/anonymous/session", login: normalizeLoginName(identity.owner_login) };
   }
   private warnIfInactiveMemorySlot(): void {
     try {
@@ -2222,7 +2673,7 @@ class ClawMemService {
       this.api.logger.warn(`clawmem: memory slot check failed: ${String(error)}`);
     }
   }
-  private async persistAgentConfig(agentId: string, values: { baseUrl: string; authScheme: "token" | "bearer"; token: string; defaultRepo: string }): Promise<void> {
+  private async persistAgentConfig(agentId: string, values: { baseUrl: string; authScheme: "token" | "bearer"; token: string; defaultRepo: string; login?: string }): Promise<void> {
     const root = this.api.runtime.config.loadConfig();
     const plugins = root.plugins;
     const entries = plugins?.entries && typeof plugins.entries === "object" && !Array.isArray(plugins.entries) ? (plugins.entries as Record<string, unknown>) : {};
@@ -2248,6 +2699,46 @@ class ClawMemService {
         },
       },
     });
+    this.applyAgentConfig(agentId, values);
+  }
+  private async persistAgentLogin(agentId: string, login: string): Promise<void> {
+    const root = this.api.runtime.config.loadConfig();
+    const plugins = root.plugins;
+    const entries = plugins?.entries && typeof plugins.entries === "object" && !Array.isArray(plugins.entries) ? (plugins.entries as Record<string, unknown>) : {};
+    const ex = asRecord(entries[this.api.id]), exCfg = asRecord(ex.config);
+    const agents = exCfg.agents && typeof exCfg.agents === "object" && !Array.isArray(exCfg.agents) ? (exCfg.agents as Record<string, unknown>) : {};
+    const existingAgent = asRecord(agents[agentId]);
+    await this.api.runtime.config.writeConfigFile({
+      ...root,
+      plugins: {
+        ...(plugins ?? {}),
+        entries: {
+          ...entries,
+          [this.api.id]: {
+            ...ex,
+            config: {
+              ...exCfg,
+              agents: {
+                ...agents,
+                [agentId]: { ...existingAgent, login },
+              },
+            },
+          },
+        },
+      },
+    });
+    this.applyAgentConfig(agentId, { login });
+  }
+  private applyAgentConfig(agentId: string, values: Partial<ClawMemAgentConfig>): void {
+    this.config.agents[agentId] = {
+      ...(this.config.agents[agentId] ?? {}),
+      ...values,
+    };
+  }
+  private clearAgentConfigFields(agentId: string, keys: Array<keyof ClawMemAgentConfig>): void {
+    const next = { ...(this.config.agents[agentId] ?? {}) };
+    for (const key of keys) delete next[key];
+    this.config.agents[agentId] = next;
   }
   private getServices(agentId?: string, repo?: string): { route: ClawMemResolvedRoute; conv: ConversationMirror; mem: MemoryStore; client: GitHubIssueClient } {
     const route = resolveAgentRoute(this.config, agentId, repo);
@@ -2258,6 +2749,26 @@ class ClawMemService {
       conv: new ConversationMirror(client, this.api, this.config),
       mem: new MemoryStore(client),
     };
+  }
+  private async setAgentDefaultRepo(agentId: string, repo: string): Promise<string> {
+    const parsed = this.resolveToolRepo(repo);
+    if (parsed.error || !parsed.repo) throw new Error(parsed.error ?? "repo is empty.");
+    const resolved = await this.requireToolIdentity(agentId);
+    if ("error" in resolved) throw new Error(resolved.error);
+    const [owner, repoName] = parsed.repo.split("/");
+    if (!owner || !repoName) throw new Error(`Invalid repo "${parsed.repo}". Expected owner/repo.`);
+    await resolved.client.getRepo(owner, repoName);
+    await this.persistAgentConfig(agentId, {
+      baseUrl: resolved.route.baseUrl,
+      authScheme: resolved.route.authScheme,
+      token: resolved.route.token!,
+      defaultRepo: parsed.repo,
+    });
+    return parsed.repo;
+  }
+  private async resolveAgentLoginReference(agentId: string | undefined): Promise<string | undefined> {
+    if (!agentId) return undefined;
+    return this.ensureAgentLoginConfigured(agentId);
   }
   private resolveToolAgentId(agentId: unknown): string {
     return normalizeAgentId(typeof agentId === "string" && agentId.trim() ? agentId : getOpenClawAgentIdFromEnv());
@@ -2289,6 +2800,20 @@ class ClawMemService {
       };
     }
     return services;
+  }
+  private async requireRepoClient(agentId: string, repo: unknown): Promise<{ route: ClawMemResolvedRoute; client: GitHubIssueClient } | { error: string }> {
+    const parsed = this.resolveToolRepo(repo);
+    if (parsed.error) return { error: parsed.error };
+    if (!(await this.ensureIdentityConfigured(agentId))) {
+      return { error: `ClawMem identity for agent "${agentId}" is not configured.` };
+    }
+    const { route, client } = this.getServices(agentId, parsed.repo);
+    if (!route.repo) {
+      return {
+        error: `No target repo selected for agent "${agentId}". Provide repo explicitly or configure agents.${agentId}.defaultRepo.`,
+      };
+    }
+    return { route, client };
   }
   private async requireCollaborationRepo(
     agentId: string,
@@ -2344,6 +2869,16 @@ class ClawMemService {
 }
 
 function asRecord(v: unknown): Record<string, unknown> { return v && typeof v === "object" ? (v as Record<string, unknown>) : {}; }
+function normalizeOptionalStringArrayParam(
+  value: unknown,
+  field: string,
+): { present: false } | { present: true; value: string[] } | { error: string } {
+  if (value === undefined) return { present: false };
+  if (!Array.isArray(value)) return { error: `${field} must be an array of non-empty strings.` };
+  const normalized = value.map((entry) => typeof entry === "string" ? entry.trim() : "").filter(Boolean);
+  if (normalized.length !== value.length) return { error: `${field} must contain only non-empty strings.` };
+  return { present: true, value: [...new Set(normalized)] };
+}
 function shouldFallbackToAnonymousBootstrap(error: unknown): boolean {
   const msg = String(error);
   return /^Error:\s*HTTP (404|405|501):/i.test(msg) || /^HTTP (404|405|501):/i.test(msg);
@@ -2386,6 +2921,78 @@ function renderMemoryBlock(memory: {
     `Detail: ${memory.detail}`,
   ];
   return lines.join("\n");
+}
+
+function renderIssueLine(issue: {
+  number?: number;
+  title?: string;
+  state?: string;
+  labels?: Array<{ name?: string } | string>;
+  assignees?: Array<{ login?: string; name?: string }>;
+  comments?: number;
+}): string {
+  const labels = extractLabelNames(issue.labels);
+  const assignees = issue.assignees?.map((entry) => entry.login?.trim() || entry.name?.trim() || "").filter(Boolean) ?? [];
+  const suffix = [
+    labels.length > 0 ? `labels: ${labels.join(", ")}` : "",
+    assignees.length > 0 ? `assignees: ${assignees.join(", ")}` : "",
+    typeof issue.comments === "number" ? `comments: ${issue.comments}` : "",
+  ].filter(Boolean).join(" | ");
+  return `#${issue.number ?? "?"} [${issue.state || "unknown"}] ${issue.title?.trim() || "Untitled issue"}${suffix ? ` (${suffix})` : ""}`;
+}
+
+function renderIssueBlock(issue: {
+  number?: number;
+  title?: string;
+  body?: string;
+  state?: string;
+  state_reason?: string | null;
+  labels?: Array<{ name?: string } | string>;
+  assignees?: Array<{ login?: string; name?: string }>;
+  user?: { login?: string; name?: string };
+  comments?: number;
+  created_at?: string;
+  updated_at?: string;
+  closed_at?: string | null;
+  html_url?: string;
+}): string {
+  const labels = extractLabelNames(issue.labels);
+  const assignees = issue.assignees?.map((entry) => entry.login?.trim() || entry.name?.trim() || "").filter(Boolean) ?? [];
+  return [
+    `Issue Number: ${issue.number ?? "?"}`,
+    `State: ${issue.state || "unknown"}`,
+    `Title: ${issue.title?.trim() || "Untitled issue"}`,
+    ...(issue.state_reason ? [`State Reason: ${issue.state_reason}`] : []),
+    ...(issue.user?.login?.trim() ? [`Author: ${issue.user.login.trim()}`] : []),
+    ...(labels.length > 0 ? [`Labels: ${labels.join(", ")}`] : []),
+    ...(assignees.length > 0 ? [`Assignees: ${assignees.join(", ")}`] : []),
+    ...(typeof issue.comments === "number" ? [`Comments: ${issue.comments}`] : []),
+    ...(issue.created_at ? [`Created At: ${issue.created_at}`] : []),
+    ...(issue.updated_at ? [`Updated At: ${issue.updated_at}`] : []),
+    ...(issue.closed_at ? [`Closed At: ${issue.closed_at}`] : []),
+    ...(issue.html_url ? [`URL: ${issue.html_url}`] : []),
+    `Body: ${(issue.body ?? "").trim() || "(empty)"}`,
+  ].join("\n");
+}
+
+function renderIssueCommentBlock(comment: {
+  id?: number;
+  body?: string;
+  created_at?: string;
+  updated_at?: string;
+  user?: { login?: string; name?: string };
+  in_reply_to_id?: number | null;
+  html_url?: string;
+}): string {
+  return [
+    `Comment ID: ${comment.id ?? "?"}`,
+    ...(comment.user?.login?.trim() ? [`Author: ${comment.user.login.trim()}`] : []),
+    ...(typeof comment.in_reply_to_id === "number" ? [`In Reply To: ${comment.in_reply_to_id}`] : []),
+    ...(comment.created_at ? [`Created At: ${comment.created_at}`] : []),
+    ...(comment.updated_at ? [`Updated At: ${comment.updated_at}`] : []),
+    ...(comment.html_url ? [`URL: ${comment.html_url}`] : []),
+    `Body: ${(comment.body ?? "").trim() || "(empty)"}`,
+  ].join("\n");
 }
 
 export function buildAutoRecallContext(memories: Array<{
@@ -2432,6 +3039,7 @@ export function buildClawMemPromptSection(params: MemoryPromptBuilderParams): st
       ? `- Reuse existing \`kind\` and \`topic\` labels by checking ${joinNaturalLanguageList(schemaTools)} first. If no current label fits, create one short stable machine-readable label instead of a translated or near-duplicate variant.`
       : "- Reuse existing `kind` and `topic` labels before inventing new ones. If no current label fits, create one short stable machine-readable label instead of a translated or near-duplicate variant."}`,
     "- Use the bundled `clawmem` skill for detailed routing, schema, collaboration, communication, and manual repo-backed workflows.",
+    "- ClawMem plugin provides memory plus atomic collaboration tools only. Team design, Team bootstrap, and Team workflow templates belong in an external ClawMem Team skill pack.",
     "",
   ];
 
@@ -2676,6 +3284,11 @@ function renderTeamLine(team: { slug?: string; name?: string; description?: stri
   const permissionText = permission !== "unknown" ? ` [perm:${permission}]` : "";
   const description = team.description?.trim() ? ` - ${team.description.trim()}` : "";
   return `${slug}${name}${privacy}${permissionText}${description}`;
+}
+
+function repoSummaryName(repo?: { name?: string }): string | undefined {
+  const name = repo?.name?.trim();
+  return name || undefined;
 }
 
 function repoSummaryFullName(repo?: { full_name?: string; owner?: { login?: string }; name?: string }): string | undefined {

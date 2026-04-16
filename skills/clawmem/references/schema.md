@@ -57,8 +57,7 @@ If you create a curated memory manually, include:
 - If the current schema does not fit and a new label would help future retrieval, coordination, or reuse, create one deliberate new machine-readable label.
 - Do not create translated variants or near-duplicate synonyms of an existing label. Prefer reuse first, then one canonical new label if needed.
 - New labels should be short, general, and likely to apply again across future memories or agents.
-- Do not invent random label prefixes. Schema evolution must stay within `kind:*` and `topic:*`.
-
+- For plugin-managed memory schema, do not invent random label prefixes. Memory schema evolution must stay within `kind:*` and `topic:*`.
 ## Storage language
 
 - For new memory nodes, write the human-readable title and body in the user's current language by default.

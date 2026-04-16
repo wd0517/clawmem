@@ -7,6 +7,8 @@
 - On session start: searches active memories by relevance and injects them into context.
 - On session reset/end: best-effort writes a final conversation summary/title and stores durable memory candidates as `type:memory` issues.
 - Lets agents inspect memory indexes and schema, fetch exact memories, update canonical facts in place, and write structured memories with `kind:*` and `topic:*` labels through plugin tools.
+- Adds atomic collaboration tools for organizations, repos, teams, invitations, access, issues, and comments.
+- Does not ship any built-in Team workflow or Team template.
 
 ---
 
@@ -20,16 +22,28 @@ openclaw config validate
 openclaw gateway restart
 ```
 
-After restart, confirm OpenClaw shows ClawMem as the active memory plugin. On first use, clawmem bootstraps each agent identity by calling `POST /api/v3/agents` on `git.clawmem.ai`, then writes the returned `token` plus `repo_full_name` back into your config under `plugins.entries.clawmem.config.agents.<agentId>` as that agent's `defaultRepo`. Automatic flows use that `defaultRepo`, while explicit memory tool calls may target other repos. When talking to an older backend that does not expose `POST /api/v3/agents`, the plugin falls back to the deprecated anonymous bootstrap path.
+After restart, confirm OpenClaw shows ClawMem as the active memory plugin. On first use, clawmem bootstraps each agent identity by calling `POST /api/v3/agents` on `git.clawmem.ai`, then writes the returned `token`, backend `login`, and `repo_full_name` back into your config under `plugins.entries.clawmem.config.agents.<agentId>` as that agent's `defaultRepo`. Automatic flows use that `defaultRepo`, while explicit memory tool calls may target other repos. When talking to an older backend that does not expose `POST /api/v3/agents`, the plugin falls back to the deprecated anonymous bootstrap path.
 
-The package now also ships a bundled `clawmem` skill for runtime memory behavior:
+ClawMem installs only the core memory plugin and its core runtime skill. If you want Team setup or Team workflow templates, install an external ClawMem Team skill pack such as `clawmem-team-skills`.
+
+Earlier ClawMem versions bundled Team workflow guidance. That guidance has moved to an external ClawMem Team skill repository such as `clawmem-team-skills`. If you are upgrading from an older setup, install the external Team skill pack before following any Team-related docs.
+
+The package ships a bundled `clawmem` skill for core runtime memory behavior:
 - core recall and save loop
 - post-install repair and verification guidance
 - mental model, user-facing communication, and console-link guidance
 - schema and manual-ops references
-- collaboration routing for shared repos
+- collaboration routing for shared repos and access primitives
 
 The website `SKILL.md` should stay bootstrap-focused. Once the plugin is installed, rely on the bundled plugin skill for day-to-day memory behavior.
+
+## Optional Team Skills
+
+ClawMem plugin = memory + atomic collaboration capability.
+
+external ClawMem Team skill pack = Team design + Team bootstrap + Team templates.
+
+If you want a Team, install that repository separately and use one of its entry skills. The plugin package is not the source of truth for Team workflows.
 
 ---
 
@@ -60,12 +74,13 @@ ClawMem is OpenClaw's durable memory system.
 - Durable facts, preferences, decisions, workflows, and active-task state belong in ClawMem memory issues.
 - Files remain for tools or humans to read directly.
 - Memory routing is per agent identity: `plugins.entries.clawmem.config.agents.<agentId>.defaultRepo` is the default space, and explicit tool calls may target other repos.
-- Shared or team memory should live in a shared repo, not in one agent's private default repo.
+- Shared memory can live in shared repos instead of one agent's private default repo.
+- How multiple agents organize around those repos is defined by external skills, not by the plugin.
 - Use plugin tools first. Raw `gh` or `curl` are fallback tools for explicit repo operations, backend debugging, or tool outages.
 
 ## Bundled Skill And Docs
 
-The plugin package is now the runtime source of truth:
+The plugin package is the runtime source of truth for ClawMem core behavior:
 
 - Bundled runtime skill: [`skills/clawmem/SKILL.md`](skills/clawmem/SKILL.md)
 - Runtime references: [`skills/clawmem/references/`](skills/clawmem/references/)
@@ -74,9 +89,11 @@ The plugin package is now the runtime source of truth:
 That bundled skill covers:
 - recall and save behavior
 - schema discipline and deliberate self-evolution
-- shared-memory and collaboration routing
+- shared-memory and collaboration primitives
 - repair and verification guidance
 - raw `gh` / `curl` fallback flows
+
+Team setup guides, Team workflow guides, and Team templates live in an external ClawMem Team skill pack such as `clawmem-team-skills`.
 
 If your environment still relies on file-injected reminders such as `SOUL.md`, `AGENTS.md`, or `TOOLS.md`, treat them as optional compatibility snippets rather than the primary runtime source of truth.
 
@@ -98,6 +115,7 @@ Minimal config (after auto-provisioning):
           agents: {
             main: {
               baseUrl: "https://git.clawmem.ai/api/v3",
+              login: "main-b54ea6",
               defaultRepo: "owner/main-memory",
               token: "<token>",
               authScheme: "token"
@@ -126,11 +144,13 @@ Full config with all options:
           agents: {
             main: {
               baseUrl: "https://git.clawmem.ai/api/v3",
+              login: "main-b54ea6",
               defaultRepo: "owner/main-memory",
               token: "<token>",
               authScheme: "token"
             },
             coder: {
+              login: "hazel-e23778",
               defaultRepo: "owner/coder-memory",
               token: "<token>"
             }
@@ -146,8 +166,6 @@ Full config with all options:
 }
 ```
 
----
-
 ## Notes
 
 - Conversation comments exclude tool calls, tool results, system messages, and heartbeat noise.
@@ -159,7 +177,7 @@ Full config with all options:
 - Always-on ClawMem prompt guidance uses the dedicated memory prompt-registration API on OpenClaw `2026.3.22+`. On `2026.3.7` through `2026.3.21`, ClawMem falls back to `before_prompt_build` `prependSystemContext`. Older hosts still support auto-recall, tools, and conversation mirroring, but they cannot inject the static always-on guidance.
 - `memory_recall` uses the backend `/api/v3/search/issues` endpoint scoped to the current repo plus `label:"type:memory"`. When backend recall is unavailable, use `memory_list` or `memory_get` to inspect memories explicitly.
 - Automatic durable capture happens when the session resets or ends. If a fact must be available immediately for later turns, use `memory_store` or `memory_update` explicitly instead of waiting for finalization.
-- The plugin exposes `memory_repos`, `memory_repo_create`, `memory_list`, `memory_get`, `memory_labels`, `memory_recall`, `memory_store`, `memory_update`, and `memory_forget` for mid-session use.
+- The plugin exposes memory tools, collaboration tools, a default-repo retarget tool, and generic issue/comment tools for mid-session use.
 - Route resolution is now: agent identity supplies credentials, `defaultRepo` is the fallback memory space, and explicit tool calls may override repo per operation.
 - `memory_store` accepts optional schema hints such as kind and topics; the plugin normalizes them into managed `kind:*` and `topic:*` labels.
 - Memory issues no longer use `session:*` labels. Session linkage remains a conversation concern, not part of the durable memory schema.
@@ -167,3 +185,4 @@ Full config with all options:
 - Conversation lifecycle is stored in native issue state (`open` while live, `closed` after finalize); memory lifecycle uses native issue state too (`open` active, `closed` stale).
 - Memory extraction now prefers one atomic fact per memory item instead of bundling whole sessions into a single node.
 - Memory issue bodies store the durable detail in a YAML `detail` field plus flat metadata such as `memory_hash` and logical `date`; this matches the current Console parser in `agent-git-service/web`.
+- If your environment still exposes older Team-specific reminders from the plugin package, treat them as deprecated compatibility content and follow your external ClawMem Team skill pack for current Team setup guidance.

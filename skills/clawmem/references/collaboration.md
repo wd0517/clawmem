@@ -41,7 +41,7 @@ Do not use this workflow for ordinary memory recall or save actions unless the u
 - Prefer the built-in ClawMem collaboration tools first.
 - Inspect current state before mutating anything.
 - Set `confirmed=true` only after the user has approved the exact org, team, repo, invitation, or permission change.
-- Fall back to `gh api` or `curl` only when plugin tools are unavailable, when debugging backend behavior directly, or when you must create an org-owned repo because the plugin does not expose an org-repo creation tool yet.
+- Fall back to `gh api` or `curl` only when plugin tools are unavailable or when debugging backend behavior directly.
 - Reuse the main `clawmem` skill's route-resolution helper when raw shell access is required.
 - Think in canonical runtime permissions: `read`, `write`, `admin`.
 - Treat GitHub-compatible aliases such as `pull`, `triage`, `push`, and `maintain` as transport compatibility only.
@@ -64,6 +64,7 @@ Tool-first rule:
   - `collaboration_repo_access_inspect`
 - Mutations:
   - `collaboration_org_create`
+  - `collaboration_org_repo_create`
   - `collaboration_org_member_remove`
   - `collaboration_org_membership_remove`
   - `collaboration_team_create`
@@ -96,7 +97,8 @@ Do not treat `defaultRepo` as the only space. It is only the fallback.
 Default tool path:
 - Use `memory_repos` to inspect accessible spaces
 - Use `memory_repo_create` when a new repo should be owned by the current agent identity
-- Create an org-owned repo with raw `gh api` or `curl` when the memory space must be governed by an organization team
+- Use `collaboration_org_repo_create` when the memory space must be governed by an organization team
+- Use `memory_repo_set_default` when a repo move or routing change should update the current agent's automatic default
 - Pass `repo` explicitly to `memory_recall`, `memory_list`, `memory_get`, `memory_store`, `memory_update`, and `memory_forget` when the target is not the current `defaultRepo`
 
 This keeps private memory, project memory, and shared memory separate without forcing extra plugin configuration changes.
@@ -131,7 +133,7 @@ Use this decision map:
 | Bring one user into the org | Org invitation |
 | Inspect whether a user already has org membership or only a pending org invite | Org membership inspection |
 | Grant a group access to selected repos | Team + team-repo grant |
-| Create a shared team memory space | Org-owned repo + team-repo grant |
+| Create a shared team memory space | `collaboration_org_repo_create` + team-repo grant |
 | Move an existing memory repo under org governance | Repo transfer into org |
 | Create another memory space under the current agent identity | `memory_repo_create` |
 | Inspect non-members who still have repo access | Outside collaborator listing |
@@ -160,7 +162,7 @@ Translate user intent like this:
 
 - `Create a shared memory repo for team X`
   - inspect or create the org and team first
-  - if the repo should be team-governed, create an org-owned repo with raw `gh api` or `curl`; `memory_repo_create` only creates repos under the current agent identity
+  - if the repo should be team-governed, use `collaboration_org_repo_create`; `memory_repo_create` only creates repos under the current agent identity
   - grant the team access with `collaboration_team_repo_set`
 - `Give Alice access to this one memory repo`
   - inspect direct collaborators first with `collaboration_repo_collaborators`
@@ -187,6 +189,7 @@ Translate user intent like this:
 - `Move this repo into org acme so team access can govern it`
   - ensure the target org already exists and the actor has org admin rights
   - then use `collaboration_repo_transfer`
+  - if the moved repo was the current agent's `defaultRepo`, expect the plugin to retarget `defaultRepo` automatically; otherwise use `memory_repo_set_default` explicitly when needed
 - `Someone shared a memory repo with me; can you see it and accept it?`
   - start with `collaboration_user_repo_invitations`
   - do not treat a `memory_repos` miss as proof that no share exists
@@ -218,7 +221,11 @@ If knowledge should stay personal, keep it in the agent's default repo. If it sh
 
 ## Manual org-owned shared repo creation
 
-Use the plugin tool path first. If the memory space must be org-governed, create an org-owned repo directly because `memory_repo_create` only creates repos under the current agent identity.
+Use the plugin tool path first:
+
+- Prefer `collaboration_org_repo_create` for normal org-owned repo creation.
+- Use raw `gh api` or `curl` only when plugin tools are unavailable or when debugging backend behavior directly.
+- `memory_repo_create` still only creates repos under the current agent identity.
 
 ### With `gh api`
 
@@ -246,6 +253,7 @@ After the repo exists:
 
 If the repo already exists under a personal owner and should become org-governed instead of creating a fresh repo:
 - use `collaboration_repo_transfer`
+- if that repo was the acting agent's `defaultRepo`, the plugin retargets `defaultRepo` automatically after a successful transfer
 - then continue with team grants and explicit `repo` targeting against the new org-owned full name
 
 ## Fallback mode
