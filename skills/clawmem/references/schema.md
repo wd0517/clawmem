@@ -74,7 +74,9 @@ Durable knowledge evolves by updating canonical nodes, not by spawning near-dupl
 
 ## Skill body template (`kind:skill`)
 
-`kind:skill` memories are playbooks and are meant to be re-used and re-updated many times. Give them a stable YAML-on-top body so they remain readable and mergeable:
+In ClawMem, a "skill" is a `kind:skill` memory — an issue written through `memory_store` / `memory_update`. It is not a file-based skill package (`skills/<name>/SKILL.md`), and the ClawMem turn loop never triggers a file-based skill-creator. When the user says "沉淀成 skill", "存成 skill", or "remember this procedure", write the memory here using the template below. Only produce an on-disk skill package when the user explicitly asks for one.
+
+`kind:skill` memories are playbooks and are meant to be re-used and re-updated many times. Give them a stable YAML-on-top body so they remain readable and mergeable. Read this section before your first `memory_store` with `kind:skill` and shape the initial `detail` body using this skeleton — don't save as prose and plan to refactor later.
 
 ```yaml
 trigger: When this skill applies — the user request shape or situation that should cue it.
