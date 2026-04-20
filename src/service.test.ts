@@ -115,6 +115,25 @@ function testBuildAutoRecallContextRendersKindAndTitle(): void {
   );
 }
 
+function testBuildAutoRecallContextCollapsesMultilineDetail(): void {
+  const context = buildAutoRecallContext([
+    {
+      memoryId: "91",
+      kind: "skill",
+      title: "Memory: review skill",
+      detail: "trigger: x\nsteps:\n  - one\n  - two",
+    },
+  ]);
+  const bulletLines = context.split("\n").filter((line) => line.startsWith("- ["));
+
+  assert(bulletLines.length === 1, "expected each memory to render as a single bullet line even when detail spans multiple lines");
+  assert(
+    bulletLines[0]?.includes("trigger: x steps: - one - two"),
+    "expected newlines and indentation inside detail to collapse to single spaces for the bullet view",
+  );
+  assert(!bulletLines[0]?.includes("\n"), "expected the rendered bullet to be a single line without raw newlines");
+}
+
 function testBuildClawMemPromptSection(): void {
   const lines = buildClawMemPromptSection({
     availableTools: new Set([
@@ -666,6 +685,7 @@ testExtractPromptFromPromptField();
 testExtractPromptFromStructuredContent();
 testBuildAutoRecallContext();
 testBuildAutoRecallContextRendersKindAndTitle();
+testBuildAutoRecallContextCollapsesMultilineDetail();
 testBuildClawMemPromptSection();
 testResolveHostVersionFromRuntime();
 testResolveHostVersionFromEnvFallback();

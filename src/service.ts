@@ -3093,8 +3093,13 @@ function formatAutoRecallBullet(memory: { memoryId: string; detail: string; kind
   if (memory.kind) parts.push(`(kind:${memory.kind})`);
   const title = stripMemoryTitlePrefix(memory.title);
   if (title) parts.push(`${title} —`);
-  parts.push(memory.detail);
+  parts.push(collapseInlineWhitespace(memory.detail));
   return parts.join(" ");
+}
+
+function collapseInlineWhitespace(value: string): string {
+  if (typeof value !== "string") return "";
+  return value.replace(/\s+/g, " ").trim();
 }
 
 function stripMemoryTitlePrefix(raw: string | undefined): string {
