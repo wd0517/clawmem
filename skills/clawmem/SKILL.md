@@ -58,7 +58,23 @@ On every user turn, run this loop:
    - Keep one durable fact per memory. Do not bundle unrelated facts, temporary requests, tool chatter, or startup boilerplate into one saved node.
    - For new memories, write the memory title and body in the user's current language by default.
    - Use `memory_forget` when a memory is stale, superseded, or harmful if reused.
-3. Keep the user posted.
+   - Trigger-phrase reflex: when the user's message contains one of the signals below, writing memory is not optional — pick the indicated kind and save, or `memory_update` the canonical node if one already exists.
+
+     | Signal from the user | Kind to save |
+     |---|---|
+     | "no", "don't", "stop doing that", "下次不要这样", "别这样", an explicit correction, an apology accepted after a mistake | `kind:lesson` |
+     | "yes exactly", "perfect, keep doing that", "这就是我要的", validation of a non-obvious choice you made | `kind:lesson` (what worked and why) or `kind:skill` if it was a multi-step procedure |
+     | "always / never", "from now on", "as a rule", naming/style/tool preferences, agreed policies | `kind:convention` |
+     | Identity, role, long-term goal, team, stable project fact, unchanging constraint | `kind:core-fact` |
+     | A non-trivial procedure that succeeded (several tool calls, trial and error, course changes) or one the user explicitly asks you to remember | `kind:skill` |
+     | Ongoing work that will be referenced across turns or sessions | `kind:task` |
+
+     If two or more `kind:lesson` memories start pointing at the same corrective direction, promote them to one `kind:skill` and close the originals with `superseded-by: #N` in the body — see [references/review.md](references/review.md).
+3. Periodically self-review.
+   - Every ~8–10 user turns, after a completed task, or when a `<clawmem-review-nudge>` block appears in context, run the review protocol in [references/review.md](references/review.md) before the next turn completes.
+   - The `memory_review` tool returns the latest review checklist. Call it when you want a compact reminder of what to look for, or when the user explicitly asks for a memory or skill review.
+   - Review is where `kind:skill` and `kind:lesson` actually accumulate; do not rely on session finalization alone.
+4. Keep the user posted.
    - If a retrieved memory materially shaped the answer, briefly surface that fact in the user's current language.
    - Include the memory id and title only when they help with debugging, traceability, or an explicit user request.
    - After creating or updating a memory, give a short confirmation in the user's current language instead of forcing fixed English phrasing.
@@ -87,7 +103,8 @@ Bias toward saving, and use explicit retrieval whenever auto-recall is absent, w
 - For user-facing runtime messaging, memory console links, and post-save confirmations, read [references/communication.md](references/communication.md).
 - For activation repair, route verification, tool-path verification, and compatibility-file reminders after install, read [references/repair.md](references/repair.md).
 - For shared repos, team memory, organizations, teams, invitations, collaborators, and collaboration routing, read [references/collaboration.md](references/collaboration.md).
-- For memory kinds, labels, curated versus plugin-managed nodes, and when to use each shape, read [references/schema.md](references/schema.md).
+- For memory kinds, labels, curated versus plugin-managed nodes, the `kind:skill` body template, and when to use each shape, read [references/schema.md](references/schema.md).
+- For the periodic self-review protocol (memory + skill tracks, lesson-to-skill promotion, anti-patterns), read [references/review.md](references/review.md).
 - For raw `gh` or `curl` flows, route resolution, troubleshooting, and `git push` to ClawMem, read [references/manual-ops.md](references/manual-ops.md).
 
 ## Bundled script

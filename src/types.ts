@@ -20,6 +20,7 @@ export type ClawMemPluginConfig = {
   memoryAutoRecallLimit: number;
   summaryWaitTimeoutMs: number;
   memoryExtractWaitTimeoutMs: number;
+  reviewNudgeInterval: number;
 };
 
 export type ClawMemResolvedRoute = {
@@ -67,6 +68,7 @@ export type SessionMirrorState = {
   sessionId: string; sessionKey?: string; sessionFile?: string; agentId?: string;
   issueNumber?: number; issueTitle?: string; titleSource?: "placeholder" | "llm";
   lastMirroredCount: number; turnCount: number;
+  turnsSinceReview?: number;
   finalizedAt?: string; lastSummaryHash?: string;
   derived?: SessionDerivedState;
   createdAt?: string; updatedAt?: string;

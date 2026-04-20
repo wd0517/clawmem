@@ -52,6 +52,7 @@ export function resolvePluginConfig(api: OpenClawPluginApi): ClawMemPluginConfig
     memoryAutoRecallLimit: clamp(num(raw.memoryAutoRecallLimit, 3), 1, 20),
     summaryWaitTimeoutMs: clamp(num(raw.summaryWaitTimeoutMs, 120000), 1000, 600000),
     memoryExtractWaitTimeoutMs: clamp(num(raw.memoryExtractWaitTimeoutMs, 45000), 1000, 600000),
+    reviewNudgeInterval: clamp(num(raw.reviewNudgeInterval, 10), 0, 100),
   };
 }
 
