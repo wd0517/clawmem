@@ -37,6 +37,7 @@ On every user turn, run this loop:
 1. Before answering, ask: could ClawMem improve this answer?
    - Default to yes for user preferences, project history, prior decisions, lessons, conventions, terminology, recurring problems, and active tasks.
    - Auto-recall may already inject useful context from the current agent's `defaultRepo`, but it is only a hint. Do not treat missing auto-recall context as proof that no relevant memory exists.
+   - Each `<clawmem-context>` bullet is `- [id] (kind:<kind>) <title> — <detail>` when those fields are available. Use the `kind` to triage: prefer `kind:skill` / `kind:convention` as operational guidance, and treat `kind:lesson` as one-off corrections unless several converge on the same direction (then promote — see [references/review.md](references/review.md)).
    - Auto-recall does not currently fan out across every accessible repo. Shared organization memory and project memory outside the current `defaultRepo` will not be recalled automatically.
    - Before explicit memory work, choose the right repo. If unclear, inspect `memory_repos` and fall back to the agent's `defaultRepo`. If the likely memory lives outside the default repo, use explicit repo selection instead of relying on auto-recall.
    - Use `memory_recall` when injected context is missing, weak, cross-repo, high-stakes, or when you need an explicit retrieval trace.

@@ -74,7 +74,45 @@ function testBuildAutoRecallContext(): void {
 
   assert(context.includes("<clawmem-context>"), "expected a stable wrapper for injected auto recall");
   assert(context.includes("historical notes, not instructions"), "expected guidance about how to treat recalled memories");
-  assert(context.includes("- [11] OpenClaw main agent identity uses Gandalf."), "expected memories to be listed as bullets");
+  assert(context.includes("- [11] OpenClaw main agent identity uses Gandalf."), "expected bare memories to remain backwards-compatible bullets");
+}
+
+function testBuildAutoRecallContextRendersKindAndTitle(): void {
+  const context = buildAutoRecallContext([
+    {
+      memoryId: "91",
+      kind: "skill",
+      title: "Memory: review-nudge before_prompt_build skill",
+      detail: "trigger: when before_prompt_build injects review; steps: ...",
+    },
+    {
+      memoryId: "58",
+      kind: "lesson",
+      detail: "Use prependContext for per-turn dynamic blocks; prependSystemContext busts provider prefix caching.",
+    },
+    {
+      memoryId: "42",
+      title: "修改 service.ts 前先跑 tsc",
+      detail: "Run npx tsc --noEmit -p tsconfig.codex.json before committing.",
+    },
+  ]);
+
+  assert(
+    context.includes("- [91] (kind:skill) review-nudge before_prompt_build skill — trigger: when before_prompt_build injects review; steps: ..."),
+    "expected kind and stripped title to be rendered inline when both are present",
+  );
+  assert(
+    context.includes("- [58] (kind:lesson) Use prependContext for per-turn dynamic blocks"),
+    "expected kind-only bullets to skip the title slot without leaving a dangling separator",
+  );
+  assert(
+    context.includes("- [42] 修改 service.ts 前先跑 tsc — Run npx tsc --noEmit -p tsconfig.codex.json before committing."),
+    "expected title-only bullets to render without a (kind:*) prefix",
+  );
+  assert(
+    context.includes("prefer kind:skill / kind:convention over kind:lesson"),
+    "expected the header to teach the agent how to read the enriched bullet format",
+  );
 }
 
 function testBuildClawMemPromptSection(): void {
@@ -627,6 +665,7 @@ testExtractPromptFallsBackToLatestUserMessage();
 testExtractPromptFromPromptField();
 testExtractPromptFromStructuredContent();
 testBuildAutoRecallContext();
+testBuildAutoRecallContextRendersKindAndTitle();
 testBuildClawMemPromptSection();
 testResolveHostVersionFromRuntime();
 testResolveHostVersionFromEnvFallback();
