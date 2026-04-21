@@ -76,8 +76,8 @@ export class MemoryStore {
 
   async store(draft: MemoryDraft): Promise<{ created: boolean; memory: ParsedMemoryIssue }> {
     const normalized = normalizeDraft(draft);
-    const detail = norm(normalized.detail);
-    const hash = sha256(detail);
+    const storedDetail = normalized.detail;
+    const hash = sha256(norm(storedDetail));
     const existing = await this.findActiveByHash(hash);
     if (existing) {
       const memory = await this.mergeSchema(existing, normalized);
@@ -87,7 +87,7 @@ export class MemoryStore {
     const date = localDate();
     const labels = memLabels(normalized.kind, normalized.topics);
     const title = renderMemoryTitle(normalized);
-    const body = renderMemoryBody(detail, hash, date);
+    const body = renderMemoryBody(storedDetail, hash, date);
     await this.client.ensureLabels(labels);
     const issue = await this.client.createIssue({ title, body, labels });
     return {
@@ -98,7 +98,7 @@ export class MemoryStore {
         memoryId: String(issue.number),
         memoryHash: hash,
         date,
-        detail,
+        detail: storedDetail,
         ...(normalized.kind ? { kind: normalized.kind } : {}),
         ...(normalized.topics && normalized.topics.length > 0 ? { topics: normalized.topics } : {}),
         status: "active",
@@ -109,7 +109,7 @@ export class MemoryStore {
   async update(memoryId: string, patch: { title?: string; detail?: string; kind?: string; topics?: string[] }): Promise<ParsedMemoryIssue | null> {
     const current = await this.get(memoryId, "all");
     if (!current) return null;
-    const nextDetail = typeof patch.detail === "string" && patch.detail.trim() ? norm(patch.detail) : current.detail;
+    const nextDetail = typeof patch.detail === "string" && patch.detail.trim() ? normalizeStoredDetail(patch.detail) : current.detail;
     const nextTitle = typeof patch.title === "string" && patch.title.trim()
       ? renderMemoryTitle({ title: patch.title.trim(), detail: nextDetail })
       : patch.detail !== undefined
@@ -119,7 +119,7 @@ export class MemoryStore {
     const nextTopics = patch.topics !== undefined
       ? uniqueNormalized(patch.topics.map((topic) => normalizeLabelValue(topic, "topic:")).filter(Boolean) as string[])
       : uniqueNormalized(current.topics ?? []);
-    const nextHash = sha256(nextDetail);
+    const nextHash = sha256(norm(nextDetail));
     const duplicate = await this.findActiveByHash(nextHash);
     if (duplicate?.issueNumber === current.issueNumber) {
       // Updating schema/title without changing the underlying detail is always safe.
@@ -259,7 +259,7 @@ function renderMemoryTitle(draft: Pick<MemoryDraft, "detail" | "title">): string
 }
 
 function renderMemoryBody(detail: string, memoryHash: string, date: string): string {
-  return stringifyFlatYaml([["memory_hash", memoryHash], ["date", date], ["detail", norm(detail)]]);
+  return stringifyFlatYaml([["memory_hash", memoryHash], ["date", date], ["detail", normalizeStoredDetail(detail)]]);
 }
 
 function parseStoredMemoryBody(rawBody: string): { detail: string; meta: Record<string, string> } {
@@ -282,6 +282,15 @@ function parseStoredMemoryBody(rawBody: string): { detail: string; meta: Record<
 }
 
 function norm(v: string): string { return v.replace(/\s+/g, " ").trim(); }
+function normalizeStoredDetail(v: string): string {
+  if (typeof v !== "string") return "";
+  return v
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/\s+$/, ""))
+    .join("\n")
+    .trim();
+}
 function trunc(v: string, max: number): string { const s = norm(v); return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`; }
 function normalizeSearch(v: string): string {
   return v.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
@@ -325,7 +334,7 @@ function truncateRecallQuery(text: string, maxLen: number): string {
 }
 
 function normalizeDraft(input: MemoryDraft): MemoryDraft {
-  const detail = norm(input.detail);
+  const detail = normalizeStoredDetail(input.detail);
   if (!detail) throw new Error("memory detail is empty");
   const title = typeof input.title === "string" && input.title.trim() ? norm(input.title) : undefined;
   const kind = normalizeLabelValue(input.kind, "kind:");

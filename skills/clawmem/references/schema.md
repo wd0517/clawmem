@@ -58,6 +58,50 @@ If you create a curated memory manually, include:
 - Do not create translated variants or near-duplicate synonyms of an existing label. Prefer reuse first, then one canonical new label if needed.
 - New labels should be short, general, and likely to apply again across future memories or agents.
 - For plugin-managed memory schema, do not invent random label prefixes. Memory schema evolution must stay within `kind:*` and `topic:*`.
+
+## Update vs new: the node-evolution rule
+
+Durable knowledge evolves by updating canonical nodes, not by spawning near-duplicates.
+
+- Before `memory_store`, `memory_recall` the same topic. If an open memory already covers the same fact, decision, workflow, or policy, use `memory_update` instead. Only open a new node when the new fact is semantically orthogonal to every existing canonical node.
+- When updating, preserve the node's original language unless the user explicitly asks for a rewrite. Refine the `detail` in place, tighten `title`, and add topic labels as coverage expands.
+- When a memory is contradicted by the current turn, choose one of:
+  - `memory_update` to record the new canonical truth on the existing node,
+  - `memory_forget` (close the issue) if the fact is simply no longer true and has no replacement,
+  - or open a new node and close the old one with a body note `superseded-by: #<new-id>` when the semantics are now different enough that one node cannot carry both.
+- Lesson → Skill promotion: when two or more active `kind:lesson` nodes point at the same corrective direction on the same topic, write one `kind:skill` that captures the positive behavior and close the lessons with `superseded-by: #<new-skill-id>`. Keep a single lesson open only if it captures a specific failure worth remembering on its own.
+- Re-validation: when `memory_recall` surfaces a `kind:skill` or `kind:convention` and the current turn re-confirms or re-applies it, `memory_update` to bump the `last_validated` date in the body (see template below) and append the turn's conversation id to `evidence`. Silent success erodes confidence in old nodes.
+
+## Skill body template (`kind:skill`)
+
+In ClawMem, a "skill" is a `kind:skill` memory — an issue written through `memory_store` / `memory_update`. It is not a file-based skill package (`skills/<name>/SKILL.md`), and the ClawMem turn loop never triggers a file-based skill-creator. When the user says "沉淀成 skill", "存成 skill", or "remember this procedure", write the memory here using the template below. Only produce an on-disk skill package when the user explicitly asks for one.
+
+`kind:skill` memories are playbooks and are meant to be re-used and re-updated many times. Give them a stable YAML-on-top body so they remain readable and mergeable. Read this section before your first `memory_store` with `kind:skill` and shape the initial `detail` body using this skeleton — don't save as prose and plan to refactor later.
+
+```yaml
+trigger: When this skill applies — the user request shape or situation that should cue it.
+steps:
+  - First action, concrete enough to follow without re-deriving.
+  - Next action.
+  - Final action.
+checks:
+  - Signals that the skill succeeded.
+  - Signals that the skill is the wrong fit and you should stop.
+last_validated: 2026-04-20
+evidence:
+  - "#42"   # conversation issue or memory id that supports this skill
+  - "#77"
+```
+
+Narrative prose, caveats, and references can follow the YAML block in the same body. The YAML block itself stays flat (no nested maps beyond lists), which matches ClawMem's body parser.
+
+When a `kind:skill` is re-used successfully, `memory_update` to:
+- bump `last_validated` to today's date,
+- append the latest supporting id to `evidence`,
+- refine `steps` or `checks` only if the turn produced a clearly better formulation.
+
+When a `kind:skill` fails in use, either fix `steps` / `checks` in place or close the node and open a replacement that references the old id with `superseded-by`.
+
 ## Storage language
 
 - For new memory nodes, write the human-readable title and body in the user's current language by default.

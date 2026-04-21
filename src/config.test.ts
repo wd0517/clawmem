@@ -32,6 +32,7 @@ function baseConfig(): ClawMemPluginConfig {
     memoryAutoRecallLimit: 3,
     summaryWaitTimeoutMs: 120000,
     memoryExtractWaitTimeoutMs: 45000,
+    reviewNudgeInterval: 10,
   };
 }
 

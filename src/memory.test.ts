@@ -563,6 +563,121 @@ async function testForgetClosesMemoryIssue(): Promise<void> {
   assert(syncedLabels[0]?.labels.every((label) => !label.startsWith("memory-status:")), "expected memory_forget to stop writing lifecycle labels");
 }
 
+async function testStorePreservesMultilineSkillBody(): Promise<void> {
+  const skillDetail = [
+    "trigger: when the user asks for a project review",
+    "steps:",
+    "  - read README and entry files",
+    "  - inspect core modules",
+    "checks:",
+    "  - conclusion first, no README recap",
+    "last_validated: 2026-04-20",
+    "evidence:",
+    '  - "#10"',
+  ].join("\n");
+  const created: Array<{ title: string; body: string; labels: string[] }> = [];
+  const client = {
+    repo: () => "owner/main-memory",
+    searchIssues: async () => [] as IssueRecord[],
+    listIssues: async () => [] as IssueRecord[],
+    listLabels: async () => [] as LabelRecord[],
+    ensureLabels: async () => {},
+    createIssue: async (payload: { title: string; body: string; labels: string[] }) => {
+      created.push(payload);
+      return { number: 91, title: payload.title };
+    },
+  };
+  const store = new MemoryStore(client as never);
+  const result = await store.store({ detail: skillDetail, kind: "skill", topics: ["review"] });
+
+  const body = created[0]?.body ?? "";
+  assert(result.created === true, "expected a new skill memory to be created");
+  assert(body.includes("detail: |-"), "expected multi-line detail to use a YAML block scalar, not a quoted scalar");
+  assert(body.includes("  trigger: when the user asks for a project review"), "expected block scalar to preserve the first content line");
+  assert(body.includes("    - read README and entry files"), "expected block scalar to preserve nested list indentation");
+  assert(!body.includes('\\"#10\\"'), "expected block scalar to avoid JSON-escaping quotes inside evidence");
+  assert(result.memory.detail === skillDetail, "expected stored detail to preserve the original structure line-for-line");
+}
+
+async function testStoreMultilineAndSinglelineDedupSharesHash(): Promise<void> {
+  const multilineDetail = [
+    "trigger: sample",
+    "steps:",
+    "  - one",
+  ].join("\n");
+  const singlelineDetail = "trigger: sample steps: - one";
+  const expectedHash = sha256(singlelineDetail);
+  const existing = memory({
+    issueNumber: 55,
+    detail: singlelineDetail,
+    memoryHash: expectedHash,
+    kind: "skill",
+  });
+  const queries: string[] = [];
+  const client = {
+    repo: () => "owner/main-memory",
+    searchIssues: async (query: string) => {
+      queries.push(query);
+      return [issueFromMemory(existing)];
+    },
+    listIssues: async () => { throw new Error("store should not scan all active memories"); },
+    ensureLabels: async () => {},
+    createIssue: async () => { throw new Error("store should not create a duplicate issue"); },
+    syncManagedLabels: async () => {},
+  };
+  const store = new MemoryStore(client as never);
+  const result = await store.store({ detail: multilineDetail, kind: "skill" });
+
+  assert(result.created === false, "expected multi-line and single-line details that differ only in whitespace to collide by hash");
+  assert(result.memory.issueNumber === 55, "expected the existing memory to win the dedup");
+  assert(queries[0]?.includes(expectedHash), "expected dedup to query on the whitespace-flattened hash");
+}
+
+async function testUpdatePreservesMultilineDetail(): Promise<void> {
+  const initialDetail = "trigger: first version";
+  const updatedDetail = [
+    "trigger: updated version",
+    "steps:",
+    "  - refined",
+  ].join("\n");
+  const issues: IssueRecord[] = [
+    issueFromMemory(memory({
+      issueNumber: 77,
+      title: "Memory: skill under test",
+      detail: initialDetail,
+      memoryHash: sha256(initialDetail),
+      kind: "skill",
+    })),
+  ];
+  const updatedIssues: Array<{ number: number; title?: string; body?: string }> = [];
+  const client = {
+    repo: () => "owner/main-memory",
+    getIssue: async (number: number) => {
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      return issue;
+    },
+    searchIssues: async () => [] as IssueRecord[],
+    listIssues: async () => [] as IssueRecord[],
+    ensureLabels: async () => {},
+    updateIssue: async (number: number, patch: { title?: string; body?: string }) => {
+      updatedIssues.push({ number, ...patch });
+      const issue = issues.find((entry) => entry.number === number);
+      if (!issue) throw new Error("issue missing");
+      if (patch.title) issue.title = patch.title;
+      if (patch.body) issue.body = patch.body;
+      return issue;
+    },
+    syncManagedLabels: async () => {},
+  };
+  const store = new MemoryStore(client as never);
+  const updated = await store.update("77", { detail: updatedDetail });
+
+  assert(updated?.detail === updatedDetail, "expected memory_update to return the multi-line detail unchanged");
+  assert(updatedIssues[0]?.body?.includes("detail: |-"), "expected memory_update to rewrite the body with a YAML block scalar when the new detail has newlines");
+  assert(updatedIssues[0]?.body?.includes("    - refined"), "expected the updated body to preserve nested list indentation");
+}
+
 async function main(): Promise<void> {
   await testBackendSearchBuildsSingleCleanedQuery();
   await testBackendSearchPreferredForRecall();
@@ -579,6 +694,9 @@ async function main(): Promise<void> {
   await testUpdateSupportsExplicitRetitle();
   await testForgetClosesMemoryIssue();
   await testUpdateUsesHashSearchForDuplicateCheck();
+  await testStorePreservesMultilineSkillBody();
+  await testStoreMultilineAndSinglelineDedupSharesHash();
+  await testUpdatePreservesMultilineDetail();
   console.log("memory tests passed");
 }
 

@@ -85,6 +85,11 @@
         "type": "integer",
         "minimum": 1,
         "maximum": 20
+      },
+      "reviewNudgeInterval": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100
       }
     }
   },
@@ -132,6 +137,10 @@
     "memoryAutoRecallLimit": {
       "label": "Auto Recall Limit",
       "help": "Maximum number of active memories automatically injected before each turn."
+    },
+    "reviewNudgeInterval": {
+      "label": "Review Nudge Interval",
+      "help": "How many user turns pass before ClawMem injects a <clawmem-review-nudge> reminder for the agent to run the review protocol. Set to 0 to disable. Default 10."
     }
   }
 }
