@@ -798,21 +798,26 @@ class ClawMemService {
         const p = asRecord(params);
         const issueNumber = this.resolvePositiveInteger(p.issueNumber, "issueNumber");
         if ("error" in issueNumber) return toolText(issueNumber.error);
+        const issueNumberValue = issueNumber.value;
         const body = typeof p.body === "string" ? p.body.trim() : "";
         if (!body) return toolText("body is empty.");
         const replyToCommentId = p.replyToCommentId === undefined ? undefined : this.resolvePositiveInteger(p.replyToCommentId, "replyToCommentId");
-        if (replyToCommentId && "error" in replyToCommentId) return toolText(replyToCommentId.error);
+        let replyOptions: { inReplyTo: number } | undefined;
+        if (replyToCommentId) {
+          if ("error" in replyToCommentId) return toolText(replyToCommentId.error);
+          replyOptions = { inReplyTo: replyToCommentId.value };
+        }
         const agentId = this.resolveToolAgentId(p.agentId);
         const resolved = await this.requireRepoClient(agentId, p.repo);
         if ("error" in resolved) return toolText(resolved.error);
         try {
           const comment = await this.enqueueRepoWrite(
             this.repoWriteKey(resolved.route),
-            () => resolved.client.createComment(issueNumber.value, body, replyToCommentId ? { inReplyTo: replyToCommentId.value } : undefined),
+            () => resolved.client.createComment(issueNumberValue, body, replyOptions),
           );
-          return toolText(`Added comment to issue #${issueNumber.value} in ${resolved.route.repo}.\n${renderIssueCommentBlock(comment)}`);
+          return toolText(`Added comment to issue #${issueNumberValue} in ${resolved.route.repo}.\n${renderIssueCommentBlock(comment)}`);
         } catch (error) {
-          return toolText(`Unable to add a comment to issue #${issueNumber.value} in ${resolved.route.repo}: ${String(error)}`);
+          return toolText(`Unable to add a comment to issue #${issueNumberValue} in ${resolved.route.repo}: ${String(error)}`);
         }
       },
     });
