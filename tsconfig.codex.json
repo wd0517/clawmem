@@ -5,7 +5,7 @@
     "target": "es2022",
     "outDir": "./dist",
     "types": ["node"],
-    "baseUrl": ".",
+    "strict": false,
     "paths": {
       "openclaw/plugin-sdk/core": ["./openclaw/plugin-sdk/core.d.ts"]
     },

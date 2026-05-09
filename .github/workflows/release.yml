@@ -45,6 +45,12 @@ jobs:
             exit 1
           fi
 
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build package
+        run: npm run build
+
       - name: Inspect package contents
         run: npm pack --dry-run
 
