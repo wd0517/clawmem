@@ -1,0 +1,46 @@
+[
+  {
+    "sample_id": "mini_locomo",
+    "conversation": {
+      "speaker_a": "Caroline",
+      "speaker_b": "Mel",
+      "session_1_date_time": "2023-05-01 09:00",
+      "session_1": [
+        {
+          "speaker": "Caroline",
+          "dia_id": "D1:1",
+          "text": "I am thinking about joining a community group."
+        },
+        {
+          "speaker": "Mel",
+          "dia_id": "D1:2",
+          "text": "That sounds like a good idea."
+        }
+      ],
+      "session_2_date_time": "2023-05-07 18:00",
+      "session_2": [
+        {
+          "speaker": "Caroline",
+          "dia_id": "D2:1",
+          "text": "I went to the LGBTQ support group today."
+        },
+        {
+          "speaker": "Mel",
+          "dia_id": "D2:2",
+          "text": "I am glad you went."
+        }
+      ]
+    },
+    "qa": [
+      {
+        "question": "When did Caroline go to the LGBTQ support group?",
+        "answer": "7 May 2023",
+        "evidence": ["D2:1"],
+        "category": 2
+      }
+    ],
+    "observation": {},
+    "session_summary": {},
+    "event_summary": {}
+  }
+]

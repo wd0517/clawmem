@@ -1,0 +1,35 @@
+[
+  {
+    "question_id": "mini_lme_001",
+    "question_type": "single-session-user",
+    "question": "Which deployment check did the user ask me to remember?",
+    "answer": "Run the Redis smoke check before deployment.",
+    "question_date": "2026-04-28",
+    "haystack_session_ids": ["session_a", "session_b"],
+    "haystack_dates": ["2026-04-20", "2026-04-22"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I need help drafting a release note."
+        },
+        {
+          "role": "assistant",
+          "content": "Sure, send me the change list."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Please remember that Redis deploys require the smoke-check script.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Got it."
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_b"]
+  }
+]
